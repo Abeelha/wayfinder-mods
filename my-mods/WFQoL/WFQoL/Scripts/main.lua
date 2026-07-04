@@ -37,7 +37,6 @@ local RELOAD_GA = "/Game/Blueprints/Player/GAS/GameplayAbilities/RangedWeapon/GA
 local RELOAD_OK_GA = "/Game/Blueprints/Player/GAS/GameplayAbilities/RangedWeapon/GA_Player_RangedWeapon_ActiveReloadSucceeded.GA_Player_RangedWeapon_ActiveReloadSucceeded_C"
 local SPRINT_CLASS = "/Game/Blueprints/Player/GAS/GameplayAbilities/GA_Player_Sprint.GA_Player_Sprint_C"
 local WFLIB = "/Script/Wayfinder.Default__WFAbilitySystemBlueprintLibrary"
-local KISMET = "/Script/Engine.Default__KismetSystemLibrary"
 
 local LMB = { KeyName = FName("LeftMouseButton") }
 local BLOCK_TAG = { TagName = FName("Input.Combat.Block") }
