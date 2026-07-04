@@ -39,6 +39,16 @@ local function setPct(np, name, pct)
     end)
 end
 
+-- force a sub-widget visible (ESlateVisibility: 0 = Visible). the player's OWN
+-- nameplate hides its health bars by default (only other players' show HP) - so
+-- self showed stamina but no HP. re-assert visible so self HP shows too.
+local function showWidget(np, name)
+    pcall(function()
+        local w = np[name]
+        if w and w:IsValid() then w:SetVisibility(0) end
+    end)
+end
+
 local function updateNameplate()
     if not playerNameplate or not playerNameplate:IsValid() then return end
     if not resolveHUD() then return end
@@ -52,6 +62,10 @@ local function updateNameplate()
     setPct(playerNameplate, "PlayerLastHealthBar",      healthPct)  -- damage trail
     setPct(playerNameplate, "PlayerHealthBar_Additive", shieldPct)  -- shield overlay
     setPct(playerNameplate, "characterStaminaFill",     staminaPct) -- stamina fill
+    -- keep the self health bars visible (game re-hides them on the local player)
+    showWidget(playerNameplate, "PlayerHealthBar")
+    showWidget(playerNameplate, "PlayerLastHealthBar")
+    showWidget(playerNameplate, "PlayerHealthBar_Additive")
 end
 
 local function installHooks()
@@ -73,6 +87,16 @@ local function installHooks()
             playerNameplate = np
             pcall(function() np.richNameText:SetText(FText("")) end)  -- hide player name
             pcall(function() np:SetStaminaMeterVisibility(true) end)  -- show stamina meter
+            -- show HEALTH too. probe the candidate meter-visibility methods (one is
+            -- the symmetric partner of SetStaminaMeterVisibility) + force the bars
+            -- visible; log which method exists so we can trim to it next pass.
+            for _, m in ipairs({ "SetHealthMeterVisibility", "SetHealthBarVisibility", "SetHealthVisibility" }) do
+                local okm = pcall(function() np[m](np, true) end)
+                print(string.format("[ShowNameplates] method %s ok=%s\n", m, tostring(okm)))
+            end
+            showWidget(np, "PlayerHealthBar")
+            showWidget(np, "PlayerLastHealthBar")
+            showWidget(np, "PlayerHealthBar_Additive")
             updateNameplate()
         end
     end)
