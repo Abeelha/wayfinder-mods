@@ -40,7 +40,7 @@ $xaml = @'
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="WFQoL Overlay" WindowStyle="None" AllowsTransparency="True"
         Background="Transparent" Topmost="True" ShowInTaskbar="False"
-        Width="280" Height="258" MinWidth="180" MinHeight="150"
+        Width="280" Height="352" MinWidth="180" MinHeight="150"
         ResizeMode="CanResizeWithGrip">
   <Border CornerRadius="14" Background="#DD0E1116" BorderBrush="#2FFFFFFF" BorderThickness="1" Padding="6">
     <Viewbox Stretch="Uniform">
@@ -147,6 +147,82 @@ function Set-Pill($prop, $on) {
     }
 }
 
+# ---- aim config: sliders write aim-config.json, the Lua mod hot-reloads it ----
+$AimCfgFile = Join-Path (Split-Path $StateFile) "aim-config.json"
+$script:aimCfgDirty = $false
+$aimDefaults = @{ fov = 20.0; smooth = 0.15; adsOnly = $true }
+try {
+    if (Test-Path $AimCfgFile) {
+        $c = Get-Content $AimCfgFile -Raw | ConvertFrom-Json
+        if ($null -ne $c.fov) { $aimDefaults.fov = [double]$c.fov }
+        if ($null -ne $c.smooth) { $aimDefaults.smooth = [double]$c.smooth }
+        if ($null -ne $c.adsOnly) { $aimDefaults.adsOnly = [bool]$c.adsOnly }
+    }
+} catch { OLog "aim cfg load error: $_" }
+
+$cfgHeader = New-Object Windows.Controls.TextBlock
+$cfgHeader.Text = "AIM CONFIG"; $cfgHeader.FontFamily = "Consolas"; $cfgHeader.FontSize = 10
+$cfgHeader.Foreground = "#6E6E78"; $cfgHeader.Margin = "2,8,0,2"
+[void]$rows.Children.Add($cfgHeader)
+
+function Add-CfgSlider($label, $min, $max, $value, $fmt) {
+    $row = New-Object Windows.Controls.DockPanel
+    $row.Margin = "2,2,2,2"
+    $name = New-Object Windows.Controls.TextBlock
+    $name.Text = $label; $name.FontFamily = "Consolas"; $name.FontSize = 11
+    $name.Foreground = "#D8D8DE"; $name.Width = 60; $name.VerticalAlignment = "Center"
+    [void]$row.Children.Add($name)
+    $val = New-Object Windows.Controls.TextBlock
+    $val.FontFamily = "Consolas"; $val.FontSize = 11; $val.Foreground = "#6FB7FF"
+    $val.Width = 38; $val.TextAlignment = "Right"; $val.VerticalAlignment = "Center"
+    $val.Text = ($value.ToString($fmt))
+    [Windows.Controls.DockPanel]::SetDock($val, "Right")
+    [void]$row.Children.Add($val)
+    $slider = New-Object Windows.Controls.Slider
+    $slider.Minimum = $min; $slider.Maximum = $max; $slider.Value = $value
+    $slider.VerticalAlignment = "Center"; $slider.Margin = "4,0,4,0"
+    $slider.IsMoveToPointEnabled = $true
+    [void]$row.Children.Add($slider)
+    [void]$rows.Children.Add($row)
+    return @{ Slider = $slider; Val = $val; Fmt = $fmt }
+}
+
+$script:fovCtl = Add-CfgSlider "FOV" 2 90 $aimDefaults.fov "0"
+$script:smoothCtl = Add-CfgSlider "SMOOTH" 0.02 1.0 $aimDefaults.smooth "0.00"
+$script:fovCtl.Slider.Add_ValueChanged({
+    $script:fovCtl.Val.Text = $script:fovCtl.Slider.Value.ToString("0")
+    $script:aimCfgDirty = $true
+})
+$script:smoothCtl.Slider.Add_ValueChanged({
+    $script:smoothCtl.Val.Text = $script:smoothCtl.Slider.Value.ToString("0.00")
+    $script:aimCfgDirty = $true
+})
+
+$adsRow = New-Object Windows.Controls.DockPanel
+$adsRow.Margin = "2,2,2,2"
+$script:adsCheck = New-Object Windows.Controls.CheckBox
+$script:adsCheck.Content = "ADS only (off = also while firing)"
+$script:adsCheck.FontFamily = "Consolas"; $script:adsCheck.FontSize = 10
+$script:adsCheck.Foreground = "#D8D8DE"; $script:adsCheck.IsChecked = $aimDefaults.adsOnly
+$script:adsCheck.VerticalAlignment = "Center"
+$script:adsCheck.Add_Checked({ $script:aimCfgDirty = $true })
+$script:adsCheck.Add_Unchecked({ $script:aimCfgDirty = $true })
+[void]$adsRow.Children.Add($script:adsCheck)
+[void]$rows.Children.Add($adsRow)
+
+function Save-AimCfg {
+    try {
+        $obj = @{
+            fov = [math]::Round($script:fovCtl.Slider.Value, 0)
+            smooth = [math]::Round($script:smoothCtl.Slider.Value, 2)
+            adsOnly = [bool]$script:adsCheck.IsChecked
+        }
+        ($obj | ConvertTo-Json -Compress) | Set-Content -Path $AimCfgFile -Encoding ascii
+        OLog "aim cfg saved: fov=$($obj.fov) smooth=$($obj.smooth) adsOnly=$($obj.adsOnly)"
+    } catch { OLog "aim cfg save error: $_" }
+}
+if (-not (Test-Path $AimCfgFile)) { Save-AimCfg }
+
 # ------------------------------------------------------------------ settings
 $cfgPath = Join-Path $env:APPDATA "wfqol-overlay.json"
 $script:locked = $true # click-through by default; Ctrl+Alt+O or tray menu unlocks
@@ -154,7 +230,7 @@ if (Test-Path $cfgPath) {
     try {
         $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
         if ($cfg.left -ne $null) { $window.Left = $cfg.left; $window.Top = $cfg.top }
-        if ($cfg.width) { $window.Width = $cfg.width; $window.Height = [Math]::Max([double]$cfg.height, 258) }
+        if ($cfg.width) { $window.Width = $cfg.width; $window.Height = [Math]::Max([double]$cfg.height, 352) }
         if ($cfg.locked -ne $null) { $script:locked = [bool]$cfg.locked }
     } catch { OLog "config load failed: $_" }
 } else {
@@ -226,6 +302,7 @@ $script:pollCount = 0
 $timer = New-Object Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromMilliseconds(300)
 $timer.Add_Tick({
+    if ($script:aimCfgDirty) { $script:aimCfgDirty = $false; Save-AimCfg }
     $stale = $true
     if (Test-Path $StateFile) {
         try {

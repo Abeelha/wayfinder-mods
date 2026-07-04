@@ -40,7 +40,6 @@ local WFLIB = "/Script/Wayfinder.Default__WFAbilitySystemBlueprintLibrary"
 local KISMET = "/Script/Engine.Default__KismetSystemLibrary"
 
 local LMB = { KeyName = FName("LeftMouseButton") }
-local RKEY = { KeyName = FName("R") }
 local BLOCK_TAG = { TagName = FName("Input.Combat.Block") }
 local INCOMBAT_TAG = { TagName = FName("Character.State.Generic.InCombat") }
 local SPRINTING_TAG = { TagName = FName("Character.State.Generic.Sprinting") }
@@ -174,6 +173,9 @@ local PRELOAD = {
     "/Game/Blueprints/Player/GAS/GameplayAbilities/DW/TA_Player_DW_Parry_Pushback",
     "/Game/Blueprints/Player/GAS/GameplayAbilities/SnS/GE_Player_SNS_ConsumeStamina_Parry",
     "/Game/Blueprints/Player/GAS/GameplayAbilities/SnS/GE_Player_SNS_ConsumeStamina_Parry_Survivalist",
+    -- reload success/fail cue notify classes: preloading makes them hookable at spawn
+    "/Game/Blueprints/GameplayCueNotifies/Ability/2HR/GCNA_2HR_ActiveReload_Success",
+    "/Game/Blueprints/GameplayCueNotifies/Ability/2HR/GCNA_2HR_ActiveReload_Fail",
 }
 local preloaded = false
 local function preloadParryAssets()
@@ -540,21 +542,24 @@ LoopAsync(300, function()
 end)
 
 -- ---------------------------------------------------------------- AutoReload
--- can't-fail by construction: CheckInWindow doesn't compare against the
--- DISPLAYED WindowMin/WindowMax - it reads an ASC attribute window
--- (WFRangedWeaponAttributeSet.ActiveReloadCenter/Bounds) +/- the instance's
--- Tolerance (default 3). so on every activation the check's own operands get
--- forced wide open: any press by anyone at any time = perfect. the timed
--- center press stays as the hands-off auto path.
+-- two tricks:
+--  window forcing: CheckInWindow doesn't compare against the DISPLAYED
+--    WindowMin/WindowMax - it reads an ASC attribute window
+--    (WFRangedWeaponAttributeSet.ActiveReloadCenter/Bounds) +/- the instance's
+--    Tolerance (default 3). every activation forces those wide open, so any
+--    press (yours included) at any time = perfect.
+--  press = the GA's own input callback: injecting the pawn's InpActEvt_Reload
+--    does NOT feed the minigame's WFAbilityTask_HandlePlayerInputPress - it
+--    just queued a SECOND reload after the first ended (the v12 double-reload
+--    bug). the graph's bound press handlers (OnTriggered_*(ElapsedTime)) are
+--    plain UFunctions on the ability - call those directly.
 local RELOAD_LATENCY = 0.03 -- scheduling/input latency compensation, seconds
 local windowForcedLogged = false
+local successThisCycle = false
 
-local function pressReload(elapsed) -- game thread only
-    if pawnRef and pawnRef:IsValid() then
-        injecting = true
-        pawnRef:InpActEvt_Reload_K2Node_InputActionEvent_12(RKEY)
-        injecting = false
-    end
+local function pressReload(ab, elapsed) -- game thread only
+    local ok = pcall(function() ab:OnTriggered_99CA32B34E7E0E8640D86BAE3837FFCB(elapsed) end)
+    if not ok then logErrorOnce("reload-press", "OnTriggered_99CA call failed") end
 end
 
 local function forceWindowOpen(ab)
@@ -625,20 +630,32 @@ local function scheduleWindowPress(ab, t0, attempt)
                 currentReload.maxT = maxT
                 log("reload: window %.2f-%.2f max %.2fs -> press at %.2fs", wmin, wmax, maxT, pressSec)
                 phase = "press"
+                local function firePress()
+                    if not (state.reload and currentReload and currentReload.t0 == t0 and ab:IsValid()) then return end
+                    currentReload.pressed = true
+                    pressReload(ab, os.clock() - t0)
+                    log("reload: pressed at %.2fs", os.clock() - t0)
+                    -- second bound handler, in case the first isn't the press path
+                    ExecuteWithDelay(250, function()
+                        ExecuteInGameThread(function()
+                            pcall(function()
+                                if state.reload and currentReload and currentReload.t0 == t0 and ab:IsValid() then
+                                    local e2 = os.clock() - t0
+                                    pcall(function() ab:OnTriggered_0C5309BB4DBB1136C0E5DEBE6E42DF1A(e2) end)
+                                    log("reload: fallback press at %.2fs", e2)
+                                end
+                            end)
+                        end)
+                    end)
+                end
                 local remainMs = math.floor((pressSec - RELOAD_LATENCY - (os.clock() - t0)) * 1000)
                 if remainMs <= 10 then
-                    pressReload(os.clock() - t0)
-                    log("reload: pressed at %.2fs", os.clock() - t0)
+                    firePress()
                     return
                 end
                 ExecuteWithDelay(remainMs, function()
                     ExecuteInGameThread(function()
-                        pcall(function()
-                            if state.reload and currentReload and currentReload.t0 == t0 and ab:IsValid() then
-                                pressReload(os.clock() - t0)
-                                log("reload: pressed at %.2fs", os.clock() - t0)
-                            end
-                        end)
+                        pcall(firePress)
                     end)
                 end)
             end)
@@ -651,8 +668,10 @@ local function onReloadActivated(self)
     local ok, err = pcall(function()
         local ab = self:get()
         local t0 = os.clock()
-        currentReload = { t0 = t0, maxT = nil }
+        successThisCycle = false
+        currentReload = { t0 = t0, maxT = nil, pressed = false, successClass = nil }
         pcall(function() currentReload.maxT = ab.MaxReloadTime end)
+        pcall(function() currentReload.successClass = ab.ReloadSuccessType end)
         if not state.reload then return end
         forceWindowOpen(ab) -- hook runs on game thread, before any press lands
         scheduleWindowPress(ab, t0)
@@ -661,10 +680,36 @@ local function onReloadActivated(self)
 end
 
 local function onReloadSucceeded(self)
-    pcall(function()
+    successThisCycle = true
+    pcall(function() log("reload: PERFECT") end)
+end
+
+-- minigame over (success, fail or cancel): stop pending presses so a stale
+-- injected press can't start a second reload. if the game didn't grant the
+-- success ability (= the perfect buff) after OUR press, force it.
+local function onReloadEnded(self)
+    local ok = pcall(function()
+        local cr = currentReload
         currentReload = nil
-        log("reload: PERFECT")
+        if not cr then return end
+        log("reload: ended at %.2fs", os.clock() - cr.t0)
+        if not (state.reload and cr.pressed) then return end
+        local successClass = cr.successClass
+        ExecuteWithDelay(250, function()
+            ExecuteInGameThread(function()
+                pcall(function()
+                    if successThisCycle then return end
+                    if not successClass or not successClass:IsValid() then return end
+                    local pawn = getPawn()
+                    local asc = pawn and getASC(pawn)
+                    if asc and asc:TryActivateAbilityByClass(successClass, true) then
+                        log("reload: buff FORCED via success ability")
+                    end
+                end)
+            end)
+        end)
     end)
+    if not ok then logErrorOnce("reload-end", "handler failed") end
 end
 
 -- ---------------------------------------------------------------- AimAssist
@@ -679,12 +724,40 @@ end
 local aimWeights = { Radius = 3000.0, Yaw = 40.0, bCanTargetFriendly = false, bIgnoreHardLockedTarget = false }
 local aimMagnetized = false
 
-local PULL_RATE = 0.15      -- fraction of the remaining angle applied per tick
-local PULL_CAP = 1.5        -- max degrees per tick
-local PULL_CONE = 20.0      -- only assist when target is within this angle
-local PULL_DEADZONE = 0.3   -- degrees; inside this, hands off
+-- tunables live in Mods/WFQoL/aim-config.json, written by the overlay's
+-- sliders and hot-reloaded here every second:
+--   fov     degrees around the crosshair the assist engages in (2-90)
+--   smooth  fraction of the remaining angle applied per 33ms tick
+--           (0.05 = lazy drift ... 1.0 = instant snap)
+--   adsOnly true = only while aiming down sights; false = also while firing
+local AIMCFG_REL = "Mods/WFQoL/aim-config.json"
+local AIMCFG_ABS = "D:/SteamLibrary/steamapps/common/Wayfinder/Atlas/Binaries/Win64/Mods/WFQoL/aim-config.json"
+local aimCfg = { fov = 20.0, smooth = 0.15, adsOnly = true }
+local aimCfgRaw = nil
+
+local PULL_DEADZONE = 0.25  -- degrees; inside this, hands off
 local INPUT_SCALE = 1 / 2.5 -- AddController*Input units -> degrees (engine default 2.5)
 local lastPullYaw, lastPullPitch = 0.0, 0.0
+
+LoopAsync(1000, function()
+    pcall(function()
+        local f = io.open(AIMCFG_REL, "r") or io.open(AIMCFG_ABS, "r")
+        if not f then return end
+        local raw = f:read("*a")
+        f:close()
+        if raw == aimCfgRaw then return end
+        aimCfgRaw = raw
+        local fov = tonumber(raw:match('"fov"%s*:%s*([%d%.]+)'))
+        local smooth = tonumber(raw:match('"smooth"%s*:%s*([%d%.]+)'))
+        local ads = raw:match('"adsOnly"%s*:%s*(%a+)')
+        if fov then aimCfg.fov = math.max(2, math.min(90, fov)) end
+        if smooth then aimCfg.smooth = math.max(0.02, math.min(1, smooth)) end
+        if ads then aimCfg.adsOnly = (ads == "true") end
+        aimWeights.Yaw = math.min(90, aimCfg.fov * 1.5) -- acquire wider than we pull
+        log("aim: config fov=%.0f smooth=%.2f adsOnly=%s", aimCfg.fov, aimCfg.smooth, tostring(aimCfg.adsOnly))
+    end)
+    return false
+end)
 
 local function normDeg(a)
     while a > 180 do a = a - 360 end
@@ -697,6 +770,13 @@ local function isAimingNow(pawn)
     pcall(function() aiming = pawn:IsAiming() end)
     if not aiming then pcall(function() aiming = pawn:IsFreeFireAiming() end) end
     return aiming
+end
+
+local function aimEngaged(pawn)
+    if not state.aim then return false end
+    if isAimingNow(pawn) then return true end
+    if not aimCfg.adsOnly and m1Held then return true end
+    return false
 end
 local aimSettingsDone = false
 local function applyAimSettings()
@@ -725,7 +805,7 @@ LoopAsync(150, function()
             local tc = pawn.TargetingComponent
             if not tc or not tc:IsValid() then return end
 
-            local aiming = state.aim and isAimingNow(pawn)
+            local aiming = aimEngaged(pawn)
             if not aiming then
                 if aimMagnetized then
                     pcall(function() tc:ClearMagnetizedAimTarget() end)
@@ -762,7 +842,7 @@ LoopAsync(33, function()
     ExecuteInGameThread(function()
         local ok, err = pcall(function()
             local pawn = getPawn()
-            if not pawn or not isAimingNow(pawn) then return end
+            if not pawn or not aimEngaged(pawn) then return end
             local tc = pawn.TargetingComponent
             if not tc or not tc:IsValid() then return end
             local target = tc:GetMagnetizedAimTarget()
@@ -788,12 +868,13 @@ LoopAsync(33, function()
             local cur = controller:GetControlRotation()
             local dyaw = normDeg(wantYaw - cur.Yaw)
             local dpitch = normDeg(wantPitch - cur.Pitch)
-            if math.abs(dyaw) > PULL_CONE or math.abs(dpitch) > PULL_CONE then return end
+            if math.abs(dyaw) > aimCfg.fov or math.abs(dpitch) > aimCfg.fov then return end
 
+            local cap = 8.0 * aimCfg.smooth -- deg/tick; smooth=1 -> hard snap
             local function pull(d)
                 if math.abs(d) < PULL_DEADZONE then return 0 end
-                local p = d * PULL_RATE
-                if p > PULL_CAP then p = PULL_CAP elseif p < -PULL_CAP then p = -PULL_CAP end
+                local p = d * aimCfg.smooth
+                if p > cap then p = cap elseif p < -cap then p = -cap end
                 return p
             end
             local py, pp = pull(dyaw), pull(dpitch)
@@ -862,7 +943,16 @@ local function registerAll()
     end)
     tryHook(AIBASE .. ":K2_ActivateAbility", onEnemyAbility)
     tryHook(RELOAD_GA .. ":K2_ActivateAbility", onReloadActivated)
+    tryHook(RELOAD_GA .. ":K2_OnEndAbility", onReloadEnded)
     tryHook(RELOAD_OK_GA .. ":K2_ActivateAbility", onReloadSucceeded)
+    -- ground-truth signals from the game's own success/fail cues (preloaded)
+    tryHook("/Game/Blueprints/GameplayCueNotifies/Ability/2HR/GCNA_2HR_ActiveReload_Success.GCNA_2HR_ActiveReload_Success_C:K2_HandleGameplayCue", function()
+        successThisCycle = true
+        log("reload: success cue")
+    end)
+    tryHook("/Game/Blueprints/GameplayCueNotifies/Ability/2HR/GCNA_2HR_ActiveReload_Fail.GCNA_2HR_ActiveReload_Fail_C:K2_HandleGameplayCue", function()
+        log("reload: FAIL cue (should be impossible - report this)")
+    end)
 end
 
 registerAll()
