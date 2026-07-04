@@ -1,9 +1,11 @@
 -- ShowNameplates - forces the player's own nameplate visible and mirrors the HUD
--- health/shield/stamina meters onto it. Patched (WFQoL): hooks now install ONCE
--- (the old main() re-ran every ClientRestart -> stacked hooks + stale closures
--- wrote wrong values, and spammed "Was unable to register a hook"); the primary
--- health fill is now driven (old code only set the damage-trail bar, so self life
--- read wrong); a one-shot diag logs which nameplate bars actually exist.
+-- health/shield/stamina meters onto it. Patched (WFQoL): hooks install ONCE (the
+-- old main() re-ran every ClientRestart -> stacked hooks + stale closures wrote
+-- wrong values, and spammed "Was unable to register a hook"); the primary health
+-- fill (PlayerHealthBar) is now driven - the old code only set the damage-trail
+-- bar so self life read wrong. Bar names confirmed present via a one-shot probe:
+-- PlayerHealthBar (main), PlayerHealthBar_Additive (shield), PlayerLastHealthBar
+-- (trail), characterStaminaFill (stamina).
 
 local function OverrideReturn(UFunctionName, ReturnValue, Callback)
     Callback = Callback or function() end
@@ -18,21 +20,6 @@ local hudMeters       = nil    -- source HUD meters (health/shield/stamina)
 local currentPlayer   = nil    -- player pawn, refreshed on each ClientRestart
 local hooksInstalled  = false  -- register the UFunction hooks exactly once
 
--- one-shot: log which candidate bars exist on the real widget so the value
--- mapping can be trimmed to the correct names next pass.
-local diagDone = false
-local function diagBars(np)
-    if diagDone then return end
-    diagDone = true
-    for _, name in ipairs({
-        "PlayerHealthBar", "PlayerHealthBar_Additive", "PlayerLastHealthBar",
-        "characterHealthFill", "characterStaminaFill", "PlayerStaminaBar",
-    }) do
-        local ok, present = pcall(function() return np[name] ~= nil and np[name]:IsValid() end)
-        print(string.format("[ShowNameplates] bar '%s' present=%s\n", name, tostring(ok and present)))
-    end
-end
-
 -- (re)find the HUD meters widget; cached until it goes invalid (level change)
 local function resolveHUD()
     if hudMeters and hudMeters:IsValid() then return true end
@@ -44,7 +31,7 @@ local function resolveHUD()
     return hudMeters ~= nil and hudMeters:IsValid()
 end
 
--- set a bar by name if it exists on the widget (wrong names no-op via pcall)
+-- set a bar by name if it exists on the widget (missing names no-op via pcall)
 local function setPct(np, name, pct)
     pcall(function()
         local bar = np[name]
@@ -61,14 +48,10 @@ local function updateNameplate()
                hudMeters.HUD_PlayerStaminaMeters.PlayerStaminaMeter.Percent
     end)
     if not ok then return end
-    diagBars(playerNameplate)
-    -- health -> primary fill + trail bar (whichever the widget actually has);
-    -- shield -> additive overlay; stamina -> its fill
-    setPct(playerNameplate, "PlayerHealthBar",          healthPct)
-    setPct(playerNameplate, "characterHealthFill",      healthPct)
-    setPct(playerNameplate, "PlayerLastHealthBar",      healthPct)
-    setPct(playerNameplate, "PlayerHealthBar_Additive", shieldPct)
-    setPct(playerNameplate, "characterStaminaFill",     staminaPct)
+    setPct(playerNameplate, "PlayerHealthBar",          healthPct)  -- primary fill
+    setPct(playerNameplate, "PlayerLastHealthBar",      healthPct)  -- damage trail
+    setPct(playerNameplate, "PlayerHealthBar_Additive", shieldPct)  -- shield overlay
+    setPct(playerNameplate, "characterStaminaFill",     staminaPct) -- stamina fill
 end
 
 local function installHooks()
