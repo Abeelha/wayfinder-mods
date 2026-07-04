@@ -743,6 +743,17 @@ end)
 local pending = {}
 local registered = {}
 
+-- launch the external overlay when the game starts (once). the overlay
+-- self-exits when our heartbeat goes stale, so it lives and dies with the
+-- game - no Windows login autostart (that spawned it on every PC boot).
+local OVERLAY_VBS = "C:/Users/Abeelha/Documents/github/wayfinder-mods/tools/overlay/launch-overlay.vbs"
+local overlayLaunched = false
+local function launchOverlay()
+    if overlayLaunched then return end
+    overlayLaunched = true
+    pcall(function() os.execute('wscript "' .. OVERLAY_VBS .. '"') end)
+end
+
 local function tryHook(path, fn)
     if registered[path] then return end
     if pcall(RegisterHook, path, fn) then
@@ -797,6 +808,7 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, New
     libCache = nil
     sprintClassCache = nil
     preloadParryAssets() -- ClientRestart hook = guaranteed game thread
+    launchOverlay()
     registerAll()
 end)
 

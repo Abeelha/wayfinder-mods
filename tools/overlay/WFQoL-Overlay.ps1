@@ -231,6 +231,8 @@ $window.Add_Loaded({ try { $window.Activate(); Move-Chip } catch {} })
 
 # ------------------------------------------------------------------ state poll
 $script:pollCount = 0
+$script:staleSince = $null   # when the heartbeat first went stale (for auto-exit)
+$EXIT_AFTER_STALE = 20       # seconds of no heartbeat before we assume the game is gone
 $timer = New-Object Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromMilliseconds(300)
 $timer.Add_Tick({
@@ -253,13 +255,23 @@ $timer.Add_Tick({
             if ($script:pollCount -eq 1) { OLog "first state read OK (age ${age}s, stale=$stale)" }
         } catch { $stale = $true; OLog "state read error: $_" }
     }
-    # ALWAYS visible while the overlay runs - never vanish on the user. when the
-    # game heartbeat is stale (alt-tab, loading, game closed) just flag "offline"
-    # and dim the combat dot; keep the card exactly where they put it.
-    if (-not $window.IsVisible) { $window.Show(); $lockChip.Show() }
-    $offlineText.Visibility = if ($stale) { "Visible" } else { "Collapsed" }
-    if ($stale) { $combatDot.Fill = "#555560" }
-    Move-Chip
+    # overlay lives and dies with the game. fresh heartbeat = show + reset the
+    # stale clock. sustained stale (game closed / crashed / alt-f4) = self-exit.
+    if ($stale) {
+        if ($null -eq $script:staleSince) { $script:staleSince = [DateTime]::UtcNow }
+        $offlineText.Visibility = "Visible"
+        $combatDot.Fill = "#555560"
+        if (([DateTime]::UtcNow - $script:staleSince).TotalSeconds -ge $EXIT_AFTER_STALE) {
+            OLog "heartbeat stale ${EXIT_AFTER_STALE}s - game gone, exiting"
+            $window.Close()
+            return
+        }
+    } else {
+        $script:staleSince = $null
+        $offlineText.Visibility = "Collapsed"
+        if (-not $window.IsVisible) { $window.Show(); $lockChip.Show() }
+        Move-Chip
+    }
 })
 $timer.Start()
 
