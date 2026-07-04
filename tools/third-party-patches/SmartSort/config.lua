@@ -24,8 +24,10 @@ local weaponFavoriteFilters = {
     { aboveLevel = 38 }
 }
 
--- Rules to junk weapons
-local weaponJunkFilters = {}
+-- Rules to junk weapons (mark level 30 and under for sell/dust)
+local weaponJunkFilters = {
+    { belowLevel = 30 }
+}
 
 
 --[[
@@ -49,11 +51,13 @@ local weaponJunkFilters = {}
         Echo = Rush
 ]]
 
--- Rules to favorite accessories
-local accessoryJunkFilters = {}
-
--- Rules to junk accessories
+-- Rules to favorite accessories (none)
 local accessoryFavoriteFilters = {}
+
+-- Rules to junk accessories (mark level 30 and under for sell/dust)
+local accessoryJunkFilters = {
+    { belowLevel = 30 }
+}
 
 
 --[[
@@ -79,10 +83,12 @@ local accessoryFavoriteFilters = {}
         4 = Epic
 ]]
 
--- Junks any weapon below level 30 (inclusive) or with an Alpha slot
-local echoJunkFilters = {}
+-- Junk Common + Uncommon echoes (rarity 1-2) for dusting
+local echoJunkFilters = {
+    { rarity = { 1, 2 } }
+}
 
--- Favorites any weapon with level 35+
+-- Favorite echoes (none)
 local echoFavoriteFilters = {}
 
 
