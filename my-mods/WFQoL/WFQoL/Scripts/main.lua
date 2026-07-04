@@ -794,8 +794,20 @@ local function writeState()
     if not ok then logErrorOnce("statefile", err) end
 end
 
+-- perf watchdog: the state loop should tick every ~1.0s. a much larger gap =
+-- the game hitched (GPU/CPU spike). logged (throttled) so we can correlate
+-- stutters with what's happening and tune Engine.ini. cheap: just clock math.
+local perfLastTick = os.clock()
+local perfLastLog = 0.0
 LoopAsync(1000, function()
     writeState()
+    local now = os.clock()
+    local dt = now - perfLastTick
+    perfLastTick = now
+    if dt > 2.0 and now - perfLastLog > 10 then
+        perfLastLog = now
+        log("perf: hitch %.1fs (combat=%s) - engine.ini tuning candidate", dt, tostring(lastCombat == true))
+    end
     return false
 end)
 
