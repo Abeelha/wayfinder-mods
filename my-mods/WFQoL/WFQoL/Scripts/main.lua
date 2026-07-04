@@ -1145,6 +1145,56 @@ NotifyOnNewObject("/Script/Wayfinder.WFTargetActor_LineTrace", function(ta)
     end)
 end)
 
+-- the reliable path: replicate exactly what a manual hit does. a real shot
+-- ends in the ability calling ApplyHitscanEffect(TargetData) where TargetData
+-- names the actor(s) the trace struck. we build that same TargetData from the
+-- acquired enemy and call the ability's applicator ourselves - the weapon's
+-- damage GE lands on the target with correct source/level, no trace geometry
+-- involved, camera pointing anywhere. this is the "magic bullet".
+local GASLIB = "/Script/GameplayAbilities.Default__AbilitySystemBlueprintLibrary"
+local gasLibCache = nil
+local function getGasLib()
+    if gasLibCache and gasLibCache:IsValid() then return gasLibCache end
+    local l = StaticFindObject(GASLIB)
+    gasLibCache = (l and l:IsValid()) and l or nil
+    return gasLibCache
+end
+
+local lastMagicLog = 0.0
+-- delayed so the ability finishes its own activation setup (Source Weapon,
+-- level) before we invoke its applicator; re-validates everything on fire.
+local function scheduleMagicHit(ab)
+    ExecuteWithDelay(60, function()
+        ExecuteInGameThread(function()
+            local ok, err = pcall(function()
+                if not (state.aim and aimCfg.bullets and ready) then return end
+                if not ab:IsValid() then return end
+                local pawn = getPawn()
+                if not pawn then return end
+                local target = currentBulletTarget(pawn)
+                if not target then return end
+                local gl = getGasLib()
+                if not gl then return end
+                local handle = gl:AbilityTargetDataFromActor(target)
+                -- full pipeline first (damage + hit cues); narrower applicator
+                -- if actor-only target data (no hit result) trips it up
+                local via = "HandleTargetData"
+                local hOk = pcall(function() ab:HandleTargetData(handle) end)
+                if not hOk then
+                    via = "ApplyHitscanEffect"
+                    pcall(function() ab:ApplyHitscanEffect(handle) end)
+                end
+                local now = os.clock()
+                if now - lastMagicLog > 2 then
+                    lastMagicLog = now
+                    pcall(function() log("bullets: MAGIC HIT (%s) -> %s", via, target:GetClass():GetFName():ToString()) end)
+                end
+            end)
+            if not ok then logErrorOnce("bullets-magichit", tostring(err)) end
+        end)
+    end)
+end
+
 local function onFireAbility(self)
     local ok, err = pcall(function()
         if not (state.aim and aimCfg.bullets and ready) then return end
@@ -1171,6 +1221,9 @@ local function onFireAbility(self)
             ta.TargetingSpreadMax = 0.0
             ta.EndpointAimType = target and AIM_SOFT_TARGET or AIM_CAMERA_FWD
         end)
+
+        -- guaranteed damage regardless of where the trace actually goes
+        if target then scheduleMagicHit(ab) end
 
         local now = os.clock()
         if now - lastHitscanLog > 2 then
