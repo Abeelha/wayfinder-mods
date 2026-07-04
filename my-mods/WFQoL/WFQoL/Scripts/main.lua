@@ -735,7 +735,7 @@ local aimMagnetized = false
 --   bullets magic bullets (kept, off by default - the damage-inject path)
 local AIMCFG_REL = "Mods/WFQoL/aim-config.json"
 local AIMCFG_ABS = "D:/SteamLibrary/steamapps/common/Wayfinder/Atlas/Binaries/Win64/Mods/WFQoL/aim-config.json"
-local aimCfg = { fov = 30.0, smooth = 0.5, aimbot = true, bullets = false }
+local aimCfg = { fov = 40.0, smooth = 1.0, aimbot = true, bullets = false }
 local aimCfgRaw = nil
 
 local PULL_DEADZONE = 0.25 -- degrees; inside this, hands off
@@ -850,16 +850,24 @@ end)
 -- still fights back because every tick re-reads the current rotation.
 -- SetControlRotation is the pawn-controller rotation the camera follows.
 local aimPulling = false
+local lockedTarget = nil          -- sticky: hold one target until dead / out of view
+local aimConfirmLogged = false
 LoopAsync(16, function()
     if not (state.aim and ready) then return false end
     ExecuteInGameThread(function()
         local ok, err = pcall(function()
             local pawn = getPawn()
-            if not pawn or not aimbotEngaged(pawn) then aimPulling = false return end
+            if not pawn or not aimbotEngaged(pawn) then aimPulling = false lockedTarget = nil return end
             local tc = pawn.TargetingComponent
             if not tc or not tc:IsValid() then return end
-            local target = tc:GetMagnetizedAimTarget()
-            if not target or not target:IsValid() then aimPulling = false return end
+
+            -- sticky lock: keep the same target while alive; else re-acquire
+            local target = nil
+            if lockedTarget and lockedTarget:IsValid() then target = lockedTarget end
+            if not target then
+                target = tc:GetMagnetizedAimTarget()
+                if not (target and target:IsValid()) then aimPulling = false lockedTarget = nil return end
+            end
             local controller = pawn:GetController()
             if not controller or not controller:IsValid() then return end
 
@@ -875,37 +883,64 @@ LoopAsync(16, function()
 
             local dx, dy, dz = tgtLoc.X - camLoc.X, tgtLoc.Y - camLoc.Y, tgtLoc.Z - camLoc.Z
             local dist2d = math.sqrt(dx * dx + dy * dy)
-            if dist2d < 50 then return end
+            if dist2d < 30 then return end
             local wantYaw = math.deg(math.atan(dy, dx))
             local wantPitch = math.deg(math.atan(dz, dist2d))
             local cur = controller:GetControlRotation()
             local dyaw = normDeg(wantYaw - cur.Yaw)
             local dpitch = normDeg(wantPitch - cur.Pitch)
-            -- FOV gate: only snap to a target already near the crosshair
-            if math.abs(dyaw) > aimCfg.fov or math.abs(dpitch) > aimCfg.fov then
+
+            -- FOV gate: acquire only inside the cone; a locked target gets a
+            -- wider leash before we drop it (so it stays glued through motion)
+            local gate = (target == lockedTarget) and (aimCfg.fov * 2.0) or aimCfg.fov
+            if math.abs(dyaw) > gate or math.abs(dpitch) > gate then
+                lockedTarget = nil
                 aimPulling = false
                 return
             end
-            if math.abs(dyaw) < PULL_DEADZONE and math.abs(dpitch) < PULL_DEADZONE then return end
+            lockedTarget = target
 
-            -- exponential approach: smooth = fraction of remaining angle per
-            -- 16ms tick (1.0 = instant lock). big cap so a high smooth truly snaps
+            -- HARD LOCK at smooth>=0.99: write the exact look-at rotation every
+            -- tick so the camera stays glued. below that, ease in by fraction.
             local k = aimCfg.smooth
-            local cap = 40.0 * k
-            local function step(d)
-                local p = d * k
-                if p > cap then p = cap elseif p < -cap then p = -cap end
-                return p
+            local newYaw, newPitch
+            if k >= 0.99 then
+                newYaw = wantYaw
+                newPitch = wantPitch
+            else
+                local cap = 60.0 * k
+                local function step(d)
+                    local p = d * k
+                    if p > cap then p = cap elseif p < -cap then p = -cap end
+                    return p
+                end
+                newYaw = normDeg(cur.Yaw + step(dyaw))
+                newPitch = normDeg(cur.Pitch + step(dpitch))
             end
-            local py, pp = step(dyaw), step(dpitch)
-            lastPullYaw, lastPullPitch = py, pp
-            local newPitch = normDeg(cur.Pitch + pp)
+            lastPullYaw, lastPullPitch = normDeg(newYaw - cur.Yaw), normDeg(newPitch - cur.Pitch)
             if newPitch > 80 then newPitch = 80 elseif newPitch < -80 then newPitch = -80 end
-            controller:SetControlRotation({ Pitch = newPitch, Yaw = normDeg(cur.Yaw + py), Roll = 0.0 })
+            controller:SetControlRotation({ Pitch = newPitch, Yaw = normDeg(newYaw), Roll = 0.0 })
+
             if not aimPulling then
                 aimPulling = true
-                pcall(function() log("aimbot: locking %s (dyaw=%.1f dpitch=%.1f)",
+                pcall(function() log("aimbot: LOCKED %s (dyaw=%.1f dpitch=%.1f)",
                     target:GetClass():GetFName():ToString(), dyaw, dpitch) end)
+            end
+            -- one-time proof the write actually sticks (game not overriding it)
+            if not aimConfirmLogged then
+                aimConfirmLogged = true
+                local wroteYaw = normDeg(newYaw)
+                ExecuteWithDelay(50, function()
+                    ExecuteInGameThread(function()
+                        pcall(function()
+                            local c2 = pawn:GetController()
+                            if c2 and c2:IsValid() then
+                                local r = c2:GetControlRotation()
+                                log("aimbot: write check wanted yaw=%.1f, now=%.1f", wroteYaw, r.Yaw)
+                            end
+                        end)
+                    end)
+                end)
             end
         end)
         if not ok then logErrorOnce("aimbot", tostring(err)) end

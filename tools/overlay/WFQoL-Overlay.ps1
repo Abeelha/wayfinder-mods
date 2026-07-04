@@ -150,7 +150,7 @@ function Set-Pill($prop, $on) {
 # ---- aim config: sliders write aim-config.json, the Lua mod hot-reloads it ----
 $AimCfgFile = Join-Path (Split-Path $StateFile) "aim-config.json"
 $script:aimCfgDirty = $false
-$aimDefaults = @{ fov = 30.0; smooth = 0.5; aimbot = $true; bullets = $false }
+$aimDefaults = @{ fov = 40.0; smooth = 1.0; aimbot = $true; bullets = $false }
 try {
     if (Test-Path $AimCfgFile) {
         $c = Get-Content $AimCfgFile -Raw | ConvertFrom-Json
