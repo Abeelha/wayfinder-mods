@@ -783,8 +783,10 @@ local function aimEngaged(pawn)
     return isAimingNow(pawn) or m1Held
 end
 
+-- hard lock: engage whenever the aimbot is on. no need to ADS or fire first;
+-- the FOV cone is what limits it to enemies near the crosshair.
 local function aimbotEngaged(pawn)
-    return state.aim and aimCfg.aimbot and (isAimingNow(pawn) or m1Held)
+    return state.aim and aimCfg.aimbot
 end
 local aimSettingsDone = false
 local function applyAimSettings()
@@ -861,11 +863,20 @@ LoopAsync(16, function()
             local tc = pawn.TargetingComponent
             if not tc or not tc:IsValid() then return end
 
-            -- sticky lock: keep the same target while alive; else re-acquire
+            -- sticky lock: keep the same target while alive; else acquire a
+            -- fresh one directly (don't depend on the magnetizer's own gate,
+            -- so the aimbot works even when not ADS/firing)
             local target = nil
             if lockedTarget and lockedTarget:IsValid() then target = lockedTarget end
             if not target then
                 target = tc:GetMagnetizedAimTarget()
+                if not (target and target:IsValid()) then
+                    pcall(function() tc:FindSoftLockTarget(aimWeights, false, true) end)
+                    pcall(function()
+                        local a = tc.m_CurrentSoftLockTargetResults.AssociatedTargets
+                        if a and #a > 0 then target = a[1] end
+                    end)
+                end
                 if not (target and target:IsValid()) then aimPulling = false lockedTarget = nil return end
             end
             local controller = pawn:GetController()

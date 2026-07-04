@@ -245,15 +245,23 @@ if (Test-Path $cfgPath) {
     $window.Left = 40; $window.Top = 200
 }
 
-# rescue off-screen positions (monitor changes etc)
+# rescue off-screen positions (monitor changes etc). check BOTH the virtual
+# desktop AND the primary screen: a window dragged onto a 2nd monitor or past
+# the primary right edge passes the virtual-bounds test but is invisible on
+# the monitor the game runs on, so also require it to sit on the primary.
 $vsLeft = [Windows.SystemParameters]::VirtualScreenLeft
 $vsTop = [Windows.SystemParameters]::VirtualScreenTop
 $vsRight = $vsLeft + [Windows.SystemParameters]::VirtualScreenWidth
 $vsBottom = $vsTop + [Windows.SystemParameters]::VirtualScreenHeight
-if ($window.Left -lt ($vsLeft - 30) -or $window.Left -gt ($vsRight - 60) -or
-    $window.Top -lt ($vsTop - 30) -or $window.Top -gt ($vsBottom - 60)) {
-    OLog "position off-screen ($($window.Left),$($window.Top)) - reset to 40,200"
-    $window.Left = 40; $window.Top = 200
+$pw = [Windows.SystemParameters]::PrimaryScreenWidth
+$ph = [Windows.SystemParameters]::PrimaryScreenHeight
+$offVirtual = ($window.Left -lt ($vsLeft - 30) -or $window.Left -gt ($vsRight - 60) -or
+    $window.Top -lt ($vsTop - 30) -or $window.Top -gt ($vsBottom - 60))
+$offPrimary = ($window.Left -lt -30 -or $window.Left -gt ($pw - 60) -or
+    $window.Top -lt -30 -or $window.Top -gt ($ph - 60))
+if ($offVirtual -or $offPrimary) {
+    OLog "position off-screen ($($window.Left),$($window.Top)) primaryW=$pw - reset onto primary"
+    $window.Left = [Math]::Max(20, $pw - $window.Width - 40); $window.Top = 200
 }
 OLog "window at $($window.Left),$($window.Top) size $($window.Width)x$($window.Height) locked=$($script:locked)"
 
@@ -331,13 +339,13 @@ $timer.Add_Tick({
             if ($script:pollCount -eq 1) { OLog "first state read OK (age ${age}s, stale=$stale)" }
         } catch { $stale = $true; OLog "state read error: $_" }
     }
-    # resident behavior: card only exists on screen while the game heartbeat is fresh
-    if ($stale) {
-        if ($window.IsVisible) { $window.Hide(); $lockChip.Hide(); OLog "game heartbeat stale - hiding" }
-    } else {
-        if (-not $window.IsVisible) { $window.Show(); $lockChip.Show(); OLog "game heartbeat fresh - showing" }
-        Move-Chip # cheap follow: keeps the chip glued through drags and resizes
-    }
+    # ALWAYS visible while the overlay runs - never vanish on the user. when the
+    # game heartbeat is stale (alt-tab, loading, game closed) just flag "offline"
+    # and dim the combat dot; keep the card exactly where they put it.
+    if (-not $window.IsVisible) { $window.Show(); $lockChip.Show() }
+    $offlineText.Visibility = if ($stale) { "Visible" } else { "Collapsed" }
+    if ($stale) { $combatDot.Fill = "#555560" }
+    Move-Chip
 })
 $timer.Start()
 
