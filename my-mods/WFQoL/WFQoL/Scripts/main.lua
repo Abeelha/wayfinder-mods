@@ -1061,6 +1061,83 @@ local function onProjectileFn(self)
     pcall(function() onProjectile(self:get()) end)
 end
 
+-- session 18 finding: the BASIC rifle attack is HITSCAN
+-- (GA_Player_RangedWeapon_Fire_Batched CDO: IsHitscanWeapon=true) - it never
+-- spawns projectile actors, it line-traces via a WFTargetActor_LineTrace.
+-- magic bullets for hitscan = the game's own enum: the trace actor's
+-- EndpointAimType supports AimAtSoftTargetActor (=1) - the trace END becomes
+-- the soft-lock target our magnetizer acquires, regardless of where the
+-- camera points. plus every spread var on ability AND trace actor zeroed =
+-- laser accuracy. props persist on the instanced ability, re-asserted on
+-- every fire activation.
+local AIM_SOFT_TARGET = 1   -- EWFTargetActorEndLocationAimingType::AimAtSoftTargetActor
+local AIM_CAMERA_FWD = 2    -- ::AimAtCameraForward
+local lastHitscanLog = 0.0
+
+local function currentBulletTarget(pawn)
+    local tc = pawn.TargetingComponent
+    if not tc or not tc:IsValid() then return nil end
+    local target = tc:GetMagnetizedAimTarget()
+    if not (target and target:IsValid()) then
+        pcall(function() tc:FindSoftLockTarget(aimWeights, false, true) end)
+        pcall(function()
+            local t = tc.m_CurrentSoftLockTargetResults.AssociatedTargets
+            if t and #t > 0 then target = t[1] end
+        end)
+    end
+    if not (target and target:IsValid()) then return nil end
+    local controller = pawn:GetController()
+    if not controller or not controller:IsValid() then return nil end
+    local camLoc = nil
+    pcall(function() camLoc = controller.PlayerCameraManager:GetCameraLocation() end)
+    if not camLoc then camLoc = pawn:K2_GetActorLocation() end
+    local tgtLoc = target:K2_GetActorLocation()
+    if angleToTarget(controller, camLoc, tgtLoc) > aimCfg.fov then return nil end
+    return target
+end
+
+local function onFireAbility(self)
+    local ok, err = pcall(function()
+        if not (state.aim and aimCfg.bullets and ready) then return end
+        local ab = self:get()
+        if not ab:IsValid() then return end
+        local pawn = getPawn()
+        if not pawn then return end
+
+        -- laser accuracy on the ability's own spread vars
+        pcall(function()
+            ab.BaseSpread = 0.0
+            ab.AimSpreadModifier = 0.0
+            ab.SpreadIncrement = 0.0
+            ab.SpreadMax = 0.0
+        end)
+
+        local target = currentBulletTarget(pawn)
+        pcall(function()
+            local ta = ab.TraceTargetActor
+            if not (ta and ta:IsValid()) then return end
+            ta.BaseSpread = 0.0
+            ta.AimingSpreadMod = 0.0
+            ta.TargetingSpreadIncrement = 0.0
+            ta.TargetingSpreadMax = 0.0
+            ta.EndpointAimType = target and AIM_SOFT_TARGET or AIM_CAMERA_FWD
+        end)
+
+        local now = os.clock()
+        if now - lastHitscanLog > 2 then
+            lastHitscanLog = now
+            if target then
+                pcall(function()
+                    log("bullets: hitscan locked -> %s", target:GetClass():GetFName():ToString())
+                end)
+            else
+                log("bullets: hitscan zero-spread (no target in fov)")
+            end
+        end
+    end)
+    if not ok then logErrorOnce("bullets-hitscan", tostring(err)) end
+end
+
 -- ---------------------------------------------------------------- overlay state file
 -- consumed by the external overlay app (tools/overlay/WFQoL-Overlay.ps1).
 -- pure Lua io: safe to run any time, no engine access.
@@ -1122,6 +1199,12 @@ local function registerAll()
     tryHook(WFPROJ_BP .. ":ReceiveBeginPlay", onProjectileFn)
     tryHook(WFPROJ_BP .. ":ComputeInitialSpeed", onProjectileFn)
     tryHook(WFPROJ_BP .. ":FindTargetActor", onProjectileFn)
+    -- magic bullets: hitscan fire abilities (basic attacks) - every variant
+    local FIREDIR = "/Game/Blueprints/Player/GAS/GameplayAbilities/RangedWeapon/"
+    tryHook(FIREDIR .. "GA_Player_RangedWeapon_Fire_Batched.GA_Player_RangedWeapon_Fire_Batched_C:K2_ActivateAbility", onFireAbility)
+    tryHook(FIREDIR .. "GA_Player_RangedWeapon_Fire_Batched_Burst.GA_Player_RangedWeapon_Fire_Batched_Burst_C:K2_ActivateAbility", onFireAbility)
+    tryHook(FIREDIR .. "GA_Player_RangedWeapon_Fire_Batched_Rail.GA_Player_RangedWeapon_Fire_Batched_Rail_C:K2_ActivateAbility", onFireAbility)
+    tryHook(FIREDIR .. "GA_Player_RangedWeapon_Fire_Batched_Shotgun.GA_Player_RangedWeapon_Fire_Batched_Shotgun_C:K2_ActivateAbility", onFireAbility)
     -- ground-truth signals from the game's own success/fail cues (preloaded)
     tryHook("/Game/Blueprints/GameplayCueNotifies/Ability/2HR/GCNA_2HR_ActiveReload_Success.GCNA_2HR_ActiveReload_Success_C:K2_HandleGameplayCue", function()
         successThisCycle = true
