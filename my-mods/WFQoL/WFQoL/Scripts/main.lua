@@ -768,6 +768,15 @@ local function onReloadActivated(self)
     local ok, err = pcall(function()
         local ab = self:get()
         if not (ab and ab:IsValid()) then return end -- MP: skip remote/invalid reload abilities
+        -- MP: only OUR reload - never apply window-forcing/press-injection to a
+        -- remote player's replicated reload (would touch their ability + everyone's
+        -- attribute sets)
+        local avatar = nil
+        pcall(function() avatar = ab:GetAvatarActorFromActorInfo() end)
+        if avatar and avatar:IsValid() then
+            local mine = getPawn()
+            if mine and addrOf(avatar) ~= addrOf(mine) then return end
+        end
         local t0 = os.clock()
         successThisCycle = false
         currentReload = { t0 = t0, maxT = nil, pressed = false, successClass = nil }
@@ -908,7 +917,8 @@ local function registerAll()
     tryHook(CHAR .. ":InpActEvt_Attack1_K2Node_InputActionEvent_36", function(self)
         if injecting then return end
         m1Held = true
-        pawnRef = self:get()
+        local p = self:get()
+        if p and p:IsValid() then pawnRef = p end -- guard: never cache an invalid pawn
     end)
     tryHook(CHAR .. ":InpActEvt_Attack1_K2Node_InputActionEvent_37", function(self)
         if injecting then return end
@@ -941,11 +951,11 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, New
     -- "Error executing hook pre-callback ClientRestart" and can abort a transition
     local hookOk, hookErr = pcall(function()
         transitionAt = os.clock() -- arm the settle gate: actors are (un)constructing
+        ready = true
+        m1Held = false
         local ok, p = pcall(function() return NewPawn:get() end)
-        if ok then
-            pawnRef = p
-            ready = true
-            m1Held = false
+        if ok and p and p:IsValid() then
+            pawnRef = p -- cache only a VALID pawn; else getPawn re-finds the local one
             pcall(function() log("pawn: %s", p:GetClass():GetFName():ToString()) end)
         end
         libCache = nil
