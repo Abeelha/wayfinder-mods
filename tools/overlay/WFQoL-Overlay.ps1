@@ -24,6 +24,22 @@ if (-not $mutex.WaitOne(0)) { OLog "another instance already running - exiting";
 OLog "overlay starting (PS $($PSVersionTable.PSVersion))"
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
+# WS_EX_NOACTIVATE: overlay never steals foreground focus from the game (no more
+# mouse-unfocus / window-switch beep). clicks on the rows still register - the
+# window just doesn't become the active window. applied at SourceInitialized.
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class WinNoActivate {
+    [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+    [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+    public static void Apply(IntPtr h) {
+        int ex = GetWindowLong(h, -20);        // GWL_EXSTYLE
+        SetWindowLong(h, -20, ex | 0x08000000); // WS_EX_NOACTIVATE
+    }
+}
+"@
+
 $CmdFile = Join-Path (Split-Path $StateFile) "overlay-cmd.json"
 
 # FONT: Cascadia Mono ships on Win11; falls back to Consolas. Swap the family
@@ -34,7 +50,7 @@ $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="WFQoL" WindowStyle="None" Background="#0F1116" Topmost="True"
-        ShowInTaskbar="False" Width="230" Height="236"
+        ShowActivated="False" ShowInTaskbar="False" Width="230" Height="236"
         MinWidth="150" MinHeight="120" ResizeMode="CanResize"
         UseLayoutRounding="True" SnapsToDevicePixels="True">
   <Border BorderBrush="#2C313C" BorderThickness="1">
@@ -184,8 +200,13 @@ $resizeGrip.Add_DragDelta({
 })
 $resizeGrip.Add_DragCompleted({ Save-Config })
 
-$window.Add_SourceInitialized({ try { Apply-Lock } catch { OLog "init lock err: $_" } })
-$window.Add_Loaded({ try { $window.Activate() } catch {} })
+$window.Add_SourceInitialized({
+    try { Apply-Lock } catch { OLog "init lock err: $_" }
+    try {
+        $h = (New-Object System.Windows.Interop.WindowInteropHelper($window)).Handle
+        [WinNoActivate]::Apply($h)
+    } catch { OLog "no-activate err: $_" }
+})
 
 # ------------------------------------------------------------------ state poll
 $script:staleSince = $null
