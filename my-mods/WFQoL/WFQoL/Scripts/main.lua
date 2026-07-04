@@ -3,7 +3,7 @@
 --   F8  AutoParry  - timed parry/block just before enemy melee hits land
 --   F6  AutoSprint - sprint while moving out of combat (foot + mount)
 --   F9  AutoReload - reload minigame always lands the perfect window
---   F10 AimAssist  - controller aim assist (soft lock/magnetism) on KB+M
+--   F10 Aimbot     - snap camera onto nearest enemy in FOV while aiming/firing
 --   INS overlay on/off
 --
 -- Safety rule (learned the hard way): no FindAllOf/ExecuteInGameThread engine
@@ -728,16 +728,14 @@ local aimMagnetized = false
 
 -- tunables live in Mods/WFQoL/aim-config.json, written by the overlay's
 -- sliders and hot-reloaded here every second:
---   fov      degrees around the crosshair targets are acquired in (2-90)
---   bullets  magic bullets: our projectiles home into the acquired target
---   strength homing acceleration, 0-1 (1 = bullets take hard curves)
---   pull     camera-pull assist on/off (bullets made this mostly obsolete)
---   smooth   camera pull: fraction of remaining angle per 16ms tick
---   adsOnly  camera pull only while ADS (acquisition always runs when
---            aiming OR firing - bullets need a target during hipfire too)
+--   fov     degrees around the crosshair a target is grabbed + snapped (2-90)
+--   smooth  snap strength: fraction of the remaining angle per 16ms tick
+--           (0.05 = slow drag ... 1.0 = instant lock)
+--   aimbot  master on/off for the camera snap
+--   bullets magic bullets (kept, off by default - the damage-inject path)
 local AIMCFG_REL = "Mods/WFQoL/aim-config.json"
 local AIMCFG_ABS = "D:/SteamLibrary/steamapps/common/Wayfinder/Atlas/Binaries/Win64/Mods/WFQoL/aim-config.json"
-local aimCfg = { fov = 20.0, smooth = 0.15, adsOnly = true, bullets = true, strength = 0.6, pull = false }
+local aimCfg = { fov = 30.0, smooth = 0.5, aimbot = true, bullets = false }
 local aimCfgRaw = nil
 
 local PULL_DEADZONE = 0.25 -- degrees; inside this, hands off
@@ -753,20 +751,15 @@ LoopAsync(1000, function()
         aimCfgRaw = raw
         local fov = tonumber(raw:match('"fov"%s*:%s*([%d%.]+)'))
         local smooth = tonumber(raw:match('"smooth"%s*:%s*([%d%.]+)'))
-        local strength = tonumber(raw:match('"strength"%s*:%s*([%d%.]+)'))
-        local ads = raw:match('"adsOnly"%s*:%s*(%a+)')
+        local aimbot = raw:match('"aimbot"%s*:%s*(%a+)')
         local bullets = raw:match('"bullets"%s*:%s*(%a+)')
-        local pull = raw:match('"pull"%s*:%s*(%a+)')
         if fov then aimCfg.fov = math.max(2, math.min(90, fov)) end
         if smooth then aimCfg.smooth = math.max(0.02, math.min(1, smooth)) end
-        if strength then aimCfg.strength = math.max(0, math.min(1, strength)) end
-        if ads then aimCfg.adsOnly = (ads == "true") end
+        if aimbot then aimCfg.aimbot = (aimbot == "true") end
         if bullets then aimCfg.bullets = (bullets == "true") end
-        if pull then aimCfg.pull = (pull == "true") end
-        aimWeights.Yaw = math.min(90, aimCfg.fov * 1.5) -- acquire wider than we pull
-        log("aim: config fov=%.0f bullets=%s strength=%.2f pull=%s smooth=%.2f adsOnly=%s",
-            aimCfg.fov, tostring(aimCfg.bullets), aimCfg.strength,
-            tostring(aimCfg.pull), aimCfg.smooth, tostring(aimCfg.adsOnly))
+        aimWeights.Yaw = math.min(90, aimCfg.fov * 1.5) -- acquire wider than we snap
+        log("aim: config fov=%.0f smooth=%.2f aimbot=%s bullets=%s",
+            aimCfg.fov, aimCfg.smooth, tostring(aimCfg.aimbot), tostring(aimCfg.bullets))
     end)
     return false
 end)
@@ -784,18 +777,14 @@ local function isAimingNow(pawn)
     return aiming
 end
 
--- acquisition: any time we're aiming OR firing (bullets need targets on hipfire)
+-- acquisition + snap: while aiming down sights OR firing
 local function aimEngaged(pawn)
     if not state.aim then return false end
     return isAimingNow(pawn) or m1Held
 end
 
--- camera pull: its own gates on top
-local function pullEngaged(pawn)
-    if not (state.aim and aimCfg.pull) then return false end
-    if isAimingNow(pawn) then return true end
-    if not aimCfg.adsOnly and m1Held then return true end
-    return false
+local function aimbotEngaged(pawn)
+    return state.aim and aimCfg.aimbot and (isAimingNow(pawn) or m1Held)
 end
 local aimSettingsDone = false
 local function applyAimSettings()
@@ -854,19 +843,19 @@ LoopAsync(100, function()
     return false
 end)
 
--- camera pull toward the magnetized target. look-at math in plain Lua, and
--- the rotation is WRITTEN via SetControlRotation - the additive
--- AddController*Input route went through the game's input pipeline which
--- scales/dampens it to nothing during ADS (session 15: calls executed
--- errorless, zero movement). direct writes bypass all of that; the mouse
--- still fights back fine because every tick re-reads the current rotation.
+-- AIMBOT: snap the camera onto the acquired target while aiming or firing.
+-- look-at math in plain Lua, rotation WRITTEN via SetControlRotation - the
+-- additive AddController*Input route is dampened to nothing during ADS (the
+-- game's aim-friction scalars). direct writes bypass all of that; the mouse
+-- still fights back because every tick re-reads the current rotation.
+-- SetControlRotation is the pawn-controller rotation the camera follows.
 local aimPulling = false
 LoopAsync(16, function()
     if not (state.aim and ready) then return false end
     ExecuteInGameThread(function()
         local ok, err = pcall(function()
             local pawn = getPawn()
-            if not pawn or not pullEngaged(pawn) then aimPulling = false return end
+            if not pawn or not aimbotEngaged(pawn) then aimPulling = false return end
             local tc = pawn.TargetingComponent
             if not tc or not tc:IsValid() then return end
             local target = tc:GetMagnetizedAimTarget()
@@ -892,6 +881,7 @@ LoopAsync(16, function()
             local cur = controller:GetControlRotation()
             local dyaw = normDeg(wantYaw - cur.Yaw)
             local dpitch = normDeg(wantPitch - cur.Pitch)
+            -- FOV gate: only snap to a target already near the crosshair
             if math.abs(dyaw) > aimCfg.fov or math.abs(dpitch) > aimCfg.fov then
                 aimPulling = false
                 return
@@ -899,9 +889,9 @@ LoopAsync(16, function()
             if math.abs(dyaw) < PULL_DEADZONE and math.abs(dpitch) < PULL_DEADZONE then return end
 
             -- exponential approach: smooth = fraction of remaining angle per
-            -- 16ms tick (1.0 = instant snap), capped so low smooth stays gentle
+            -- 16ms tick (1.0 = instant lock). big cap so a high smooth truly snaps
             local k = aimCfg.smooth
-            local cap = 12.0 * k
+            local cap = 40.0 * k
             local function step(d)
                 local p = d * k
                 if p > cap then p = cap elseif p < -cap then p = -cap end
@@ -910,14 +900,15 @@ LoopAsync(16, function()
             local py, pp = step(dyaw), step(dpitch)
             lastPullYaw, lastPullPitch = py, pp
             local newPitch = normDeg(cur.Pitch + pp)
-            if newPitch > 75 then newPitch = 75 elseif newPitch < -75 then newPitch = -75 end
+            if newPitch > 80 then newPitch = 80 elseif newPitch < -80 then newPitch = -80 end
             controller:SetControlRotation({ Pitch = newPitch, Yaw = normDeg(cur.Yaw + py), Roll = 0.0 })
             if not aimPulling then
                 aimPulling = true
-                log("aim: pulling (dyaw=%.1f dpitch=%.1f)", dyaw, dpitch)
+                pcall(function() log("aimbot: locking %s (dyaw=%.1f dpitch=%.1f)",
+                    target:GetClass():GetFName():ToString(), dyaw, dpitch) end)
             end
         end)
-        if not ok then logErrorOnce("aimpull", tostring(err)) end
+        if not ok then logErrorOnce("aimbot", tostring(err)) end
     end)
     return false
 end)
@@ -1361,7 +1352,7 @@ bindToggle(Key.F6, "sprint", "AutoSprint")
 bindToggle(Key.F7, "chain", "AutoChain")
 bindToggle(Key.F8, "parry", "AutoParry")
 bindToggle(Key.F9, "reload", "AutoReload")
-bindToggle(Key.F10, "aim", "AimAssist")
+bindToggle(Key.F10, "aim", "Aimbot")
 
 -- F5: one-shot diagnostic dump (mount debugging etc)
 RegisterKeyBind(Key.F5, function()

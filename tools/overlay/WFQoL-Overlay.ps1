@@ -40,7 +40,7 @@ $xaml = @'
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="WFQoL Overlay" WindowStyle="None" AllowsTransparency="True"
         Background="Transparent" Topmost="True" ShowInTaskbar="False"
-        Width="280" Height="310" MinWidth="180" MinHeight="150"
+        Width="280" Height="368" MinWidth="180" MinHeight="150"
         ResizeMode="CanResizeWithGrip">
   <Border CornerRadius="14" Background="#DD0E1116" BorderBrush="#2FFFFFFF" BorderThickness="1" Padding="6">
     <Viewbox Stretch="Uniform">
@@ -94,7 +94,7 @@ $features = @(
     @{ Name = "CHAIN";  Key = "F7"; Prop = "chain" },
     @{ Name = "PARRY";  Key = "F8"; Prop = "parry" },
     @{ Name = "RELOAD"; Key = "F9"; Prop = "reload" },
-    @{ Name = "AIM";    Key = "F10"; Prop = "aim" }
+    @{ Name = "AIMBOT"; Key = "F10"; Prop = "aim" }
 )
 $pills = @{}
 $modeChip = $null
@@ -150,21 +150,19 @@ function Set-Pill($prop, $on) {
 # ---- aim config: sliders write aim-config.json, the Lua mod hot-reloads it ----
 $AimCfgFile = Join-Path (Split-Path $StateFile) "aim-config.json"
 $script:aimCfgDirty = $false
-$aimDefaults = @{ fov = 20.0; smooth = 0.15; adsOnly = $true; bullets = $true; strength = 0.6; pull = $false }
+$aimDefaults = @{ fov = 30.0; smooth = 0.5; aimbot = $true; bullets = $false }
 try {
     if (Test-Path $AimCfgFile) {
         $c = Get-Content $AimCfgFile -Raw | ConvertFrom-Json
         if ($null -ne $c.fov) { $aimDefaults.fov = [double]$c.fov }
         if ($null -ne $c.smooth) { $aimDefaults.smooth = [double]$c.smooth }
-        if ($null -ne $c.adsOnly) { $aimDefaults.adsOnly = [bool]$c.adsOnly }
+        if ($null -ne $c.aimbot) { $aimDefaults.aimbot = [bool]$c.aimbot }
         if ($null -ne $c.bullets) { $aimDefaults.bullets = [bool]$c.bullets }
-        if ($null -ne $c.strength) { $aimDefaults.strength = [double]$c.strength }
-        if ($null -ne $c.pull) { $aimDefaults.pull = [bool]$c.pull }
     }
 } catch { OLog "aim cfg load error: $_" }
 
 $cfgHeader = New-Object Windows.Controls.TextBlock
-$cfgHeader.Text = "AIM CONFIG"; $cfgHeader.FontFamily = "Consolas"; $cfgHeader.FontSize = 10
+$cfgHeader.Text = "AIMBOT CONFIG"; $cfgHeader.FontFamily = "Consolas"; $cfgHeader.FontSize = 10
 $cfgHeader.Foreground = "#6E6E78"; $cfgHeader.Margin = "2,8,0,2"
 [void]$rows.Children.Add($cfgHeader)
 
@@ -206,22 +204,29 @@ function Add-CfgCheck($label, $checked) {
 }
 
 $script:fovCtl = Add-CfgSlider "FOV" 2 90 $aimDefaults.fov "0"
+$script:smoothCtl = Add-CfgSlider "SNAP" 0.02 1.0 $aimDefaults.smooth "0.00"
 $script:fovCtl.Slider.Add_ValueChanged({
     $script:fovCtl.Val.Text = $script:fovCtl.Slider.Value.ToString("0")
     $script:aimCfgDirty = $true
 })
+$script:smoothCtl.Slider.Add_ValueChanged({
+    $script:smoothCtl.Val.Text = $script:smoothCtl.Slider.Value.ToString("0.00")
+    $script:aimCfgDirty = $true
+})
 
-$script:bulletsCheck = Add-CfgCheck "MAGIC BULLETS (always hit)" $aimDefaults.bullets
+$script:aimbotCheck = Add-CfgCheck "AIMBOT (snap camera to enemy)" $aimDefaults.aimbot
+$script:bulletsCheck = Add-CfgCheck "MAGIC BULLETS (damage inject)" $aimDefaults.bullets
 
 function Save-AimCfg {
     try {
         $obj = @{
             fov = [math]::Round($script:fovCtl.Slider.Value, 0)
+            smooth = [math]::Round($script:smoothCtl.Slider.Value, 2)
+            aimbot = [bool]$script:aimbotCheck.IsChecked
             bullets = [bool]$script:bulletsCheck.IsChecked
-            pull = $false
         }
         ($obj | ConvertTo-Json -Compress) | Set-Content -Path $AimCfgFile -Encoding ascii
-        OLog "aim cfg saved: fov=$($obj.fov) bullets=$($obj.bullets)"
+        OLog "aim cfg saved: fov=$($obj.fov) snap=$($obj.smooth) aimbot=$($obj.aimbot) bullets=$($obj.bullets)"
     } catch { OLog "aim cfg save error: $_" }
 }
 if (-not (Test-Path $AimCfgFile)) { Save-AimCfg }
@@ -233,7 +238,7 @@ if (Test-Path $cfgPath) {
     try {
         $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
         if ($cfg.left -ne $null) { $window.Left = $cfg.left; $window.Top = $cfg.top }
-        if ($cfg.width) { $window.Width = $cfg.width; $window.Height = [Math]::Max([double]$cfg.height, 310) }
+        if ($cfg.width) { $window.Width = $cfg.width; $window.Height = [Math]::Max([double]$cfg.height, 368) }
         if ($cfg.locked -ne $null) { $script:locked = [bool]$cfg.locked }
     } catch { OLog "config load failed: $_" }
 } else {
