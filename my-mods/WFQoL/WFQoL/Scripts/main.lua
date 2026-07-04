@@ -178,19 +178,11 @@ local function distTo(a, b)
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
--- the parry abilities reference their stamina-cost effects via SOFT class refs;
--- lazy-loading those mid-combat can land on a non-game thread = fatal crash
--- ("AssembleReferenceTokenStream ... called on a non-game thread"). preload them
--- from a guaranteed game-thread context instead.
+-- static preload (ClientRestart, game thread). weapon PARRY cost/pushback assets
+-- are NOT hardcoded here anymore - preloadAbilityGraph() derives + loads them
+-- universally from whatever weapon is equipped (see below). this list is only for
+-- non-weapon-specific assets that must be loaded early.
 local PRELOAD = {
-    "/Game/Blueprints/Player/GAS/GameplayAbilities/2H/GameplayEffects/GE_2H_Parry_Cooldown",
-    "/Game/Blueprints/Player/GAS/GameplayAbilities/2H/GameplayEffects/GE_2H_Parry_DamageReduction",
-    "/Game/Blueprints/Player/GAS/GameplayAbilities/DW/GameplayEffects/GE_Player_DW_ConsumeStamina_Parry",
-    "/Game/Blueprints/Player/GAS/GameplayAbilities/DW/GameplayEffects/GE_Player_DW_ConsumeStamina_Parry_Survivalist",
-    "/Game/Blueprints/Player/GAS/GameplayAbilities/DW/GA_Player_DW_Parry_Pushback",
-    "/Game/Blueprints/Player/GAS/GameplayAbilities/DW/TA_Player_DW_Parry_Pushback",
-    "/Game/Blueprints/Player/GAS/GameplayAbilities/SnS/GE_Player_SNS_ConsumeStamina_Parry",
-    "/Game/Blueprints/Player/GAS/GameplayAbilities/SnS/GE_Player_SNS_ConsumeStamina_Parry_Survivalist",
     -- reload success/fail cue notify classes: preloading makes them hookable at spawn
     "/Game/Blueprints/GameplayCueNotifies/Ability/2HR/GCNA_2HR_ActiveReload_Success",
     "/Game/Blueprints/GameplayCueNotifies/Ability/2HR/GCNA_2HR_ActiveReload_Fail",
@@ -210,23 +202,48 @@ end
 -- ClientRestart, game thread) precisely. NO runtime LoadAsset here - the v34
 -- attempt to LoadAsset live class refs mid-combat/every-reload caused a fatal
 -- freed-pointer crash (0xffff...ffff). GetFName()/ToString() is a cheap, safe read.
+-- UNIVERSAL parry preload (replaces the hardcoded-per-weapon PRELOAD approach):
+-- every weapon's block ability lives at .../GameplayAbilities/<WPN>/GA_Player_*,
+-- and its parry cost/cooldown/pushback assets follow fixed name patterns in that
+-- same <WPN> folder (+ <WPN>/GameplayEffects/). so we derive the folder from the
+-- LIVE block ability and sync-load those siblings on the GAME THREAD, once per
+-- weapon (deduped) - covers EVERY weapon type, no per-weapon hardcoding.
+-- activating a block ability whose cost GE hasn't loaded makes the game async-load
+-- it and finalize the class off-thread = the AssembleReferenceTokenStream crash;
+-- pre-loading synchronously here prevents that. non-existent speculative paths are
+-- harmless no-ops (LoadAsset is synchronous, can't off-thread-async-load).
 local abilityGraphPreloaded = {}
 local function preloadAbilityGraph(ability)
     if not ability or not ability:IsValid() then return end
     local ok, key = pcall(function() return ability:GetClass():GetFName():ToString() end)
     if not ok or not key or abilityGraphPreloaded[key] then return end
     abilityGraphPreloaded[key] = true
-    -- log the exact ability CLASS path + its cost-GE path (safe reads: class refs
-    -- persist, all pcall'd + IsValid'd, one-shot per weapon, NO LoadAsset) so the
-    -- precise paths can be added to the static PRELOAD list.
+
     local classPath = "?"
     pcall(function() classPath = ability:GetClass():GetFullName() end)
-    local costGE = "none"
-    pcall(function()
-        local ge = ability.CostGameplayEffectClass
-        if ge and ge:IsValid() then costGE = ge:GetFullName() end
-    end)
-    log("parry: block ability=%s | class=%s | costGE=%s", key, classPath, costGE)
+
+    -- "<ClassType> /Game/.../GA_X.GA_X_C" -> package "/Game/.../GA_X"
+    local objPath = classPath:match("%s(/%S+)$")
+    local pkg = objPath and objPath:match("^(.-)%.")
+    local folder, wpn = nil, nil
+    if pkg then folder, wpn = pkg:match("^(.*/GameplayAbilities/([^/]+))/") end
+    log("parry: block ability=%s folder=%s", key, tostring(folder))
+    if not folder or not wpn then return end -- unrecognized layout: crash+diag will name it
+
+    local seen = {}
+    local function tryLoad(p) if p and not seen[p] then seen[p] = true; pcall(function() LoadAsset(p) end) end end
+    -- token casing varies (folder "SnS" -> GE token "SNS") and GEs live either in
+    -- <WPN>/GameplayEffects/ (2H, DW) OR directly in <WPN>/ (SnS) - try all combos
+    for _, t in ipairs({ wpn, wpn:upper() }) do
+        for _, base in ipairs({ folder .. "/GameplayEffects/", folder .. "/" }) do
+            tryLoad(base .. "GE_Player_" .. t .. "_ConsumeStamina_Parry")
+            tryLoad(base .. "GE_Player_" .. t .. "_ConsumeStamina_Parry_Survivalist")
+            tryLoad(base .. "GE_" .. t .. "_Parry_Cooldown")
+            tryLoad(base .. "GE_" .. t .. "_Parry_DamageReduction")
+        end
+        tryLoad(folder .. "/GA_Player_" .. t .. "_Parry_Pushback")
+        tryLoad(folder .. "/TA_Player_" .. t .. "_Parry_Pushback")
+    end
 end
 
 -- stamina read via the HUD stamina meter widget (same trick ShowNameplates uses)
