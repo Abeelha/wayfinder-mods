@@ -1096,6 +1096,55 @@ local function currentBulletTarget(pawn)
     return target
 end
 
+-- the trace target actor is spawned FRESH per shot by WaitTargetData - edits
+-- to last shot's TA die with it (why v18's persistent writes never bent a
+-- trace). SetStartLocation is the per-shot config call on the NEW instance,
+-- before the trace runs: stamp the aim mode right there. MasterPC gates to
+-- player-owned TAs (enemy trace TAs have no PlayerController).
+local lastTraceLog = 0.0
+local function onTraceTA(self)
+    local ok, err = pcall(function()
+        if not (state.aim and aimCfg.bullets and ready) then return end
+        local ta = self:get()
+        if not ta:IsValid() then return end
+        local isPlayers = false
+        pcall(function()
+            local pc = ta.MasterPC
+            isPlayers = pc and pc:IsValid()
+        end)
+        if not isPlayers then return end
+        local pawn = getPawn()
+        if not pawn then return end
+
+        ta.BaseSpread = 0.0
+        ta.AimingSpreadMod = 0.0
+        ta.TargetingSpreadIncrement = 0.0
+        ta.TargetingSpreadMax = 0.0
+        local target = currentBulletTarget(pawn)
+        if target then
+            ta.EndpointAimType = AIM_SOFT_TARGET
+        end
+        local now = os.clock()
+        if now - lastTraceLog > 2 then
+            lastTraceLog = now
+            if target then
+                pcall(function() log("bullets: trace TA locked -> %s", target:GetClass():GetFName():ToString()) end)
+            else
+                log("bullets: trace TA zero-spread (no target in fov)")
+            end
+        end
+    end)
+    if not ok then logErrorOnce("bullets-ta", tostring(err)) end
+end
+
+NotifyOnNewObject("/Script/Wayfinder.WFTargetActor_LineTrace", function(ta)
+    ExecuteWithDelay(10, function()
+        ExecuteInGameThread(function()
+            pcall(function() onTraceTA({ get = function() return ta end }) end)
+        end)
+    end)
+end)
+
 local function onFireAbility(self)
     local ok, err = pcall(function()
         if not (state.aim and aimCfg.bullets and ready) then return end
@@ -1199,6 +1248,9 @@ local function registerAll()
     tryHook(WFPROJ_BP .. ":ReceiveBeginPlay", onProjectileFn)
     tryHook(WFPROJ_BP .. ":ComputeInitialSpeed", onProjectileFn)
     tryHook(WFPROJ_BP .. ":FindTargetActor", onProjectileFn)
+    -- magic bullets: per-shot config calls on the freshly-spawned trace TA
+    tryHook("/Script/Wayfinder.WFTargetActor_Trace:SetStartLocation", onTraceTA)
+    tryHook("/Script/Wayfinder.WFTargetActor_Trace:SetShouldProduceTargetDataOnServer", onTraceTA)
     -- magic bullets: hitscan fire abilities (basic attacks) - every variant
     local FIREDIR = "/Game/Blueprints/Player/GAS/GameplayAbilities/RangedWeapon/"
     tryHook(FIREDIR .. "GA_Player_RangedWeapon_Fire_Batched.GA_Player_RangedWeapon_Fire_Batched_C:K2_ActivateAbility", onFireAbility)
