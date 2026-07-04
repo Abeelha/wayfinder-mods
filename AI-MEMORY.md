@@ -224,3 +224,8 @@ Per-repo memory. Append-only, concise. Format: `### YYYY-MM-DD - Category - entr
 - FIX (rewrite): hooks install ONCE (hooksInstalled guard); ClientRestart -> onRestart() just refreshes currentPlayer + nulls playerNameplate/hudMeters so ShouldBeVisible rebinds for the new pawn. Drives primary health fill (candidates PlayerHealthBar + characterHealthFill) + trail + additive(shield) + characterStaminaFill; setPct() pcall-guards each so wrong bar names no-op. One-shot diagBars() logs which bars exist -> trim mapping next pass. All native access pcall-wrapped.
 - Repo-tracked at tools/third-party-patches/ShowNameplates/ (main.lua + README). NOT synced by deploy-mods.ps1 (my-mods only) - manual copy. Game-folder original backed up main.lua.wfqol-bak-*. Applies next launch (hot-reload off).
 - NEXT: read log for "[ShowNameplates] bar 'X' present=true/false" -> confirm real bar names, drop the dead candidates.
+
+## v31 (2026-07-04) - re-enabled ConsoleEnablerMod for SmartSort F10 console
+- SmartSort registers its sort command via RegisterConsoleCommandHandler("RunSmartSort",...) (main.lua:260) = needs the in-game console. F10 console = ConsoleEnablerMod (was purged v26). Re-enabled ConsoleEnablerMod:1 in mods.txt (game-side). ConsoleCommandsMod NOT needed (that's a separate command pack; RunSmartSort is self-registered). Other purged tooling stays off.
+- Usage: F10 -> type RunSmartSort -> sorts existing inventory (may freeze briefly). New items auto-sort. Config rules at Mods/SmartSort/scripts/config.lua, restart game to apply rule edits.
+- mods.txt now enabled: ConsoleEnablerMod, ShowNameplates, SmartSort, WFQoL, Keybinds. Applies next launch.
