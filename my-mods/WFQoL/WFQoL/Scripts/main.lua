@@ -103,7 +103,7 @@ local sendRelease = false
 -- reload minigame state lives up here: AutoChain must stop injecting M1 while
 -- the minigame runs (Attack1 AND Reload both count as minigame inputs - a
 -- spammed press outside the window = guaranteed failed reload)
-local currentReload = nil -- { montage, t0, pressAt, maxT }
+local currentReload = nil -- { t0, maxT }
 local function reloadInProgress()
     if not currentReload then return false end
     return (os.clock() - currentReload.t0) < ((currentReload.maxT or 3.0) + 0.5)
@@ -540,42 +540,40 @@ LoopAsync(300, function()
 end)
 
 -- ---------------------------------------------------------------- AutoReload
--- the GA computes its perfect window on activation and stores it on the
--- instance: WindowMin/WindowMax/WindowCenter (normalized 0-1 of the slider)
--- plus MaxReloadTime (seconds). read those and press dead-center of the
--- window. no CheckInWindow polling, no IsActive (both threw via UE4SS).
--- every SUCCESS (auto or manual - R or M1 both trigger the minigame) stores
--- the actual press time per montage; a learned time takes priority forever.
-local LEARN_REL = "Mods/WFQoL/reload-times.txt"
-local LEARN_ABS = "D:/SteamLibrary/steamapps/common/Wayfinder/Atlas/Binaries/Win64/Mods/WFQoL/reload-times.txt"
-local learned = {}
+-- can't-fail by construction: CheckInWindow doesn't compare against the
+-- DISPLAYED WindowMin/WindowMax - it reads an ASC attribute window
+-- (WFRangedWeaponAttributeSet.ActiveReloadCenter/Bounds) +/- the instance's
+-- Tolerance (default 3). so on every activation the check's own operands get
+-- forced wide open: any press by anyone at any time = perfect. the timed
+-- center press stays as the hands-off auto path.
 local RELOAD_LATENCY = 0.03 -- scheduling/input latency compensation, seconds
-
-pcall(function()
-    local f = io.open(LEARN_REL, "r") or io.open(LEARN_ABS, "r")
-    if not f then return end
-    for line in f:lines() do
-        local k, v = line:match("^(.+)=([%d%.]+)$")
-        if k and tonumber(v) then learned[k] = tonumber(v) end
-    end
-    f:close()
-end)
-
-local function saveLearned()
-    pcall(function()
-        local f = io.open(LEARN_REL, "w") or io.open(LEARN_ABS, "w")
-        if not f then return end
-        for k, v in pairs(learned) do f:write(string.format("%s=%.3f\n", k, v)) end
-        f:close()
-    end)
-end
+local windowForcedLogged = false
 
 local function pressReload(elapsed) -- game thread only
     if pawnRef and pawnRef:IsValid() then
         injecting = true
         pawnRef:InpActEvt_Reload_K2Node_InputActionEvent_12(RKEY)
         injecting = false
-        if currentReload then currentReload.pressAt = elapsed end
+    end
+end
+
+local function forceWindowOpen(ab)
+    pcall(function() ab.Tolerance = 1000.0 end)
+    pcall(function() ab.EarlyPressForgivenessPercent = 0.0 end)
+    -- whichever operand the check reads, cover it: widen the attribute window too
+    pcall(function()
+        for _, s in pairs(FindAllOf("WFRangedWeaponAttributeSet") or {}) do
+            if s:IsValid() then
+                pcall(function()
+                    s.ActiveReloadBounds.CurrentValue = 200.0
+                    s.ActiveReloadBounds.BaseValue = 200.0
+                end)
+            end
+        end
+    end)
+    if not windowForcedLogged then
+        windowForcedLogged = true
+        log("reload: window forced open")
     end
 end
 
@@ -609,7 +607,7 @@ local function scheduleWindowPress(ab, t0, attempt)
     if attempt > 10 then
         if not windowUnreadable then
             windowUnreadable = true
-            log("reload: window props unreadable - do one manual perfect reload to teach it")
+            log("reload: window props unreadable - press manually (any time = perfect)")
         end
         return
     end
@@ -652,59 +650,54 @@ end
 local function onReloadActivated(self)
     local ok, err = pcall(function()
         local ab = self:get()
-        local montage = "unknown"
-        pcall(function() montage = ab.ReloadMontage:GetFName():ToString() end)
         local t0 = os.clock()
-        currentReload = { montage = montage, t0 = t0, pressAt = nil, maxT = nil }
+        currentReload = { t0 = t0, maxT = nil }
         pcall(function() currentReload.maxT = ab.MaxReloadTime end)
         if not state.reload then return end
-
-        local t = learned[montage]
-        if t then
-            ExecuteWithDelay(math.max(math.floor((t - RELOAD_LATENCY) * 1000), 20), function()
-                ExecuteInGameThread(function()
-                    pcall(function()
-                        if state.reload and currentReload and currentReload.t0 == t0 then
-                            pressReload(os.clock() - t0)
-                            log("reload: learned press at %.2fs", os.clock() - t0)
-                        end
-                    end)
-                end)
-            end)
-        else
-            scheduleWindowPress(ab, t0)
-        end
+        forceWindowOpen(ab) -- hook runs on game thread, before any press lands
+        scheduleWindowPress(ab, t0)
     end)
     if not ok then logErrorOnce("reload-activate", tostring(err)) end
 end
 
--- success = the game activated the Succeeded ability; whatever press time led
--- here (manual or injected) becomes the learned perfect time for this montage
 local function onReloadSucceeded(self)
     pcall(function()
-        if currentReload and currentReload.pressAt and currentReload.montage ~= "unknown" then
-            local first = learned[currentReload.montage] == nil
-            learned[currentReload.montage] = currentReload.pressAt
-            saveLearned()
-            if first then
-                log("reload: LEARNED perfect time %.2fs for %s", currentReload.pressAt, currentReload.montage)
-            end
-        end
         currentReload = nil
+        log("reload: PERFECT")
     end)
 end
 
 -- ---------------------------------------------------------------- AimAssist
--- the game's own magnetizer only runs for gamepad input and the input-source
--- checks are pure C++ (zero blueprint callers of IsUsingGamepad /
--- GetPlayerInputSource in the whole dump - UFunction hooks never fire). so:
--- run our OWN soft-lock loop. while aiming, ask the pawn's TargetingComponent
--- for the best soft-lock target and write it into m_MagnetizedAimTarget - the
--- same slot the native gamepad path fills. gamepad-spoof hooks kept only as
--- diag counters; bCameraAssistOnGamepad still flipped on at spawn.
-local aimCalls = { gamepad = 0, source = 0 } -- proof whether the hooks fire (F5 diag)
+-- everything gamepad-flavored in the game (magnet consumption, input-source
+-- checks) is C++-gated and unreachable, so the assist is built here from two
+-- ungateable parts:
+--   magnetizer: while aiming, find the best soft-lock target via the pawn's
+--     TargetingComponent and write it into m_MagnetizedAimTarget
+--   camera pull: rotate the camera toward that target ourselves via
+--     AddControllerYaw/PitchInput - gentle, capped, cone-limited, with a
+--     deadzone so the mouse always has the final say
 local aimWeights = { Radius = 3000.0, Yaw = 40.0, bCanTargetFriendly = false, bIgnoreHardLockedTarget = false }
 local aimMagnetized = false
+
+local PULL_RATE = 0.15      -- fraction of the remaining angle applied per tick
+local PULL_CAP = 1.5        -- max degrees per tick
+local PULL_CONE = 20.0      -- only assist when target is within this angle
+local PULL_DEADZONE = 0.3   -- degrees; inside this, hands off
+local INPUT_SCALE = 1 / 2.5 -- AddController*Input units -> degrees (engine default 2.5)
+local lastPullYaw, lastPullPitch = 0.0, 0.0
+
+local function normDeg(a)
+    while a > 180 do a = a - 360 end
+    while a < -180 do a = a + 360 end
+    return a
+end
+
+local function isAimingNow(pawn)
+    local aiming = false
+    pcall(function() aiming = pawn:IsAiming() end)
+    if not aiming then pcall(function() aiming = pawn:IsFreeFireAiming() end) end
+    return aiming
+end
 local aimSettingsDone = false
 local function applyAimSettings()
     if aimSettingsDone then return end
@@ -714,8 +707,10 @@ local function applyAimSettings()
                 local old = nil
                 pcall(function() old = s.bCameraAssistOnGamepad end)
                 s.bCameraAssistOnGamepad = true
+                -- native ADS friction (slowdown over targets); ships defaulted to 0
+                pcall(function() s.ADSAimFriction = 1.0 end)
                 aimSettingsDone = true
-                log("aim: bCameraAssistOnGamepad %s -> true", tostring(old))
+                log("aim: bCameraAssistOnGamepad %s -> true, ADSAimFriction -> 1", tostring(old))
             end
         end
     end)
@@ -730,11 +725,7 @@ LoopAsync(150, function()
             local tc = pawn.TargetingComponent
             if not tc or not tc:IsValid() then return end
 
-            local aiming = false
-            if state.aim then
-                pcall(function() aiming = pawn:IsAiming() end)
-                if not aiming then pcall(function() aiming = pawn:IsFreeFireAiming() end) end
-            end
+            local aiming = state.aim and isAimingNow(pawn)
             if not aiming then
                 if aimMagnetized then
                     pcall(function() tc:ClearMagnetizedAimTarget() end)
@@ -760,6 +751,58 @@ LoopAsync(150, function()
             end
         end)
         if not ok then logErrorOnce("aim", tostring(err)) end
+    end)
+    return false
+end)
+
+-- camera pull toward the magnetized target. look-at math done in plain Lua
+-- (no struct-passing into engine calls to go wrong)
+LoopAsync(33, function()
+    if not (state.aim and ready) then return false end
+    ExecuteInGameThread(function()
+        local ok, err = pcall(function()
+            local pawn = getPawn()
+            if not pawn or not isAimingNow(pawn) then return end
+            local tc = pawn.TargetingComponent
+            if not tc or not tc:IsValid() then return end
+            local target = tc:GetMagnetizedAimTarget()
+            if not target or not target:IsValid() then return end
+            local controller = pawn:GetController()
+            if not controller or not controller:IsValid() then return end
+
+            local camLoc = nil
+            pcall(function() camLoc = controller.PlayerCameraManager:GetCameraLocation() end)
+            if not camLoc then camLoc = pawn:K2_GetActorLocation() end
+            local tgtLoc = nil
+            pcall(function()
+                local s = tc:GetMagnetizedAimTargetSocketLocation()
+                if s and not (s.X == 0 and s.Y == 0 and s.Z == 0) then tgtLoc = s end
+            end)
+            if not tgtLoc then tgtLoc = target:K2_GetActorLocation() end
+
+            local dx, dy, dz = tgtLoc.X - camLoc.X, tgtLoc.Y - camLoc.Y, tgtLoc.Z - camLoc.Z
+            local dist2d = math.sqrt(dx * dx + dy * dy)
+            if dist2d < 50 then return end
+            local wantYaw = math.deg(math.atan(dy, dx))
+            local wantPitch = math.deg(math.atan(dz, dist2d))
+            local cur = controller:GetControlRotation()
+            local dyaw = normDeg(wantYaw - cur.Yaw)
+            local dpitch = normDeg(wantPitch - cur.Pitch)
+            if math.abs(dyaw) > PULL_CONE or math.abs(dpitch) > PULL_CONE then return end
+
+            local function pull(d)
+                if math.abs(d) < PULL_DEADZONE then return 0 end
+                local p = d * PULL_RATE
+                if p > PULL_CAP then p = PULL_CAP elseif p < -PULL_CAP then p = -PULL_CAP end
+                return p
+            end
+            local py, pp = pull(dyaw), pull(dpitch)
+            lastPullYaw, lastPullPitch = py, pp
+            -- pitch input is inverted by engine convention
+            if py ~= 0 then pawn:AddControllerYawInput(py * INPUT_SCALE) end
+            if pp ~= 0 then pawn:AddControllerPitchInput(-pp * INPUT_SCALE) end
+        end)
+        if not ok then logErrorOnce("aimpull", tostring(err)) end
     end)
     return false
 end)
@@ -812,10 +855,6 @@ local function registerAll()
         if injecting then return end
         m1Held = true
         pawnRef = self:get()
-        -- M1 is also a valid minigame trigger: count it as a manual press
-        if reloadInProgress() then
-            currentReload.pressAt = os.clock() - currentReload.t0
-        end
     end)
     tryHook(CHAR .. ":InpActEvt_Attack1_K2Node_InputActionEvent_37", function(self)
         if injecting then return end
@@ -824,24 +863,6 @@ local function registerAll()
     tryHook(AIBASE .. ":K2_ActivateAbility", onEnemyAbility)
     tryHook(RELOAD_GA .. ":K2_ActivateAbility", onReloadActivated)
     tryHook(RELOAD_OK_GA .. ":K2_ActivateAbility", onReloadSucceeded)
-    -- capture YOUR manual reload presses so successes teach the perfect time
-    tryHook(CHAR .. ":InpActEvt_Reload_K2Node_InputActionEvent_12", function(self)
-        if injecting then return end
-        if reloadInProgress() then
-            currentReload.pressAt = os.clock() - currentReload.t0
-        end
-    end)
-    -- aim assist: make the gamepad checks lie while enabled (returning a value
-    -- from a hook callback overrides the UFunction's return value - same
-    -- convention ShowNameplates uses)
-    tryHook("/Script/Wayfinder.WFPlayerCharacter:IsUsingGamepad", function(self)
-        aimCalls.gamepad = aimCalls.gamepad + 1
-        if state.aim then return true end
-    end)
-    tryHook("/Script/Wayfinder.WFGameplayBlueprintLibrary:GetPlayerInputSource", function(self, Actor)
-        aimCalls.source = aimCalls.source + 1
-        if state.aim then return 1 end -- EPlayerInputSource::GAMEPAD
-    end)
 end
 
 registerAll()
@@ -910,15 +931,14 @@ RegisterKeyBind(Key.F5, function()
                 if t and t:IsValid() then magnet = t:GetClass():GetFName():ToString() end
             end)
             pcall(function() magnetizing = tostring(pawn:IsMagnetizingAim()) end)
-            log("diag: magnet=%s magnetizing=%s aiming=%s", magnet, magnetizing,
-                tostring((function() local a = false pcall(function() a = pawn:IsAiming() end) return a end)()))
-            log("diag: pawn=%s vel=%.0f mountedNative=%s parent=%s parentVel=%.0f walk=%s parentWalk=%s mode=%s combat=%s sprintTag=%s aimCalls=g%d/s%d",
+            log("diag: magnet=%s magnetizing=%s aiming=%s pull=%.2f/%.2f", magnet, magnetizing,
+                tostring(isAimingNow(pawn)), lastPullYaw, lastPullPitch)
+            log("diag: pawn=%s vel=%.0f mountedNative=%s parent=%s parentVel=%.0f walk=%s parentWalk=%s mode=%s combat=%s sprintTag=%s",
                 cls, math.sqrt(velSq(pawn)),
                 okm and tostring(mountedNative) or "CALL-FAILED",
                 parentCls, parentVel,
                 tostring(maxWalk(pawn)), parent and tostring(maxWalk(parent)) or "-",
-                sprintMode, tostring(combat), tostring(sprinting),
-                aimCalls.gamepad, aimCalls.source)
+                sprintMode, tostring(combat), tostring(sprinting))
         end)
         if not ok then log("diag error: %s", tostring(err)) end
     end)
