@@ -376,6 +376,10 @@ local function onEnemyAbility(self)
     if now - lastScheduled < 0.05 then return end
     local ok, err = pcall(function()
         local ab = self:get()
+        -- MULTIPLAYER: this hook fires for replicated/remote enemy abilities too;
+        -- a client-side stub can be non-nil but invalid -> GetClass() null-deref
+        -- (0x10) through pcall. validate the ability before any native call.
+        if not (ab and ab:IsValid()) then return end
         local className = ab:GetClass():GetFName():ToString()
         local verdict = meleeCache[className]
         if verdict == nil then
@@ -763,6 +767,7 @@ end
 local function onReloadActivated(self)
     local ok, err = pcall(function()
         local ab = self:get()
+        if not (ab and ab:IsValid()) then return end -- MP: skip remote/invalid reload abilities
         local t0 = os.clock()
         successThisCycle = false
         currentReload = { t0 = t0, maxT = nil, pressed = false, successClass = nil }
