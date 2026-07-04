@@ -726,13 +726,16 @@ local aimMagnetized = false
 
 -- tunables live in Mods/WFQoL/aim-config.json, written by the overlay's
 -- sliders and hot-reloaded here every second:
---   fov     degrees around the crosshair the assist engages in (2-90)
---   smooth  fraction of the remaining angle applied per 33ms tick
---           (0.05 = lazy drift ... 1.0 = instant snap)
---   adsOnly true = only while aiming down sights; false = also while firing
+--   fov      degrees around the crosshair targets are acquired in (2-90)
+--   bullets  magic bullets: our projectiles home into the acquired target
+--   strength homing acceleration, 0-1 (1 = bullets take hard curves)
+--   pull     camera-pull assist on/off (bullets made this mostly obsolete)
+--   smooth   camera pull: fraction of remaining angle per 16ms tick
+--   adsOnly  camera pull only while ADS (acquisition always runs when
+--            aiming OR firing - bullets need a target during hipfire too)
 local AIMCFG_REL = "Mods/WFQoL/aim-config.json"
 local AIMCFG_ABS = "D:/SteamLibrary/steamapps/common/Wayfinder/Atlas/Binaries/Win64/Mods/WFQoL/aim-config.json"
-local aimCfg = { fov = 20.0, smooth = 0.15, adsOnly = true }
+local aimCfg = { fov = 20.0, smooth = 0.15, adsOnly = true, bullets = true, strength = 0.6, pull = false }
 local aimCfgRaw = nil
 
 local PULL_DEADZONE = 0.25 -- degrees; inside this, hands off
@@ -748,12 +751,20 @@ LoopAsync(1000, function()
         aimCfgRaw = raw
         local fov = tonumber(raw:match('"fov"%s*:%s*([%d%.]+)'))
         local smooth = tonumber(raw:match('"smooth"%s*:%s*([%d%.]+)'))
+        local strength = tonumber(raw:match('"strength"%s*:%s*([%d%.]+)'))
         local ads = raw:match('"adsOnly"%s*:%s*(%a+)')
+        local bullets = raw:match('"bullets"%s*:%s*(%a+)')
+        local pull = raw:match('"pull"%s*:%s*(%a+)')
         if fov then aimCfg.fov = math.max(2, math.min(90, fov)) end
         if smooth then aimCfg.smooth = math.max(0.02, math.min(1, smooth)) end
+        if strength then aimCfg.strength = math.max(0, math.min(1, strength)) end
         if ads then aimCfg.adsOnly = (ads == "true") end
+        if bullets then aimCfg.bullets = (bullets == "true") end
+        if pull then aimCfg.pull = (pull == "true") end
         aimWeights.Yaw = math.min(90, aimCfg.fov * 1.5) -- acquire wider than we pull
-        log("aim: config fov=%.0f smooth=%.2f adsOnly=%s", aimCfg.fov, aimCfg.smooth, tostring(aimCfg.adsOnly))
+        log("aim: config fov=%.0f bullets=%s strength=%.2f pull=%s smooth=%.2f adsOnly=%s",
+            aimCfg.fov, tostring(aimCfg.bullets), aimCfg.strength,
+            tostring(aimCfg.pull), aimCfg.smooth, tostring(aimCfg.adsOnly))
     end)
     return false
 end)
@@ -771,8 +782,15 @@ local function isAimingNow(pawn)
     return aiming
 end
 
+-- acquisition: any time we're aiming OR firing (bullets need targets on hipfire)
 local function aimEngaged(pawn)
     if not state.aim then return false end
+    return isAimingNow(pawn) or m1Held
+end
+
+-- camera pull: its own gates on top
+local function pullEngaged(pawn)
+    if not (state.aim and aimCfg.pull) then return false end
     if isAimingNow(pawn) then return true end
     if not aimCfg.adsOnly and m1Held then return true end
     return false
@@ -846,7 +864,7 @@ LoopAsync(16, function()
     ExecuteInGameThread(function()
         local ok, err = pcall(function()
             local pawn = getPawn()
-            if not pawn or not aimEngaged(pawn) then aimPulling = false return end
+            if not pawn or not pullEngaged(pawn) then aimPulling = false return end
             local tc = pawn.TargetingComponent
             if not tc or not tc:IsValid() then return end
             local target = tc:GetMagnetizedAimTarget()
@@ -900,6 +918,57 @@ LoopAsync(16, function()
         if not ok then logErrorOnce("aimpull", tostring(err)) end
     end)
     return false
+end)
+
+-- magic bullets: every projectile the PLAYER fires gets homed into the
+-- acquired target. all projectile actors derive from MayhemBaseProjectile,
+-- which ships a native SetHomingTarget(Actor); the movement component is a
+-- stock UProjectileMovementComponent underneath, so homing acceleration is
+-- tunable on top (STRENGTH slider).
+local lastBulletLog = 0.0
+NotifyOnNewObject("/Script/Wayfinder.MayhemBaseProjectile", function(proj)
+    if not (ready and state.aim and aimCfg.bullets) then return end
+    ExecuteWithDelay(30, function() -- spawn props aren't set in the constructor yet
+        ExecuteInGameThread(function()
+            local ok, err = pcall(function()
+                if not proj:IsValid() then return end
+                local pawn = getPawn()
+                if not pawn then return end
+                local inst = nil
+                pcall(function() inst = proj:GetInstigator() end)
+                if not inst or not inst:IsValid() then return end
+                if addrOf(inst) ~= addrOf(pawn) then return end -- only OUR shots
+
+                local tc = pawn.TargetingComponent
+                if not tc or not tc:IsValid() then return end
+                local target = tc:GetMagnetizedAimTarget()
+                if not (target and target:IsValid()) then
+                    -- hipfire before the magnetizer ticked: acquire right now
+                    pcall(function() tc:FindSoftLockTarget(aimWeights, false, true) end)
+                    pcall(function()
+                        local t = tc.m_CurrentSoftLockTargetResults.AssociatedTargets
+                        if t and #t > 0 then target = t[1] end
+                    end)
+                end
+                if not (target and target:IsValid()) then return end
+
+                proj:SetHomingTarget(target)
+                pcall(function()
+                    local mc = proj.MovementComponent
+                    mc.bIsHomingProjectile = true
+                    mc.HomingAccelerationMagnitude = 2000.0 + aimCfg.strength * 38000.0
+                end)
+                local now = os.clock()
+                if now - lastBulletLog > 2 then
+                    lastBulletLog = now
+                    pcall(function()
+                        log("bullets: homing -> %s", target:GetClass():GetFName():ToString())
+                    end)
+                end
+            end)
+            if not ok then logErrorOnce("bullets", tostring(err)) end
+        end)
+    end)
 end)
 
 -- ---------------------------------------------------------------- overlay state file

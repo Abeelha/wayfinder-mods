@@ -40,7 +40,7 @@ $xaml = @'
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="WFQoL Overlay" WindowStyle="None" AllowsTransparency="True"
         Background="Transparent" Topmost="True" ShowInTaskbar="False"
-        Width="280" Height="352" MinWidth="180" MinHeight="150"
+        Width="280" Height="400" MinWidth="180" MinHeight="150"
         ResizeMode="CanResizeWithGrip">
   <Border CornerRadius="14" Background="#DD0E1116" BorderBrush="#2FFFFFFF" BorderThickness="1" Padding="6">
     <Viewbox Stretch="Uniform">
@@ -150,13 +150,16 @@ function Set-Pill($prop, $on) {
 # ---- aim config: sliders write aim-config.json, the Lua mod hot-reloads it ----
 $AimCfgFile = Join-Path (Split-Path $StateFile) "aim-config.json"
 $script:aimCfgDirty = $false
-$aimDefaults = @{ fov = 20.0; smooth = 0.15; adsOnly = $true }
+$aimDefaults = @{ fov = 20.0; smooth = 0.15; adsOnly = $true; bullets = $true; strength = 0.6; pull = $false }
 try {
     if (Test-Path $AimCfgFile) {
         $c = Get-Content $AimCfgFile -Raw | ConvertFrom-Json
         if ($null -ne $c.fov) { $aimDefaults.fov = [double]$c.fov }
         if ($null -ne $c.smooth) { $aimDefaults.smooth = [double]$c.smooth }
         if ($null -ne $c.adsOnly) { $aimDefaults.adsOnly = [bool]$c.adsOnly }
+        if ($null -ne $c.bullets) { $aimDefaults.bullets = [bool]$c.bullets }
+        if ($null -ne $c.strength) { $aimDefaults.strength = [double]$c.strength }
+        if ($null -ne $c.pull) { $aimDefaults.pull = [bool]$c.pull }
     }
 } catch { OLog "aim cfg load error: $_" }
 
@@ -187,10 +190,30 @@ function Add-CfgSlider($label, $min, $max, $value, $fmt) {
     return @{ Slider = $slider; Val = $val; Fmt = $fmt }
 }
 
+function Add-CfgCheck($label, $checked) {
+    $row = New-Object Windows.Controls.DockPanel
+    $row.Margin = "2,2,2,2"
+    $cb = New-Object Windows.Controls.CheckBox
+    $cb.Content = $label
+    $cb.FontFamily = "Consolas"; $cb.FontSize = 10
+    $cb.Foreground = "#D8D8DE"; $cb.IsChecked = $checked
+    $cb.VerticalAlignment = "Center"
+    $cb.Add_Checked({ $script:aimCfgDirty = $true })
+    $cb.Add_Unchecked({ $script:aimCfgDirty = $true })
+    [void]$row.Children.Add($cb)
+    [void]$rows.Children.Add($row)
+    return $cb
+}
+
 $script:fovCtl = Add-CfgSlider "FOV" 2 90 $aimDefaults.fov "0"
+$script:strengthCtl = Add-CfgSlider "STRENGTH" 0.0 1.0 $aimDefaults.strength "0.00"
 $script:smoothCtl = Add-CfgSlider "SMOOTH" 0.02 1.0 $aimDefaults.smooth "0.00"
 $script:fovCtl.Slider.Add_ValueChanged({
     $script:fovCtl.Val.Text = $script:fovCtl.Slider.Value.ToString("0")
+    $script:aimCfgDirty = $true
+})
+$script:strengthCtl.Slider.Add_ValueChanged({
+    $script:strengthCtl.Val.Text = $script:strengthCtl.Slider.Value.ToString("0.00")
     $script:aimCfgDirty = $true
 })
 $script:smoothCtl.Slider.Add_ValueChanged({
@@ -198,27 +221,22 @@ $script:smoothCtl.Slider.Add_ValueChanged({
     $script:aimCfgDirty = $true
 })
 
-$adsRow = New-Object Windows.Controls.DockPanel
-$adsRow.Margin = "2,2,2,2"
-$script:adsCheck = New-Object Windows.Controls.CheckBox
-$script:adsCheck.Content = "ADS only (off = also while firing)"
-$script:adsCheck.FontFamily = "Consolas"; $script:adsCheck.FontSize = 10
-$script:adsCheck.Foreground = "#D8D8DE"; $script:adsCheck.IsChecked = $aimDefaults.adsOnly
-$script:adsCheck.VerticalAlignment = "Center"
-$script:adsCheck.Add_Checked({ $script:aimCfgDirty = $true })
-$script:adsCheck.Add_Unchecked({ $script:aimCfgDirty = $true })
-[void]$adsRow.Children.Add($script:adsCheck)
-[void]$rows.Children.Add($adsRow)
+$script:bulletsCheck = Add-CfgCheck "MAGIC BULLETS (shots home in)" $aimDefaults.bullets
+$script:pullCheck = Add-CfgCheck "CAM PULL (SMOOTH slider)" $aimDefaults.pull
+$script:adsCheck = Add-CfgCheck "cam pull: ADS only" $aimDefaults.adsOnly
 
 function Save-AimCfg {
     try {
         $obj = @{
             fov = [math]::Round($script:fovCtl.Slider.Value, 0)
+            strength = [math]::Round($script:strengthCtl.Slider.Value, 2)
             smooth = [math]::Round($script:smoothCtl.Slider.Value, 2)
+            bullets = [bool]$script:bulletsCheck.IsChecked
+            pull = [bool]$script:pullCheck.IsChecked
             adsOnly = [bool]$script:adsCheck.IsChecked
         }
         ($obj | ConvertTo-Json -Compress) | Set-Content -Path $AimCfgFile -Encoding ascii
-        OLog "aim cfg saved: fov=$($obj.fov) smooth=$($obj.smooth) adsOnly=$($obj.adsOnly)"
+        OLog "aim cfg saved: fov=$($obj.fov) strength=$($obj.strength) bullets=$($obj.bullets) pull=$($obj.pull)"
     } catch { OLog "aim cfg save error: $_" }
 }
 if (-not (Test-Path $AimCfgFile)) { Save-AimCfg }
@@ -230,7 +248,7 @@ if (Test-Path $cfgPath) {
     try {
         $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
         if ($cfg.left -ne $null) { $window.Left = $cfg.left; $window.Top = $cfg.top }
-        if ($cfg.width) { $window.Width = $cfg.width; $window.Height = [Math]::Max([double]$cfg.height, 352) }
+        if ($cfg.width) { $window.Width = $cfg.width; $window.Height = [Math]::Max([double]$cfg.height, 400) }
         if ($cfg.locked -ne $null) { $script:locked = [bool]$cfg.locked }
     } catch { OLog "config load failed: $_" }
 } else {
