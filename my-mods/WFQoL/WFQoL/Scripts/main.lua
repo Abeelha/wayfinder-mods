@@ -69,9 +69,18 @@ local function getPawn()
     if pawnRef and pawnRef:IsValid() then return pawnRef end
     pawnRef = nil
     pcall(function()
+        -- MULTIPLAYER: FindAllOf now returns REMOTE players' characters too (their
+        -- components are null client-side -> native crash if we drive one). prefer
+        -- the LOCALLY-controlled pawn; fall back to first real (single-player).
+        local first = nil
         for _, p in pairs(FindAllOf(CHAR_CLASS_ONLY) or {}) do
-            if isReal(p) then pawnRef = p break end
+            if isReal(p) then
+                first = first or p
+                local okl, loc = pcall(function() return p:IsLocallyControlled() end)
+                if okl and loc then pawnRef = p break end
+            end
         end
+        if not pawnRef then pawnRef = first end
     end)
     return pawnRef
 end

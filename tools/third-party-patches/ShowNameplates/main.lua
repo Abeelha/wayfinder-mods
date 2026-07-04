@@ -83,8 +83,14 @@ local function installHooks()
     OverrideReturn(NP_PLAYER .. ":ShouldBeVisible", true, function(self)
         local np = self:get()
         local ok, mine = pcall(function()
-            return currentPlayer and currentPlayer:IsValid()
-               and np.AttachedOwnerActor:GetAddress() == currentPlayer:GetAddress()
+            -- MULTIPLAYER: this fires for every player nameplate incl remote ones.
+            -- a remote/just-spawned nameplate can have a NULL AttachedOwnerActor;
+            -- calling :GetAddress() on it is a native null-deref (0x10) that pcall
+            -- can't catch. validate np + owner + currentPlayer before touching them.
+            if not (np and np:IsValid() and currentPlayer and currentPlayer:IsValid()) then return false end
+            local owner = np.AttachedOwnerActor
+            if not (owner and owner:IsValid()) then return false end
+            return owner:GetAddress() == currentPlayer:GetAddress()
         end)
         if not (ok and mine) then return end
         if not playerNameplate or not playerNameplate:IsValid() then
