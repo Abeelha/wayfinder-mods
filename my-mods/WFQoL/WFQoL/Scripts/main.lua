@@ -177,10 +177,19 @@ local function onEnemyAbility(self)
 end
 
 -- ---------------------------------------------------------------- AutoSprint
+-- escalating strategies, each verified before moving on:
+--   ability: TryActivateAbilityByClass(GA_Player_Sprint) - real sprint
+--   tag:     inject Character.State.Generic.Sprinting loose tag
+--   speed:   write CharacterMovement.MaxWalkSpeed directly (x1.5)
 local MIN_SPEED_SQ = 100 * 100
-local sprintMode = "ability" -- switches to "tag" if ability activation is inert
+local sprintMode = "ability"
 local sprintTries = 0
 local tagInjected = false
+local tagTicks = 0
+local tagBaseline = nil
+local tagVerified = false
+local speedBoosted = false
+local origMaxWalk = nil
 local lastCombat = nil
 
 local function speedSq(pawn)
@@ -195,15 +204,25 @@ local function speedSq(pawn)
     return s
 end
 
-local function stopInjectedSprint(asc)
+local function maxWalk(pawn)
+    local ok, v = pcall(function() return pawn.CharacterMovement.MaxWalkSpeed end)
+    return ok and v or nil
+end
+
+local function stopSprintAssist(pawn, asc)
     if tagInjected then
         pcall(function() asc:RemoveGameplayTag(SPRINTING_TAG) end)
         tagInjected = false
+        tagTicks = 0
+    end
+    if speedBoosted and origMaxWalk then
+        pcall(function() pawn.CharacterMovement.MaxWalkSpeed = origMaxWalk end)
+        speedBoosted = false
     end
 end
 
 LoopAsync(300, function()
-    if not (state.sprint and ready) then return false end
+    if not ready then return false end
     ExecuteInGameThread(function()
         local ok, err = pcall(function()
             local pawn = getPawn()
@@ -217,14 +236,15 @@ LoopAsync(300, function()
                 log("combat: %s", tostring(inCombat))
             end
 
-            local moving = speedSq(pawn) >= MIN_SPEED_SQ
-            if inCombat or not moving then
-                stopInjectedSprint(asc)
+            local shouldSprint = state.sprint and not inCombat
+                and speedSq(pawn) >= MIN_SPEED_SQ
+            if not shouldSprint then
+                stopSprintAssist(pawn, asc)
                 return
             end
 
-            if ascHasTag(asc, SPRINTING_TAG) then
-                sprintTries = 0
+            if ascHasTag(asc, SPRINTING_TAG) and not tagInjected then
+                sprintTries = 0 -- real sprint is running
                 return
             end
 
@@ -235,12 +255,38 @@ LoopAsync(300, function()
                     sprintTries = sprintTries + 1
                     if sprintTries >= 5 then
                         sprintMode = "tag"
-                        log("sprint ability inert after %d tries, switching to tag injection", sprintTries)
+                        log("sprint: ability path inert, trying tag injection")
                     end
                 end
-            else
-                pcall(function() asc:AddUniqueGameplayTag(SPRINTING_TAG) end)
-                tagInjected = true
+            elseif sprintMode == "tag" then
+                if not tagInjected then
+                    tagBaseline = maxWalk(pawn)
+                    pcall(function() asc:AddUniqueGameplayTag(SPRINTING_TAG) end)
+                    tagInjected = true
+                    tagTicks = 0
+                else
+                    tagTicks = tagTicks + 1
+                    if tagTicks == 3 and not tagVerified then
+                        local now = maxWalk(pawn)
+                        if tagBaseline and now and now > tagBaseline + 1 then
+                            tagVerified = true
+                            log("sprint: tag injection works (walk %d -> %d)", tagBaseline, now)
+                        else
+                            stopSprintAssist(pawn, asc)
+                            sprintMode = "speed"
+                            log("sprint: tag inert (walk stuck at %s), using direct speed", tostring(now))
+                        end
+                    end
+                end
+            else -- speed mode
+                if not speedBoosted then
+                    origMaxWalk = maxWalk(pawn)
+                    if origMaxWalk then
+                        pcall(function() pawn.CharacterMovement.MaxWalkSpeed = origMaxWalk * 1.5 end)
+                        speedBoosted = true
+                        log("sprint: direct speed %d -> %d", origMaxWalk, origMaxWalk * 1.5)
+                    end
+                end
             end
         end)
         if not ok then logErrorOnce("sprint", err) end
@@ -349,8 +395,13 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, New
 end)
 
 -- ---------------------------------------------------------------- keybinds
+-- debounced: key auto-repeat fires RegisterKeyBind multiple times per press
+local lastToggle = {}
 local function bindToggle(key, name, label)
     RegisterKeyBind(key, function()
+        local now = os.clock()
+        if lastToggle[name] and now - lastToggle[name] < 0.3 then return end
+        lastToggle[name] = now
         state[name] = not state[name]
         log("%s %s", label, state[name] and "ON" or "OFF")
     end)
