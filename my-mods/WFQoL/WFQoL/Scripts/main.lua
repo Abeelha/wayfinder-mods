@@ -953,12 +953,16 @@ local function onProjectile(proj)
         ExecuteInGameThread(function()
             local ok, err = pcall(function()
                 if not proj:IsValid() then return end
+                -- several hooks/notifies can report the same shot, and pooled
+                -- projectiles REUSE addresses across shots: dedup with a
+                -- short time window instead of forever
                 local addr = addrOf(proj)
-                if addr and seenProj[addr] then return end -- notified on several class levels
+                local nowD = os.clock()
+                if addr and seenProj[addr] and nowD - seenProj[addr] < 0.5 then return end
                 if addr then
-                    seenProj[addr] = true
+                    seenProj[addr] = nowD
                     seenProjCount = seenProjCount + 1
-                    if seenProjCount > 400 then seenProj = { [addr] = true } seenProjCount = 1 end
+                    if seenProjCount > 400 then seenProj = { [addr] = nowD } seenProjCount = 1 end
                 end
                 local pawn = getPawn()
                 if not pawn then return end
@@ -1045,18 +1049,16 @@ local function onProjectile(proj)
     end)
 end
 
+-- session 17 finding: NotifyOnNewObject NEVER fired for shots on any class
+-- level (registered clean, zero callbacks) - projectiles are pooled
+-- (IPoolableProjectileInterface), constructed once and reused per shot.
+-- notifies kept for genuinely fresh spawns; the real per-shot signal is the
+-- BP base's own per-launch functions, hooked in registerAll below.
 NotifyOnNewObject("/Script/Wayfinder.MayhemBaseProjectile", onProjectile)
 NotifyOnNewObject("/Script/Wayfinder.MayhemProjectile", onProjectile)
-local bpNotifyDone = false
-local function registerProjectileNotify()
-    if bpNotifyDone then return end
-    local ok = pcall(function()
-        NotifyOnNewObject("/Game/Blueprints/Projectiles/WFProjectile_Base_BP.WFProjectile_Base_BP_C", onProjectile)
-    end)
-    if ok then
-        bpNotifyDone = true
-        log("bullets: BP projectile notify registered")
-    end
+local WFPROJ_BP = "/Game/Blueprints/Projectiles/WFProjectile_Base_BP.WFProjectile_Base_BP_C"
+local function onProjectileFn(self)
+    pcall(function() onProjectile(self:get()) end)
 end
 
 -- ---------------------------------------------------------------- overlay state file
@@ -1116,6 +1118,10 @@ local function registerAll()
     tryHook(RELOAD_GA .. ":K2_ActivateAbility", onReloadActivated)
     tryHook(RELOAD_GA .. ":K2_OnEndAbility", onReloadEnded)
     tryHook(RELOAD_OK_GA .. ":K2_ActivateAbility", onReloadSucceeded)
+    -- magic bullets: per-shot functions on the (pooled) projectile BP base
+    tryHook(WFPROJ_BP .. ":ReceiveBeginPlay", onProjectileFn)
+    tryHook(WFPROJ_BP .. ":ComputeInitialSpeed", onProjectileFn)
+    tryHook(WFPROJ_BP .. ":FindTargetActor", onProjectileFn)
     -- ground-truth signals from the game's own success/fail cues (preloaded)
     tryHook("/Game/Blueprints/GameplayCueNotifies/Ability/2HR/GCNA_2HR_ActiveReload_Success.GCNA_2HR_ActiveReload_Success_C:K2_HandleGameplayCue", function()
         successThisCycle = true
@@ -1146,7 +1152,6 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, New
     sprintClassCache = nil
     preloadParryAssets() -- ClientRestart hook = guaranteed game thread
     applyAimSettings()
-    registerProjectileNotify() -- BP class is loaded by the preload above
     registerAll()
 end)
 
