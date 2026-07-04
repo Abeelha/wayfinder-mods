@@ -176,6 +176,8 @@ local PRELOAD = {
     -- reload success/fail cue notify classes: preloading makes them hookable at spawn
     "/Game/Blueprints/GameplayCueNotifies/Ability/2HR/GCNA_2HR_ActiveReload_Success",
     "/Game/Blueprints/GameplayCueNotifies/Ability/2HR/GCNA_2HR_ActiveReload_Fail",
+    -- player projectile BP base (magic bullets registers a spawn notify on it)
+    "/Game/Blueprints/Projectiles/WFProjectile_Base_BP",
 }
 local preloaded = false
 local function preloadParryAssets()
@@ -920,24 +922,66 @@ LoopAsync(16, function()
     return false
 end)
 
--- magic bullets: every projectile the PLAYER fires gets homed into the
--- acquired target. all projectile actors derive from MayhemBaseProjectile,
--- which ships a native SetHomingTarget(Actor); the movement component is a
--- stock UProjectileMovementComponent underneath, so homing acceleration is
--- tunable on top (STRENGTH slider).
+-- magic bullets: every projectile the PLAYER fires is force-connected into
+-- the acquired target via the movement component's FakeNewHit (the game's own
+-- guaranteed-impact API). the ONLY knob is FOV: how close your crosshair must
+-- be to the target for the magic to engage. homing (SetHomingTarget) is the
+-- fallback if the forced hit ever errors.
+-- player shot class chain: WFProjectile_2HR_Slug_C -> WFProjectile_Base_BP_C
+-- -> MayhemProjectile -> MayhemBaseProjectile; notify registered on all
+-- levels because v15's base-only registration never fired.
 local lastBulletLog = 0.0
-NotifyOnNewObject("/Script/Wayfinder.MayhemBaseProjectile", function(proj)
+local lastBulletDiag = 0.0
+local seenProj = {}
+local seenProjCount = 0
+
+local function angleToTarget(controller, camLoc, tgtLoc)
+    local dx, dy, dz = tgtLoc.X - camLoc.X, tgtLoc.Y - camLoc.Y, tgtLoc.Z - camLoc.Z
+    local len = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if len < 1 then return 999 end
+    local rot = controller:GetControlRotation()
+    local yr, pr = math.rad(rot.Yaw), math.rad(rot.Pitch)
+    local fx, fy, fz = math.cos(pr) * math.cos(yr), math.cos(pr) * math.sin(yr), math.sin(pr)
+    local dot = (fx * dx + fy * dy + fz * dz) / len
+    if dot > 1 then dot = 1 elseif dot < -1 then dot = -1 end
+    return math.deg(math.acos(dot))
+end
+
+local function onProjectile(proj)
     if not (ready and state.aim and aimCfg.bullets) then return end
     ExecuteWithDelay(30, function() -- spawn props aren't set in the constructor yet
         ExecuteInGameThread(function()
             local ok, err = pcall(function()
                 if not proj:IsValid() then return end
+                local addr = addrOf(proj)
+                if addr and seenProj[addr] then return end -- notified on several class levels
+                if addr then
+                    seenProj[addr] = true
+                    seenProjCount = seenProjCount + 1
+                    if seenProjCount > 400 then seenProj = { [addr] = true } seenProjCount = 1 end
+                end
                 local pawn = getPawn()
                 if not pawn then return end
-                local inst = nil
+
+                local projCls, instCls, ownCls = "?", "nil", "nil"
+                pcall(function() projCls = proj:GetClass():GetFName():ToString() end)
+                local inst, owner = nil, nil
                 pcall(function() inst = proj:GetInstigator() end)
-                if not inst or not inst:IsValid() then return end
-                if addrOf(inst) ~= addrOf(pawn) then return end -- only OUR shots
+                pcall(function() owner = proj:GetOwner() end)
+                pcall(function() if inst and inst:IsValid() then instCls = inst:GetClass():GetFName():ToString() end end)
+                pcall(function() if owner and owner:IsValid() then ownCls = owner:GetClass():GetFName():ToString() end end)
+                local now = os.clock()
+                if now - lastBulletDiag > 2 then
+                    lastBulletDiag = now
+                    log("bullets: saw %s inst=%s owner=%s", projCls, instCls, ownCls)
+                end
+
+                -- ours? instigator or owner is the player pawn (or at least a player char)
+                local mine = false
+                if inst and inst:IsValid() and addrOf(inst) == addrOf(pawn) then mine = true end
+                if not mine and owner and owner:IsValid() and addrOf(owner) == addrOf(pawn) then mine = true end
+                if not mine and instCls == CHAR_CLASS_ONLY then mine = true end
+                if not mine then return end
 
                 local tc = pawn.TargetingComponent
                 if not tc or not tc:IsValid() then return end
@@ -952,24 +996,68 @@ NotifyOnNewObject("/Script/Wayfinder.MayhemBaseProjectile", function(proj)
                 end
                 if not (target and target:IsValid()) then return end
 
-                proj:SetHomingTarget(target)
+                -- FOV is the one and only gate
+                local controller = pawn:GetController()
+                if not controller or not controller:IsValid() then return end
+                local camLoc = nil
+                pcall(function() camLoc = controller.PlayerCameraManager:GetCameraLocation() end)
+                if not camLoc then camLoc = pawn:K2_GetActorLocation() end
+                local tgtLoc = nil
                 pcall(function()
-                    local mc = proj.MovementComponent
-                    mc.bIsHomingProjectile = true
-                    mc.HomingAccelerationMagnitude = 2000.0 + aimCfg.strength * 38000.0
+                    local s = tc:GetMagnetizedAimTargetSocketLocation()
+                    if s and not (s.X == 0 and s.Y == 0 and s.Z == 0) then tgtLoc = s end
                 end)
-                local now = os.clock()
+                if not tgtLoc then tgtLoc = target:K2_GetActorLocation() end
+                if angleToTarget(controller, camLoc, tgtLoc) > aimCfg.fov then return end
+
+                -- force the impact: the projectile "hits" the target right now
+                local forced = false
+                pcall(function()
+                    local comp = target:K2_GetRootComponent()
+                    if not (comp and comp:IsValid()) then return end
+                    local pl = proj:K2_GetActorLocation()
+                    local nx, ny, nz = pl.X - tgtLoc.X, pl.Y - tgtLoc.Y, pl.Z - tgtLoc.Z
+                    local nl = math.sqrt(nx * nx + ny * ny + nz * nz)
+                    if nl < 1 then nx, ny, nz, nl = 0, 0, 1, 1 end
+                    proj.MovementComponent:FakeNewHit(target, comp,
+                        { X = tgtLoc.X, Y = tgtLoc.Y, Z = tgtLoc.Z },
+                        { X = nx / nl, Y = ny / nl, Z = nz / nl })
+                    forced = true
+                end)
+                if not forced then
+                    -- fallback: max-strength homing
+                    pcall(function()
+                        proj:SetHomingTarget(target)
+                        local mc = proj.MovementComponent
+                        mc.bIsHomingProjectile = true
+                        mc.HomingAccelerationMagnitude = 40000.0
+                    end)
+                end
                 if now - lastBulletLog > 2 then
                     lastBulletLog = now
                     pcall(function()
-                        log("bullets: homing -> %s", target:GetClass():GetFName():ToString())
+                        log("bullets: %s -> %s", forced and "FORCED HIT" or "homing", target:GetClass():GetFName():ToString())
                     end)
                 end
             end)
             if not ok then logErrorOnce("bullets", tostring(err)) end
         end)
     end)
-end)
+end
+
+NotifyOnNewObject("/Script/Wayfinder.MayhemBaseProjectile", onProjectile)
+NotifyOnNewObject("/Script/Wayfinder.MayhemProjectile", onProjectile)
+local bpNotifyDone = false
+local function registerProjectileNotify()
+    if bpNotifyDone then return end
+    local ok = pcall(function()
+        NotifyOnNewObject("/Game/Blueprints/Projectiles/WFProjectile_Base_BP.WFProjectile_Base_BP_C", onProjectile)
+    end)
+    if ok then
+        bpNotifyDone = true
+        log("bullets: BP projectile notify registered")
+    end
+end
 
 -- ---------------------------------------------------------------- overlay state file
 -- consumed by the external overlay app (tools/overlay/WFQoL-Overlay.ps1).
@@ -1058,6 +1146,7 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, New
     sprintClassCache = nil
     preloadParryAssets() -- ClientRestart hook = guaranteed game thread
     applyAimSettings()
+    registerProjectileNotify() -- BP class is loaded by the preload above
     registerAll()
 end)
 
