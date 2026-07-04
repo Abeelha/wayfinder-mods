@@ -34,7 +34,7 @@ $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="WFQoL" WindowStyle="None" Background="#0F1116" Topmost="True"
-        ShowInTaskbar="False" Width="230" Height="210"
+        ShowInTaskbar="False" Width="230" Height="236"
         MinWidth="150" MinHeight="120" ResizeMode="CanResize"
         UseLayoutRounding="True" SnapsToDevicePixels="True">
   <Border BorderBrush="#2C313C" BorderThickness="1">
@@ -88,7 +88,8 @@ $features = @(
     @{ Name = "SPRINT"; Key = "F6"; Prop = "sprint" },
     @{ Name = "CHAIN";  Key = "F7"; Prop = "chain" },
     @{ Name = "PARRY";  Key = "F8"; Prop = "parry" },
-    @{ Name = "RELOAD"; Key = "F9"; Prop = "reload" }
+    @{ Name = "RELOAD"; Key = "F9"; Prop = "reload" },
+    @{ Name = "LOOT";   Key = "F4"; Prop = "loot" }
 )
 $script:rowMap = @{}
 foreach ($f in $features) {
@@ -204,6 +205,7 @@ $timer.Add_Tick({
                 Set-Row "chain" $s.chain
                 Set-Row "parry" $s.parry
                 Set-Row "reload" $s.reload
+                if ($null -ne $s.loot) { Set-Row "loot" $s.loot }
                 $combatDot.Fill = if ($s.combat) { "#FF5A5A" } else { "#5CE08A" }
                 $mode = "$($s.sprintMode)"
                 $lp = if ($s.lastParry) { "  parry:$($s.lastParry)" } else { "" }
@@ -221,6 +223,9 @@ $timer.Add_Tick({
         $script:staleSince = $null; $offlineText.Visibility = "Collapsed"
         if (-not $window.IsVisible) { $window.Show() }
     }
+    # always-autosave: persist any position/size change (drag, resize, OS snap)
+    $geo = "$($window.Left),$($window.Top),$($window.Width),$($window.Height)"
+    if ($geo -ne $script:lastGeo) { $script:lastGeo = $geo; Save-Config }
 })
 $timer.Start()
 
