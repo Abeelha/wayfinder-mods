@@ -195,37 +195,18 @@ local function preloadParryAssets()
     log("parry cost assets preloaded")
 end
 
--- "<ClassType> /Game/....X_C" -> LoadAsset("/Game/....X_C") on the current thread
-local function loadObjectPath(obj)
-    pcall(function()
-        if not obj or not obj:IsValid() then return end
-        local full = obj:GetFullName()
-        local path = full:match("%s(/.+)$") or full
-        LoadAsset(path)
-    end)
-end
-
--- dynamic preload: force-load a live ability's class + its cost/cooldown effect
--- classes on the GAME THREAD before we ever activate it. activating an ability
--- whose cost GE is a not-yet-loaded soft class makes the game async-load it, and
--- that finalizes the class token stream off-thread = the fatal
--- "AssembleReferenceTokenStream ... non-game thread" crash. this reads the LIVE
--- ability (no hardcoded paths) so it covers EVERY weapon type, and runs once per
--- ability class. the PRELOAD list above only covered 2H/DW/SnS.
+-- DIAGNOSTIC ONLY (v35): name the equipped block ability once per class so its
+-- parry cost GE can be added to the static PRELOAD list (which loads safely on
+-- ClientRestart, game thread) precisely. NO runtime LoadAsset here - the v34
+-- attempt to LoadAsset live class refs mid-combat/every-reload caused a fatal
+-- freed-pointer crash (0xffff...ffff). GetFName()/ToString() is a cheap, safe read.
 local abilityGraphPreloaded = {}
 local function preloadAbilityGraph(ability)
     if not ability or not ability:IsValid() then return end
     local ok, key = pcall(function() return ability:GetClass():GetFName():ToString() end)
     if not ok or not key or abilityGraphPreloaded[key] then return end
     abilityGraphPreloaded[key] = true
-    log("parry: preloading cost graph for %s", key)
-    loadObjectPath(ability:GetClass())
-    for _, prop in ipairs({ "CostGameplayEffectClass", "CooldownGameplayEffectClass" }) do
-        pcall(function()
-            local ge = ability[prop]
-            if ge then loadObjectPath(ge) end
-        end)
-    end
+    log("parry: block ability = %s (add its cost GE to PRELOAD if it crashes)", key)
 end
 
 -- stamina read via the HUD stamina meter widget (same trick ShowNameplates uses)
@@ -273,7 +254,7 @@ end
 local function tryActivateParry(asc)
     local blockAbility = asc:GetAbilityFromInputTag(BLOCK_TAG)
     if not blockAbility or not blockAbility:IsValid() then return false end
-    preloadAbilityGraph(blockAbility) -- one-shot/class: avoid off-thread cost-GE load crash
+    preloadAbilityGraph(blockAbility) -- one-shot/class: log block ability name (diagnostic)
     local isActive = false
     pcall(function() isActive = blockAbility:IsActive() end)
     if isActive then return "active" end
@@ -741,10 +722,6 @@ local function onReloadActivated(self)
         currentReload = { t0 = t0, maxT = nil, pressed = false, successClass = nil }
         pcall(function() currentReload.maxT = ab.MaxReloadTime end)
         pcall(function() currentReload.successClass = ab.ReloadSuccessType end)
-        -- preload the success ability class now (game thread) - onReloadEnded may
-        -- TryActivateAbilityByClass it later, and an unloaded class there would
-        -- async-load off-thread = AssembleReferenceTokenStream crash
-        pcall(function() if currentReload.successClass then loadObjectPath(currentReload.successClass) end end)
         if not state.reload then return end
         forceWindowOpen(ab) -- hook runs on game thread, before any press lands
         scheduleWindowPress(ab, t0)

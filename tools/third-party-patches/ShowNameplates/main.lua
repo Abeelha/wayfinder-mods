@@ -87,13 +87,8 @@ local function installHooks()
             playerNameplate = np
             pcall(function() np.richNameText:SetText(FText("")) end)  -- hide player name
             pcall(function() np:SetStaminaMeterVisibility(true) end)  -- show stamina meter
-            -- show HEALTH too. probe the candidate meter-visibility methods (one is
-            -- the symmetric partner of SetStaminaMeterVisibility) + force the bars
-            -- visible; log which method exists so we can trim to it next pass.
-            for _, m in ipairs({ "SetHealthMeterVisibility", "SetHealthBarVisibility", "SetHealthVisibility" }) do
-                local okm = pcall(function() np[m](np, true) end)
-                print(string.format("[ShowNameplates] method %s ok=%s\n", m, tostring(okm)))
-            end
+            -- show HEALTH too: no meter-toggle method exists (probed: all false), so
+            -- force the health bar widgets visible directly (ESlateVisibility 0).
             showWidget(np, "PlayerHealthBar")
             showWidget(np, "PlayerLastHealthBar")
             showWidget(np, "PlayerHealthBar_Additive")
