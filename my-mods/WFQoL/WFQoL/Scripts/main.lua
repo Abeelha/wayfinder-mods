@@ -106,10 +106,11 @@ end)
 -- ---------------------------------------------------------------- AutoParry
 local LEAD = 0.25
 local DEFAULT_HIT = 0.6
-local PARRY_COOLDOWN = 0.6
+local PARRY_COOLDOWN = 0.3
 local PARRY_RANGE = 800.0
 local lastParry = 0.0
 local lastScheduled = 0.0
+local lastParryInfo = "" -- for the external overlay
 
 local function isMeleeAttack(ability)
     local hasAttack, hasMelee = false, false
@@ -131,7 +132,7 @@ local function distTo(a, b)
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
-local function doParry(className, delayMs)
+local function doParry(className, delayMs, isRetry)
     ExecuteInGameThread(function()
         local ok, err = pcall(function()
             if not state.parry then return end
@@ -145,7 +146,11 @@ local function doParry(className, delayMs)
             if not blockAbility or not blockAbility:IsValid() then return end
             if asc:TryActivateAbilityByClass(blockAbility:GetClass(), true) then
                 lastParry = now
+                lastParryInfo = string.format("%s @%dms", className:gsub("^GA_", ""):gsub("_C$", ""), delayMs)
                 log("parry vs %s (delay %dms)", className, delayMs)
+            elseif not isRetry then
+                -- blocked by current player action (mid-swing etc): one quick retry
+                ExecuteWithDelay(120, function() doParry(className, delayMs, true) end)
             end
         end)
         if not ok then logErrorOnce("parry", err) end
@@ -155,7 +160,7 @@ end
 local function onEnemyAbility(self)
     if not state.parry then return end
     local now = os.clock()
-    if now - lastScheduled < 0.15 then return end
+    if now - lastScheduled < 0.05 then return end
     local ok, err = pcall(function()
         local ab = self:get()
         if not isMeleeAttack(ab) then return end
@@ -204,9 +209,30 @@ local function speedSq(pawn)
     return s
 end
 
-local function maxWalk(pawn)
-    local ok, v = pcall(function() return pawn.CharacterMovement.MaxWalkSpeed end)
+local function maxWalk(actor)
+    local ok, v = pcall(function() return actor.CharacterMovement.MaxWalkSpeed end)
     return ok and v or nil
+end
+
+-- mount speed assist tracked separately: boost lives on the MOUNT actor, never
+-- inject the sprint tag on the rider while mounted (anim/dismount jank)
+local mountBoostRef = nil
+local mountBoostOrig = nil
+
+local function stopMountBoost()
+    if mountBoostRef then
+        local ref, orig = mountBoostRef, mountBoostOrig
+        pcall(function()
+            if ref:IsValid() and orig then ref.CharacterMovement.MaxWalkSpeed = orig end
+        end)
+        mountBoostRef = nil
+        mountBoostOrig = nil
+    end
+end
+
+local function isMounted(pawn)
+    local ok, v = pcall(function() return pawn:IsMounted() end)
+    return ok and v or false
 end
 
 local function stopSprintAssist(pawn, asc)
@@ -219,6 +245,7 @@ local function stopSprintAssist(pawn, asc)
         pcall(function() pawn.CharacterMovement.MaxWalkSpeed = origMaxWalk end)
         speedBoosted = false
     end
+    stopMountBoost()
 end
 
 LoopAsync(300, function()
@@ -242,6 +269,25 @@ LoopAsync(300, function()
                 stopSprintAssist(pawn, asc)
                 return
             end
+
+            -- mounted: boost the mount's own movement, nothing touches the rider
+            if isMounted(pawn) then
+                if tagInjected or speedBoosted then stopSprintAssist(pawn, asc) end
+                if not mountBoostRef then
+                    local okm, mount = pcall(function() return pawn:GetAttachParentActor() end)
+                    if okm and mount and mount:IsValid() then
+                        local orig = maxWalk(mount)
+                        if orig then
+                            pcall(function() mount.CharacterMovement.MaxWalkSpeed = orig * 1.4 end)
+                            mountBoostRef = mount
+                            mountBoostOrig = orig
+                            log("sprint: mount speed %.0f -> %.0f", orig, orig * 1.4)
+                        end
+                    end
+                end
+                return
+            end
+            stopMountBoost() -- just dismounted
 
             if ascHasTag(asc, SPRINTING_TAG) and not tagInjected then
                 sprintTries = 0 -- real sprint is running
@@ -270,7 +316,7 @@ LoopAsync(300, function()
                         local now = maxWalk(pawn)
                         if tagBaseline and now and now > tagBaseline + 1 then
                             tagVerified = true
-                            log("sprint: tag injection works (walk %d -> %d)", tagBaseline, now)
+                            log("sprint: tag injection works (walk %.0f -> %.0f)", tagBaseline, now)
                         else
                             stopSprintAssist(pawn, asc)
                             sprintMode = "speed"
@@ -284,7 +330,7 @@ LoopAsync(300, function()
                     if origMaxWalk then
                         pcall(function() pawn.CharacterMovement.MaxWalkSpeed = origMaxWalk * 1.5 end)
                         speedBoosted = true
-                        log("sprint: direct speed %d -> %d", origMaxWalk, origMaxWalk * 1.5)
+                        log("sprint: direct speed %.0f -> %.0f", origMaxWalk, origMaxWalk * 1.5)
                     end
                 end
             end
@@ -313,30 +359,28 @@ local function onReloadActivated(self)
     end)
 end
 
--- ---------------------------------------------------------------- overlay
-local kismet = nil
-local function overlayTick()
-    if not (state.overlay and ready) then return end
-    ExecuteInGameThread(function()
-        local ok, err = pcall(function()
-            local pawn = getPawn()
-            if not pawn then return end
-            if not kismet or not kismet:IsValid() then
-                kismet = StaticFindObject(KISMET)
-            end
-            if not kismet or not kismet:IsValid() then return end
-            local function tag(on) return on and "ON" or "--" end
-            local line = string.format(
-                "WFQoL   chain[F7]:%s   parry[F8]:%s   sprint[F6]:%s   reload[F9]:%s",
-                tag(state.chain), tag(state.parry), tag(state.sprint), tag(state.reload))
-            kismet:PrintString(pawn, line, true, false,
-                { R = 0.25, G = 1.0, B = 0.75, A = 1.0 }, 0.65)
-        end)
-        if not ok then logErrorOnce("overlay", err) end
+-- ---------------------------------------------------------------- overlay state file
+-- consumed by the external overlay app (tools/overlay/WFQoL-Overlay.ps1).
+-- pure Lua io: safe to run any time, no engine access.
+local STATE_FILE = "Mods/WFQoL/overlay-state.json"
+local STATE_FILE_ABS = "D:/SteamLibrary/steamapps/common/Wayfinder/Atlas/Binaries/Win64/Mods/WFQoL/overlay-state.json"
+
+local function writeState()
+    local ok, err = pcall(function()
+        local f = io.open(STATE_FILE, "w") or io.open(STATE_FILE_ABS, "w")
+        if not f then error("cannot open " .. STATE_FILE) end
+        f:write(string.format(
+            '{"chain":%s,"parry":%s,"sprint":%s,"reload":%s,"sprintMode":"%s","combat":%s,"lastParry":"%s","ts":%d}',
+            tostring(state.chain), tostring(state.parry), tostring(state.sprint),
+            tostring(state.reload), sprintMode, tostring(lastCombat == true),
+            lastParryInfo, os.time()))
+        f:close()
     end)
+    if not ok then logErrorOnce("statefile", err) end
 end
-LoopAsync(500, function()
-    overlayTick()
+
+LoopAsync(1000, function()
+    writeState()
     return false
 end)
 
@@ -404,6 +448,7 @@ local function bindToggle(key, name, label)
         lastToggle[name] = now
         state[name] = not state[name]
         log("%s %s", label, state[name] and "ON" or "OFF")
+        writeState()
     end)
 end
 
@@ -411,6 +456,5 @@ bindToggle(Key.F6, "sprint", "AutoSprint")
 bindToggle(Key.F7, "chain", "AutoChain")
 bindToggle(Key.F8, "parry", "AutoParry")
 bindToggle(Key.F9, "reload", "AutoReload")
-pcall(function() bindToggle(Key.INS, "overlay", "Overlay") end)
 
-log("loaded - F6 sprint / F7 chain / F8 parry / F9 reload / INS overlay")
+log("loaded - F6 sprint / F7 chain / F8 parry / F9 reload / overlay via tools/overlay")
