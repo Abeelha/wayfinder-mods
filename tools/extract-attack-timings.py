@@ -16,7 +16,7 @@ GA_DIRS = [
     os.path.join(CONTENT, "Blueprints", "Enemies"),
     os.path.join(CONTENT, "Blueprints", "Abilities"),
 ]
-OUT = os.path.join(REPO, "my-mods", "AutoParry", "AutoParry", "Scripts", "timings.lua")
+OUT = os.path.join(REPO, "my-mods", "WFQoL", "WFQoL", "Scripts", "timings.lua")
 
 TRACE_MARKERS = ("WeaponTrace", "MeleeTrace", "AnimNotifyState_Trace", "DamageTrace")
 

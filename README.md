@@ -17,7 +17,11 @@ UE4SS Lua mods for [Wayfinder](https://store.steampowered.com/app/1171690/Wayfin
 
 ## Mods
 
-| Mod | What | Toggle |
-|-----|------|--------|
+**WFQoL** (single mod, all features, on-screen overlay via INS):
+
+| Feature | What | Toggle |
+|---------|------|--------|
 | AutoChain | hold M1 = auto-chain melee attacks | F7 |
-| AutoParry | perfect-parry enemy melee hits (game fires its own counter) | F8 |
+| AutoParry | timed parry just before enemy melee hits land (295 attack timings from montage data) | F8 |
+| AutoSprint | sprint while moving out of combat, foot + mount | F6 |
+| AutoReload | ranged active-reload minigame always perfect | F9 |
