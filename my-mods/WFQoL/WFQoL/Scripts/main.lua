@@ -406,24 +406,28 @@ LoopAsync(300, function()
                 end
                 if mountBoostRef and mountBoostRef ~= mount then stopMountBoost() end
 
-                local mv = velSq(mount)
-                local threshold = mountBoostRef and (30 * 30) or MIN_SPEED_SQ
-                if not state.sprint or mv < threshold then
+                if not state.sprint then
                     stopMountBoost()
                     return
                 end
 
+                -- persistent while mounted: baseline captured ONCE per mount (the
+                -- v7 clunk was re-capturing mid-gallop speeds as new baselines and
+                -- compounding). MaxWalkSpeed is a cap - holding it high while
+                -- standing is harmless, so no velocity gating at all here.
                 if not mountBoostRef then
                     local orig = maxWalk(mount)
                     if orig then
                         mountBoostRef = mount
                         mountBoostOrig = orig
                         pcall(function() mount.CharacterMovement.MaxWalkSpeed = orig * 1.4 end)
-                        log("sprint: mount speed %.0f -> %.0f", orig, orig * 1.4)
+                        log("sprint: mount boost engaged (%.0f -> %.0f)", orig, orig * 1.4)
                     end
                 else
                     local cur = maxWalk(mount)
                     local target = mountBoostOrig * 1.4
+                    -- re-assert only if the game dropped it BELOW target; if the
+                    -- game itself goes faster (its own gallop state), leave it be
                     if cur and cur < target - 1 then
                         pcall(function() mount.CharacterMovement.MaxWalkSpeed = target end)
                     end
@@ -494,6 +498,29 @@ end)
 -- and press exactly when the slider enters the white (perfect) zone.
 local reloadPolling = false
 
+-- UE4SS out-param calling convention differs by version: try out-table first,
+-- fall back to multi-return; remember whichever works
+local reloadCallStyle = nil
+local function checkInWindow(ab, elapsed)
+    if reloadCallStyle ~= "multi" then
+        local ok, res = pcall(function()
+            local out = {}
+            local r = ab:CheckInWindow(elapsed, out)
+            return (r == true) or (out.bInWindow == true)
+        end)
+        if ok then
+            reloadCallStyle = "table"
+            return res
+        end
+    end
+    local ok2, a, b = pcall(function() return ab:CheckInWindow(elapsed) end)
+    if ok2 then
+        reloadCallStyle = "multi"
+        return (a == true) or (b == true)
+    end
+    return nil
+end
+
 local function onReloadActivated(self)
     if not state.reload or reloadPolling then return end
     local ab = self:get()
@@ -516,7 +543,12 @@ local function onReloadActivated(self)
                     return
                 end
                 local elapsed = os.clock() - t0
-                local inWindow = ab:CheckInWindow(elapsed)
+                local inWindow = checkInWindow(ab, elapsed)
+                if inWindow == nil then
+                    logErrorOnce("reload", "CheckInWindow call failed in both styles")
+                    done = true
+                    return
+                end
                 if inWindow then
                     if pawnRef and pawnRef:IsValid() then
                         injecting = true
