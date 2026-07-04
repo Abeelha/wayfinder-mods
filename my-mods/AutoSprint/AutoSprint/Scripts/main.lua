@@ -21,21 +21,33 @@ local function logErrorOnce(err)
     end
 end
 
+-- no engine access at all until a player pawn exists (touching unloaded classes
+-- at the main menu = access violation on boot)
+local ready = false
 local pawnRef = nil
 RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, NewPawn)
     local ok, p = pcall(function() return NewPawn:get() end)
-    if ok then pawnRef = p end
+    if ok then
+        pawnRef = p
+        ready = true
+    end
+end)
+
+-- covers "Restart All Mods" while already in a map (class loaded -> safe to scan)
+local CHAR_CLASS = "/Game/Blueprints/Main/WFPlayerCharacter_Base.WFPlayerCharacter_Base_C"
+pcall(function()
+    if StaticFindObject(CHAR_CLASS):IsValid() then ready = true end
 end)
 
 local function getPawn()
     if pawnRef and pawnRef:IsValid() then return pawnRef end
-    local ok = pcall(function()
+    pawnRef = nil
+    pcall(function()
         for _, p in pairs(FindAllOf("WFPlayerCharacter_Base_C") or {}) do
             if p:IsValid() then pawnRef = p break end
         end
     end)
-    if ok and pawnRef and pawnRef:IsValid() then return pawnRef end
-    return nil
+    return pawnRef
 end
 
 local function speedSq(pawn)
@@ -54,7 +66,7 @@ end
 local lastCombat = nil
 
 LoopAsync(300, function()
-    if not ENABLED then return false end
+    if not (ENABLED and ready) then return false end
     ExecuteInGameThread(function()
         local ok, err = pcall(function()
             local pawn = getPawn()
