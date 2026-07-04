@@ -1,0 +1,7 @@
+# FModel JSON dump of the whole game (135k files) - reference only, stays local
+# source: https://www.nexusmods.com/wayfinder/mods/2
+Atlas/
+
+*.zip
+*.7z
+backups/
