@@ -46,6 +46,14 @@ local timings = require("timings") -- enemy GA class -> seconds to first weapon 
 -- ---------------------------------------------------------------- pawn / ready
 local ready = false
 local pawnRef = nil
+-- level transitions (breach load / open-world streaming) tear actors down while
+-- our game-thread loops keep running: touching a dying pawn's CharacterMovement
+-- or ASC natively = access violation that pcall CANNOT catch (crash reading
+-- 0x1c). SETTLE gate: after a pawn swap, skip native loop work briefly so the
+-- new/old actors finish (un)constructing.
+local SETTLE_SECS = 1.5
+local transitionAt = 0.0
+local function settling() return (os.clock() - transitionAt) < SETTLE_SECS end
 
 local function getPawn()
     if pawnRef and pawnRef:IsValid() then return pawnRef end
@@ -242,7 +250,7 @@ local function doParry(className, delayMs, enemy, attempt)
     attempt = attempt or 1
     ExecuteInGameThread(function()
         local ok, err = pcall(function()
-            if not state.parry then return end
+            if not state.parry or settling() then return end
             if reloadInProgress() then return end -- parry/montage-stop would kill the minigame
             local now = os.clock()
             if now - lastParry < PARRY_COOLDOWN then return end
@@ -299,7 +307,7 @@ end
 local meleeCache = {}
 
 local function onEnemyAbility(self)
-    if not state.parry then return end
+    if not state.parry or settling() then return end
     local now = os.clock()
     if now - lastScheduled < 0.05 then return end
     local ok, err = pcall(function()
@@ -366,9 +374,24 @@ local function attachParent(pawn)
     return nil
 end
 
+-- CharacterMovement can be null on an actor that's being torn down; validate the
+-- sub-object BEFORE reading/writing MaxWalkSpeed (a null-deref here is native =
+-- uncatchable). fetch the component, IsValid-check it, then touch the property.
 local function maxWalk(actor)
-    local ok, v = pcall(function() return actor.CharacterMovement.MaxWalkSpeed end)
+    local ok, v = pcall(function()
+        local cm = actor.CharacterMovement
+        if not (cm and cm:IsValid()) then return nil end
+        return cm.MaxWalkSpeed
+    end)
     return ok and v or nil
+end
+
+local function setMaxWalk(actor, v)
+    pcall(function()
+        if not (actor and actor:IsValid()) then return end
+        local cm = actor.CharacterMovement
+        if cm and cm:IsValid() then cm.MaxWalkSpeed = v end
+    end)
 end
 
 -- mount speed assist tracked separately: boost lives on the MOUNT actor, never
@@ -388,9 +411,7 @@ local function stopMountBoost()
     if mountBoostRef then
         local ref = mountBoostRef
         local base = mountBoostAddr and mountBaselines[mountBoostAddr]
-        pcall(function()
-            if ref:IsValid() and base then ref.CharacterMovement.MaxWalkSpeed = base end
-        end)
+        if base then setMaxWalk(ref, base) end
         mountBoostRef = nil
         mountBoostAddr = nil
     end
@@ -415,16 +436,17 @@ local function stopSprintAssist(pawn, asc)
         tagTicks = 0
     end
     if speedBoosted and origMaxWalk then
-        pcall(function() pawn.CharacterMovement.MaxWalkSpeed = origMaxWalk end)
+        setMaxWalk(pawn, origMaxWalk)
         speedBoosted = false
     end
     stopMountBoost()
 end
 
 LoopAsync(300, function()
-    if not ready then return false end
+    if not ready or settling() then return false end
     ExecuteInGameThread(function()
         local ok, err = pcall(function()
+            if settling() then return end
             local pawn = getPawn()
             if not pawn then return end
             local asc = getASC(pawn)
@@ -454,9 +476,7 @@ LoopAsync(300, function()
                 if tagInjected or speedBoosted then
                     pcall(function() asc:RemoveGameplayTag(SPRINTING_TAG) end)
                     tagInjected = false
-                    if speedBoosted and origMaxWalk then
-                        pcall(function() pawn.CharacterMovement.MaxWalkSpeed = origMaxWalk end)
-                    end
+                    if speedBoosted and origMaxWalk then setMaxWalk(pawn, origMaxWalk) end
                     speedBoosted = false
                 end
                 local addr = addrOf(mount)
@@ -484,7 +504,7 @@ LoopAsync(300, function()
                 -- re-assert only if the game dropped it BELOW target; its own
                 -- faster states are left alone
                 if cur and cur < target - 1 then
-                    pcall(function() mount.CharacterMovement.MaxWalkSpeed = target end)
+                    setMaxWalk(mount, target)
                 end
                 return
             end
@@ -535,7 +555,7 @@ LoopAsync(300, function()
                 if not speedBoosted then
                     origMaxWalk = maxWalk(pawn)
                     if origMaxWalk then
-                        pcall(function() pawn.CharacterMovement.MaxWalkSpeed = origMaxWalk * 1.5 end)
+                        setMaxWalk(pawn, origMaxWalk * 1.5)
                         speedBoosted = true
                         log("sprint: direct speed %.0f -> %.0f", origMaxWalk, origMaxWalk * 1.5)
                     end
@@ -842,6 +862,7 @@ LoopAsync(5000, function()
 end)
 
 RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, NewPawn)
+    transitionAt = os.clock() -- arm the settle gate: actors are (un)constructing
     local ok, p = pcall(function() return NewPawn:get() end)
     if ok then
         pawnRef = p
@@ -851,6 +872,7 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, New
     end
     libCache = nil
     sprintClassCache = nil
+    metersCache = nil -- HUD widgets are rebuilt on the new level; drop stale ref
     preloadParryAssets() -- ClientRestart hook = guaranteed game thread
     launchOverlay()
     registerAll()
