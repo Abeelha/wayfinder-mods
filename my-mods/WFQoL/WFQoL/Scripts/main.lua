@@ -736,8 +736,33 @@ LoopAsync(1000, function()
     return false
 end)
 
--- overlay is a resident tray app (login autostart via tools/overlay/install-autostart.ps1);
--- it shows itself whenever the heartbeat in overlay-state.json is fresh
+-- overlay -> mod command channel: clicking a mod row in the overlay writes
+-- overlay-cmd.json {seq, feature}; we toggle that mod's state on a new seq.
+-- the pre-existing seq at load is recorded but not applied (stale click guard).
+local CMD_REL = "Mods/WFQoL/overlay-cmd.json"
+local CMD_ABS = "D:/SteamLibrary/steamapps/common/Wayfinder/Atlas/Binaries/Win64/Mods/WFQoL/overlay-cmd.json"
+local lastCmdSeq = nil
+LoopAsync(200, function()
+    pcall(function()
+        local f = io.open(CMD_REL, "r") or io.open(CMD_ABS, "r")
+        if not f then return end
+        local raw = f:read("*a")
+        f:close()
+        local seq = raw:match('"seq"%s*:%s*(%d+)')
+        local feat = raw:match('"feature"%s*:%s*"(%a+)"')
+        if not seq then return end
+        if lastCmdSeq == nil then lastCmdSeq = seq return end
+        if seq ~= lastCmdSeq then
+            lastCmdSeq = seq
+            if feat and state[feat] ~= nil then
+                state[feat] = not state[feat]
+                log("%s %s (overlay click)", feat, state[feat] and "ON" or "OFF")
+                writeState()
+            end
+        end
+    end)
+    return false
+end)
 
 -- ---------------------------------------------------------------- hooks
 local pending = {}
