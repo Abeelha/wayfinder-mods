@@ -1,0 +1,280 @@
+local Rules = require("config")
+
+-- DATA TABLES
+local ITEM_TYPES = {
+    Weapon = {
+        "Inventory/2HScytheItems",
+        "Inventory/2HSwordItems",
+        "Inventory/AxeItems",
+        "Inventory/DWItems",
+        "Inventory/MaceItems",
+        "Inventory/RifleItems",
+        "Inventory/SnSItems",
+    },
+    Echo = {
+        "Inventory/CreatureEchoes/CreatureEchoItems"
+    },
+    Accessory = {
+        "Inventory/Accessories/AccessoryInventoryItems"
+    },
+    Housing = {}
+}
+
+local SLOT_TYPES = {
+    [0] = "Invalid",
+    [1] = "Alfa",
+    [2] = "Bravo",
+    [3] = "Charlie",
+    [4] = "Delta",
+    [5] = "Echo",
+    [6] = "ArmorModHead",
+    [7] = "ArmorModChest",
+    [8] = "ArmorModArms",
+    [9] = "ArmorModLegs",
+    [10] = "ArmorModFeet",
+    [11] = "WeaponCharm",
+    [12] = "EFogSoulCategory_MAX"
+}
+
+local ECHO_CURVE = {
+    [1] = 414,
+    [2] = 468,
+    [3] = 522,
+    [4] = 576,
+}
+
+local ECHO_CURVE_INCREMENT = 54
+
+local WEAPON_CURVE = {
+    0, 375, 1212, 3029, 5538, 8827, 12981, 18087, 24231, 31500, 39981, 49760, 60923, 72837, 87000, 100215, 114660, 130380, 147420, 165000, 186450, 208800, 232943, 258945, 285938, 317340, 351120, 387368, 426173, 466538, 501742.5,
+    539087.4, 576432.3, 613777.2, 651122.1, 688467, 725811.9,
+    763156.8
+}
+
+local ACCESSORY_CURVE = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45
+}
+
+
+-- CONFIG
+local debug = true -- Enabled debug logging (WFQoL: on to trace auto-sort)
+
+
+-- Text Strings
+local Text = {
+    noInventory = "InventoryComponent hasn't been loaded yet!",
+    flaggingItems = "Smart Sorting Items...",
+    flaggedItems = "Items Sorted.",
+}
+
+-- FUNCTIONS
+
+function Log(Message, OutputDevice)
+    if OutputDevice then
+        OutputDevice:Log(string.format("[SmartSort] %s\n", Message))
+    else
+        if debug then
+            print(string.format("[SmartSort] %s\n", Message))
+        end
+    end
+end
+
+function expToLevel(exp, curveObject)
+    local levelCurveNumber = 0
+
+    for idx, levelExp in ipairs(curveObject) do
+        if levelExp <= exp then
+            levelCurveNumber = idx
+        else
+            break -- Exit the loop once the condition is not met
+        end
+    end
+
+    return levelCurveNumber
+end
+
+function echoExpToLevel(xp, rarity)
+    local currentXp = xp
+    local initialXp = ECHO_CURVE[rarity]
+    local remainingXP = math.max(currentXp - initialXp, 0)
+    local firstLevel = currentXp < initialXp and 0 or 1
+    local levels = math.ceil(remainingXP / ECHO_CURVE_INCREMENT)
+    return 1 + firstLevel + levels
+end
+
+-- Check if the string contains any of the table values
+function existsInTable(dataString, list)
+    for _, item in ipairs(list) do
+        if string.find(dataString, item) then
+            return true -- Found a match
+        end
+    end
+    return false -- No matches found
+end
+
+-- Applies tag to item
+function applyTagToItem(PlayerInventoryComponent, itemHandle, flagToAPply)
+    local pre0, post0 = RegisterHook(
+        "/Script/Wayfinder.PlayerInventoryComponent:SERVER_TryApplyItemFlags",
+        function(_, p1)
+            local struct = p1:get()
+
+            struct.ID = { A = itemHandle.ID.A, B = itemHandle.ID.B, C = itemHandle.ID.C, D = itemHandle.ID.D }
+            struct.Data = {
+                RowName = itemHandle.Data.RowName
+            }
+        end)
+
+
+    PlayerInventoryComponent:SERVER_TryApplyItemFlags({}, flagToAPply)
+
+    UnregisterHook("/Script/Wayfinder.PlayerInventoryComponent:SERVER_TryApplyItemFlags", pre0, post0)
+end
+
+function handleApplyItemFlag(PlayerInventoryComponent, itemEntry, rules, levelCurve, isEcho, flatToApply)
+    local itemSpec = itemEntry.Spec;
+    local itemFlag = itemSpec.ItemFlags;
+    local itemRarity = itemSpec.echoRarity;
+
+    -- Returns immediately if item is set as favorite
+    if itemFlag == 2 then
+        return true
+    end
+
+    local hasTriggeredRule = false;
+
+    for _, rule in ipairs(rules) do
+        -- Check rule for belowLevel
+        if rule.belowLevel then
+            local level = isEcho and echoExpToLevel(itemSpec.CurrentExp, itemRarity) or
+                expToLevel(itemSpec.CurrentExp, levelCurve);
+
+            if level <= rule.belowLevel then
+                hasTriggeredRule = true
+            end
+        end
+
+        -- Check rule for aboveLevel
+        if rule.aboveLevel then
+            local level = isEcho and echoExpToLevel(itemSpec.CurrentExp, itemRarity) or
+                expToLevel(itemSpec.CurrentExp, levelCurve);
+
+            if level >= rule.aboveLevel then
+                hasTriggeredRule = true
+            end
+        end
+
+        -- Check rule for slots
+        if rule.slots then
+            local itemSlots = itemEntry.Spec.m_GeneratedFogSoulSlots
+
+            for i = 1, #itemSlots do
+                local hasSlot = existsInTable(SLOT_TYPES[itemSlots[i].Category], rule.slots)
+                if hasSlot then
+                    hasTriggeredRule = true
+                end
+            end
+        end
+
+        if rule.rarity then
+            local hasRarity = existsInTable(itemSpec.echoRarity, rule.rarity)
+            if hasRarity then
+                hasTriggeredRule = true
+            end
+        end
+
+        if rule.upgraded and isEcho then
+            if itemSpec.currentExp > itemSpec.startingExp then
+                hasTriggeredRule = true
+            end
+        end
+    end
+
+    -- Apply the tag if all condition are true
+    -- Also prevent re-applying of current flag
+    if hasTriggeredRule and itemFlag ~= flatToApply then
+        Log(string.format("applying flag %d (2=fav,1=junk,4=echo-junk)", flatToApply))
+        applyTagToItem(PlayerInventoryComponent, itemEntry.Handle, flatToApply)
+    end
+
+    return hasTriggeredRule;
+end
+
+-- @param PlayerInventoryComponent: UActorComponent
+-- @param itemEntry: InventoryItemEntry
+function FlagItem(PlayerInventoryComponent, itemEntry)
+    local itemType = itemEntry["Handle"]["Data"]["DataTable"]:GetFullName();
+
+    local isWeapon = existsInTable(itemType, ITEM_TYPES.Weapon)
+    local isAccessory = existsInTable(itemType, ITEM_TYPES.Accessory)
+    local isEcho = existsInTable(itemType, ITEM_TYPES.Echo)
+
+    Log(string.format("FlagItem type=%s weapon=%s acc=%s echo=%s", itemType,
+        tostring(isWeapon), tostring(isAccessory), tostring(isEcho)))
+
+    if isWeapon then
+        -- Handle Favorite
+        local isFavorite = handleApplyItemFlag(PlayerInventoryComponent, itemEntry, Rules.weaponFavoriteFilters,
+            WEAPON_CURVE, isEcho, 2)
+
+        if not isFavorite then
+            -- Handle Junk
+            handleApplyItemFlag(PlayerInventoryComponent, itemEntry, Rules.weaponJunkFilters, WEAPON_CURVE, isEcho, 1)
+        end
+    elseif isAccessory then
+        -- Handle Favorite
+        local isFavorite = handleApplyItemFlag(PlayerInventoryComponent, itemEntry, Rules.accessoryFavoriteFilters,
+            ACCESSORY_CURVE, isEcho, 2)
+
+        if not isFavorite then
+            -- Handle Junk
+            handleApplyItemFlag(PlayerInventoryComponent, itemEntry, Rules.accessoryJunkFilters, ACCESSORY_CURVE, isEcho,
+                1)
+        end
+    elseif isEcho then
+        local isFavorite = handleApplyItemFlag(PlayerInventoryComponent, itemEntry, Rules.echoFavoriteFilters,
+            {}, isEcho, 2)
+
+        if not isFavorite then
+            -- Handle Junk
+            handleApplyItemFlag(PlayerInventoryComponent, itemEntry, Rules.echoJunkFilters,
+                {}, isEcho, 4)
+        end
+    end
+end
+
+function FlagItems(PlayerInventoryComponent)
+    local items = PlayerInventoryComponent:GetItemsByTag({
+        GameplayTags = {},
+        ParentTags = {}
+    })
+
+    Log(string.format("ITEM COUNT: %s\n", #items))
+    for _, item in ipairs(items) do
+        FlagItem(PlayerInventoryComponent, item["Handle"])
+    end
+end
+
+RegisterHook("/Script/Wayfinder.PlayerInventoryComponent:CLIENT_NotifyItemAdded",
+    function(_, ItemEntry)
+        Log("CLIENT_NotifyItemAdded fired")
+        local ok, err = pcall(function()
+            local PlayerInventoryComponent = FindFirstOf("PlayerInventoryComponent");
+            FlagItem(PlayerInventoryComponent, ItemEntry["Handle"])
+        end)
+        if not ok then Log(string.format("auto-sort ERROR: %s", tostring(err))) end
+    end)
+
+RegisterConsoleCommandHandler("RunSmartSort", function(FullCommand, Parameters, OutputDevice)
+    local PlayerInventoryComponent = FindFirstOf("PlayerInventoryComponent");
+
+    if PlayerInventoryComponent:IsValid() then
+        Log(Text.flaggingItems, OutputDevice)
+        FlagItems(PlayerInventoryComponent);
+        Log(Text.flaggedItems, OutputDevice);
+    else
+        Log(Text.noInventory, OutputDevice)
+    end
+
+    return true
+end)
