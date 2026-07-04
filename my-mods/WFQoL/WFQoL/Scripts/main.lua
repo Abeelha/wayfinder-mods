@@ -3,6 +3,7 @@
 --   F8  AutoParry  - timed parry/block just before enemy melee hits land
 --   F6  AutoSprint - sprint while moving out of combat (foot + mount)
 --   F9  AutoReload - reload minigame always lands the perfect window
+--   F10 AimAssist  - controller aim assist (soft lock/magnetism) on KB+M
 --   INS overlay on/off
 --
 -- Safety rule (learned the hard way): no FindAllOf/ExecuteInGameThread engine
@@ -13,6 +14,7 @@ local state = {
     parry = true,
     sprint = true,
     reload = true,
+    aim = true,
     overlay = true,
 }
 
@@ -98,8 +100,18 @@ local m1Held = false
 local injecting = false
 local sendRelease = false
 
+-- reload minigame state lives up here: AutoChain must stop injecting M1 while
+-- the minigame runs (Attack1 AND Reload both count as minigame inputs - a
+-- spammed press outside the window = guaranteed failed reload)
+local currentReload = nil -- { montage, t0, pressAt, maxT }
+local function reloadInProgress()
+    if not currentReload then return false end
+    return (os.clock() - currentReload.t0) < ((currentReload.maxT or 3.0) + 0.5)
+end
+
 LoopAsync(70, function()
     if not (state.chain and m1Held and ready) then return false end
+    if reloadInProgress() then return false end
     ExecuteInGameThread(function()
         if not pawnRef or not pawnRef:IsValid() then return end
         injecting = true
@@ -232,6 +244,7 @@ local function doParry(className, delayMs, enemy, attempt)
     ExecuteInGameThread(function()
         local ok, err = pcall(function()
             if not state.parry then return end
+            if reloadInProgress() then return end -- parry/montage-stop would kill the minigame
             local now = os.clock()
             if now - lastParry < PARRY_COOLDOWN then return end
             local pawn = getPawn()
@@ -527,18 +540,16 @@ LoopAsync(300, function()
 end)
 
 -- ---------------------------------------------------------------- AutoReload
--- two paths:
---  LEARNED: if a perfect press time is known for this weapon's reload montage
---           (taught by YOUR manual perfect reloads, or a prior auto success),
---           replay the press at that exact time.
---  PROBE:   otherwise poll the ability's CheckInWindow every 40ms and press
---           when the window opens. every success teaches the LEARNED path.
+-- the GA computes its perfect window on activation and stores it on the
+-- instance: WindowMin/WindowMax/WindowCenter (normalized 0-1 of the slider)
+-- plus MaxReloadTime (seconds). read those and press dead-center of the
+-- window. no CheckInWindow polling, no IsActive (both threw via UE4SS).
+-- every SUCCESS (auto or manual - R or M1 both trigger the minigame) stores
+-- the actual press time per montage; a learned time takes priority forever.
 local LEARN_REL = "Mods/WFQoL/reload-times.txt"
 local LEARN_ABS = "D:/SteamLibrary/steamapps/common/Wayfinder/Atlas/Binaries/Win64/Mods/WFQoL/reload-times.txt"
 local learned = {}
-local currentReload = nil -- { montage, t0, pressAt }
-local reloadPolling = false
-local reloadCallStyle = nil
+local RELOAD_LATENCY = 0.03 -- scheduling/input latency compensation, seconds
 
 pcall(function()
     local f = io.open(LEARN_REL, "r") or io.open(LEARN_ABS, "r")
@@ -568,69 +579,71 @@ local function pressReload(elapsed) -- game thread only
     end
 end
 
--- UE4SS out-param calling convention differs by version: try out-table first,
--- fall back to multi-return; remember whichever works
-local function checkInWindow(ab, elapsed)
-    if reloadCallStyle ~= "multi" then
-        local ok, res = pcall(function()
-            local out = {}
-            local r = ab:CheckInWindow(elapsed, out)
-            return (r == true) or (out.bInWindow == true)
-        end)
-        if ok then
-            reloadCallStyle = "table"
-            return res
-        end
+-- window props are set by the GA's ubergraph right after activation; values
+-- are normalized 0-1 of the slider unless they read as plain seconds
+local function readWindow(ab)
+    local maxT, wmin, wmax, wcenter
+    local ok = pcall(function()
+        maxT = ab.MaxReloadTime
+        wmin = ab.WindowMin
+        wmax = ab.WindowMax
+        wcenter = ab.WindowCenter
+    end)
+    if not ok or not maxT or maxT <= 0.05 then return nil end
+    local center
+    if wmin and wmax and wmax > 0 then
+        center = (wmin + wmax) / 2
+    elseif wcenter and wcenter > 0 then
+        center = wcenter
     end
-    local ok2, a, b = pcall(function() return ab:CheckInWindow(elapsed) end)
-    if ok2 then
-        reloadCallStyle = "multi"
-        return (a == true) or (b == true)
-    end
-    return nil
+    if not center then return nil end
+    local scale = (wmax and wmax > 1.001) and 1.0 or maxT
+    return center * scale, wmin or -1, wmax or -1, maxT
 end
 
-local function startProbe(ab, t0)
-    if reloadPolling then return end
-    reloadPolling = true
-    local ticks = 0
-    local done = false
-    LoopAsync(40, function()
-        ticks = ticks + 1
-        if done or ticks > 150 then
-            reloadPolling = false
-            return true
+local windowUnreadable = false
+local function scheduleWindowPress(ab, t0, attempt)
+    attempt = attempt or 1
+    if attempt > 10 then
+        if not windowUnreadable then
+            windowUnreadable = true
+            log("reload: window props unreadable - do one manual perfect reload to teach it")
         end
+        return
+    end
+    ExecuteWithDelay(attempt == 1 and 100 or 60, function()
         ExecuteInGameThread(function()
-            local phase = "start"
+            local phase = "read"
             local ok, err = pcall(function()
-                if done then return end
-                if not state.reload then done = true return end
-                phase = "isvalid"
-                if not ab:IsValid() then done = true return end
-                phase = "isactive"
-                if not ab:IsActive() then done = true return end
-                phase = "checkwindow"
-                local elapsed = os.clock() - t0
-                local inWindow = checkInWindow(ab, elapsed)
-                if inWindow == nil then
-                    logErrorOnce("reload", "CheckInWindow failed in both call styles")
-                    done = true
+                if not state.reload or not currentReload or currentReload.t0 ~= t0 then return end
+                if not ab:IsValid() then return end
+                local pressSec, wmin, wmax, maxT = readWindow(ab)
+                if not pressSec then
+                    scheduleWindowPress(ab, t0, attempt + 1)
                     return
                 end
-                if inWindow then
-                    phase = "press"
-                    pressReload(elapsed)
-                    log("reload: window press at %.2fs", elapsed)
-                    done = true
+                currentReload.maxT = maxT
+                log("reload: window %.2f-%.2f max %.2fs -> press at %.2fs", wmin, wmax, maxT, pressSec)
+                phase = "press"
+                local remainMs = math.floor((pressSec - RELOAD_LATENCY - (os.clock() - t0)) * 1000)
+                if remainMs <= 10 then
+                    pressReload(os.clock() - t0)
+                    log("reload: pressed at %.2fs", os.clock() - t0)
+                    return
                 end
+                ExecuteWithDelay(remainMs, function()
+                    ExecuteInGameThread(function()
+                        pcall(function()
+                            if state.reload and currentReload and currentReload.t0 == t0 and ab:IsValid() then
+                                pressReload(os.clock() - t0)
+                                log("reload: pressed at %.2fs", os.clock() - t0)
+                            end
+                        end)
+                    end)
+                end)
             end)
-            if not ok then
-                logErrorOnce("reload@" .. phase, tostring(err))
-                done = true
-            end
+            if not ok then logErrorOnce("reload@" .. phase, tostring(err)) end
         end)
-        return false
     end)
 end
 
@@ -640,22 +653,24 @@ local function onReloadActivated(self)
         local montage = "unknown"
         pcall(function() montage = ab.ReloadMontage:GetFName():ToString() end)
         local t0 = os.clock()
-        currentReload = { montage = montage, t0 = t0, pressAt = nil }
+        currentReload = { montage = montage, t0 = t0, pressAt = nil, maxT = nil }
+        pcall(function() currentReload.maxT = ab.MaxReloadTime end)
         if not state.reload then return end
 
         local t = learned[montage]
         if t then
-            ExecuteWithDelay(math.max(math.floor((t - 0.03) * 1000), 20), function()
+            ExecuteWithDelay(math.max(math.floor((t - RELOAD_LATENCY) * 1000), 20), function()
                 ExecuteInGameThread(function()
                     pcall(function()
-                        if state.reload and ab:IsValid() and ab:IsActive() then
+                        if state.reload and currentReload and currentReload.t0 == t0 then
                             pressReload(os.clock() - t0)
+                            log("reload: learned press at %.2fs", os.clock() - t0)
                         end
                     end)
                 end)
             end)
         else
-            startProbe(ab, t0)
+            scheduleWindowPress(ab, t0)
         end
     end)
     if not ok then logErrorOnce("reload-activate", tostring(err)) end
@@ -664,13 +679,38 @@ end
 -- success = the game activated the Succeeded ability; whatever press time led
 -- here (manual or injected) becomes the learned perfect time for this montage
 local function onReloadSucceeded(self)
-    local ok = pcall(function()
+    pcall(function()
         if currentReload and currentReload.pressAt and currentReload.montage ~= "unknown" then
             local first = learned[currentReload.montage] == nil
             learned[currentReload.montage] = currentReload.pressAt
             saveLearned()
             if first then
                 log("reload: LEARNED perfect time %.2fs for %s", currentReload.pressAt, currentReload.montage)
+            end
+        end
+        currentReload = nil
+    end)
+end
+
+-- ---------------------------------------------------------------- AimAssist
+-- soft lock / aim magnetism / camera assist only run when the game believes a
+-- gamepad is driving. two native queries decide that (WFPlayerCharacter:
+-- IsUsingGamepad and WFGameplayBlueprintLibrary:GetPlayerInputSource); both
+-- are hooked to lie while state.aim is on. bCameraAssistOnGamepad is the
+-- settings-menu master switch for the assist itself (defaults false even on
+-- real controllers) so it gets flipped on at spawn.
+local aimCalls = { gamepad = 0, source = 0 } -- proof the hooks are live (F5 diag)
+local aimSettingsDone = false
+local function applyAimSettings()
+    if aimSettingsDone then return end
+    pcall(function()
+        for _, s in pairs(FindAllOf("WFGameUserSettings") or {}) do
+            if s:IsValid() then
+                local old = nil
+                pcall(function() old = s.bCameraAssistOnGamepad end)
+                s.bCameraAssistOnGamepad = true
+                aimSettingsDone = true
+                log("aim: bCameraAssistOnGamepad %s -> true", tostring(old))
             end
         end
     end)
@@ -687,10 +727,10 @@ local function writeState()
         local f = io.open(STATE_FILE, "w") or io.open(STATE_FILE_ABS, "w")
         if not f then error("cannot open " .. STATE_FILE) end
         f:write(string.format(
-            '{"chain":%s,"parry":%s,"sprint":%s,"reload":%s,"sprintMode":"%s","combat":%s,"lastParry":"%s","ts":%d}',
+            '{"chain":%s,"parry":%s,"sprint":%s,"reload":%s,"aim":%s,"sprintMode":"%s","combat":%s,"lastParry":"%s","ts":%d}',
             tostring(state.chain), tostring(state.parry), tostring(state.sprint),
-            tostring(state.reload), sprintMode, tostring(lastCombat == true),
-            lastParryInfo, os.time()))
+            tostring(state.reload), tostring(state.aim), sprintMode,
+            tostring(lastCombat == true), lastParryInfo, os.time()))
         f:close()
     end)
     if not ok then logErrorOnce("statefile", err) end
@@ -724,6 +764,10 @@ local function registerAll()
         if injecting then return end
         m1Held = true
         pawnRef = self:get()
+        -- M1 is also a valid minigame trigger: count it as a manual press
+        if reloadInProgress() then
+            currentReload.pressAt = os.clock() - currentReload.t0
+        end
     end)
     tryHook(CHAR .. ":InpActEvt_Attack1_K2Node_InputActionEvent_37", function(self)
         if injecting then return end
@@ -735,9 +779,20 @@ local function registerAll()
     -- capture YOUR manual reload presses so successes teach the perfect time
     tryHook(CHAR .. ":InpActEvt_Reload_K2Node_InputActionEvent_12", function(self)
         if injecting then return end
-        if currentReload then
+        if reloadInProgress() then
             currentReload.pressAt = os.clock() - currentReload.t0
         end
+    end)
+    -- aim assist: make the gamepad checks lie while enabled (returning a value
+    -- from a hook callback overrides the UFunction's return value - same
+    -- convention ShowNameplates uses)
+    tryHook("/Script/Wayfinder.WFPlayerCharacter:IsUsingGamepad", function(self)
+        aimCalls.gamepad = aimCalls.gamepad + 1
+        if state.aim then return true end
+    end)
+    tryHook("/Script/Wayfinder.WFGameplayBlueprintLibrary:GetPlayerInputSource", function(self, Actor)
+        aimCalls.source = aimCalls.source + 1
+        if state.aim then return 1 end -- EPlayerInputSource::GAMEPAD
     end)
 end
 
@@ -760,6 +815,7 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, New
     libCache = nil
     sprintClassCache = nil
     preloadParryAssets() -- ClientRestart hook = guaranteed game thread
+    applyAimSettings()
     registerAll()
 end)
 
@@ -781,6 +837,7 @@ bindToggle(Key.F6, "sprint", "AutoSprint")
 bindToggle(Key.F7, "chain", "AutoChain")
 bindToggle(Key.F8, "parry", "AutoParry")
 bindToggle(Key.F9, "reload", "AutoReload")
+bindToggle(Key.F10, "aim", "AimAssist")
 
 -- F5: one-shot diagnostic dump (mount debugging etc)
 RegisterKeyBind(Key.F5, function()
@@ -799,15 +856,16 @@ RegisterKeyBind(Key.F5, function()
             local asc = getASC(pawn)
             local combat = asc and ascHasTag(asc, INCOMBAT_TAG) or false
             local sprinting = asc and ascHasTag(asc, SPRINTING_TAG) or false
-            log("diag: pawn=%s vel=%.0f mountedNative=%s parent=%s parentVel=%.0f walk=%s parentWalk=%s mode=%s combat=%s sprintTag=%s",
+            log("diag: pawn=%s vel=%.0f mountedNative=%s parent=%s parentVel=%.0f walk=%s parentWalk=%s mode=%s combat=%s sprintTag=%s aimCalls=g%d/s%d",
                 cls, math.sqrt(velSq(pawn)),
                 okm and tostring(mountedNative) or "CALL-FAILED",
                 parentCls, parentVel,
                 tostring(maxWalk(pawn)), parent and tostring(maxWalk(parent)) or "-",
-                sprintMode, tostring(combat), tostring(sprinting))
+                sprintMode, tostring(combat), tostring(sprinting),
+                aimCalls.gamepad, aimCalls.source)
         end)
         if not ok then log("diag error: %s", tostring(err)) end
     end)
 end)
 
-log("loaded - F6 sprint / F7 chain / F8 parry / F9 reload / overlay via tools/overlay")
+log("loaded - F6 sprint / F7 chain / F8 parry / F9 reload / F10 aim / overlay via tools/overlay")

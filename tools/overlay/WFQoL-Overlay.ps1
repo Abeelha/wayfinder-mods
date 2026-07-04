@@ -40,7 +40,7 @@ $xaml = @'
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="WFQoL Overlay" WindowStyle="None" AllowsTransparency="True"
         Background="Transparent" Topmost="True" ShowInTaskbar="False"
-        Width="280" Height="230" MinWidth="180" MinHeight="150"
+        Width="280" Height="258" MinWidth="180" MinHeight="150"
         ResizeMode="CanResizeWithGrip">
   <Border CornerRadius="14" Background="#DD0E1116" BorderBrush="#2FFFFFFF" BorderThickness="1" Padding="6">
     <Viewbox Stretch="Uniform">
@@ -93,7 +93,8 @@ $features = @(
     @{ Name = "SPRINT"; Key = "F6"; Prop = "sprint" },
     @{ Name = "CHAIN";  Key = "F7"; Prop = "chain" },
     @{ Name = "PARRY";  Key = "F8"; Prop = "parry" },
-    @{ Name = "RELOAD"; Key = "F9"; Prop = "reload" }
+    @{ Name = "RELOAD"; Key = "F9"; Prop = "reload" },
+    @{ Name = "AIM";    Key = "F10"; Prop = "aim" }
 )
 $pills = @{}
 $modeChip = $null
@@ -153,7 +154,7 @@ if (Test-Path $cfgPath) {
     try {
         $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
         if ($cfg.left -ne $null) { $window.Left = $cfg.left; $window.Top = $cfg.top }
-        if ($cfg.width) { $window.Width = $cfg.width; $window.Height = $cfg.height }
+        if ($cfg.width) { $window.Width = $cfg.width; $window.Height = [Math]::Max([double]$cfg.height, 258) }
         if ($cfg.locked -ne $null) { $script:locked = [bool]$cfg.locked }
     } catch { OLog "config load failed: $_" }
 } else {
@@ -236,6 +237,7 @@ $timer.Add_Tick({
                 Set-Pill "chain" $s.chain
                 Set-Pill "parry" $s.parry
                 Set-Pill "reload" $s.reload
+                if ($null -ne $s.aim) { Set-Pill "aim" $s.aim }
                 if ($script:modeChip) { $script:modeChip.Text = "$($s.sprintMode)" }
                 $combatDot.Fill = if ($s.combat) { "#FF5A5A" } else { "#71F58A" }
                 $parryText.Text = if ($s.lastParry) { "last parry: $($s.lastParry)" } else { "" }
