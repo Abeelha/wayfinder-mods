@@ -63,9 +63,21 @@ pcall(function()
     if StaticFindObject(CHAR):IsValid() then ready = true end -- mod restarted mid-map
 end)
 
+-- cache engine object refs: repeated StaticFindObject lookups in loops cost frames
+local libCache = nil
 local function getLib()
+    if libCache and libCache:IsValid() then return libCache end
     local lib = StaticFindObject(WFLIB)
-    return lib and lib:IsValid() and lib or nil
+    libCache = (lib and lib:IsValid()) and lib or nil
+    return libCache
+end
+
+local sprintClassCache = nil
+local function getSprintClass()
+    if sprintClassCache and sprintClassCache:IsValid() then return sprintClassCache end
+    local c = StaticFindObject(SPRINT_CLASS)
+    sprintClassCache = (c and c:IsValid()) and c or nil
+    return sprintClassCache
 end
 
 local function getASC(pawn)
@@ -132,7 +144,16 @@ local function distTo(a, b)
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
-local function doParry(className, delayMs, isRetry)
+local function tryActivateParry(asc)
+    local blockAbility = asc:GetAbilityFromInputTag(BLOCK_TAG)
+    if not blockAbility or not blockAbility:IsValid() then return false end
+    return asc:TryActivateAbilityByClass(blockAbility:GetClass(), true)
+end
+
+-- forcing ladder: plain activation -> cancel current swing montage + retry ->
+-- two more delayed rounds -> give up loudly
+local function doParry(className, delayMs, attempt)
+    attempt = attempt or 1
     ExecuteInGameThread(function()
         local ok, err = pcall(function()
             if not state.parry then return end
@@ -142,20 +163,35 @@ local function doParry(className, delayMs, isRetry)
             if not pawn then return end
             local asc = getASC(pawn)
             if not asc then return end
-            local blockAbility = asc:GetAbilityFromInputTag(BLOCK_TAG)
-            if not blockAbility or not blockAbility:IsValid() then return end
-            if asc:TryActivateAbilityByClass(blockAbility:GetClass(), true) then
+
+            if tryActivateParry(asc) then
                 lastParry = now
                 lastParryInfo = string.format("%s @%dms", className:gsub("^GA_", ""):gsub("_C$", ""), delayMs)
                 log("parry vs %s (delay %dms)", className, delayMs)
-            elseif not isRetry then
-                -- blocked by current player action (mid-swing etc): one quick retry
-                ExecuteWithDelay(120, function() doParry(className, delayMs, true) end)
+                return
+            end
+
+            -- mid-swing: cancel the player's current montage and force it through
+            pcall(function() asc:ServerCurrentMontageStop(0.15) end)
+            if tryActivateParry(asc) then
+                lastParry = now
+                lastParryInfo = string.format("%s @%dms forced", className:gsub("^GA_", ""):gsub("_C$", ""), delayMs)
+                log("parry FORCED (cancelled swing) vs %s", className)
+                return
+            end
+
+            if attempt < 3 then
+                ExecuteWithDelay(80, function() doParry(className, delayMs, attempt + 1) end)
+            else
+                log("parry FAILED vs %s after %d attempts", className, attempt)
             end
         end)
         if not ok then logErrorOnce("parry", err) end
     end)
 end
+
+-- verdict memo: tag containers iterated once per ABILITY CLASS ever, not per activation
+local meleeCache = {}
 
 local function onEnemyAbility(self)
     if not state.parry then return end
@@ -163,8 +199,13 @@ local function onEnemyAbility(self)
     if now - lastScheduled < 0.05 then return end
     local ok, err = pcall(function()
         local ab = self:get()
-        if not isMeleeAttack(ab) then return end
         local className = ab:GetClass():GetFName():ToString()
+        local verdict = meleeCache[className]
+        if verdict == nil then
+            verdict = isMeleeAttack(ab)
+            meleeCache[className] = verdict
+        end
+        if not verdict then return end
         local enemy = ab:GetAvatarActorFromActorInfo()
         local pawn = getPawn()
         if not (enemy and enemy:IsValid() and pawn) then return end
@@ -197,16 +238,18 @@ local speedBoosted = false
 local origMaxWalk = nil
 local lastCombat = nil
 
-local function speedSq(pawn)
-    local v = pawn:GetVelocity()
-    local s = v.X * v.X + v.Y * v.Y
-    if s > 1 then return s end
+local function velSq(actor)
+    local ok, s = pcall(function()
+        local v = actor:GetVelocity()
+        return v.X * v.X + v.Y * v.Y
+    end)
+    return ok and s or 0
+end
+
+local function attachParent(pawn)
     local ok, parent = pcall(function() return pawn:GetAttachParentActor() end)
-    if ok and parent and parent:IsValid() then
-        local pv = parent:GetVelocity()
-        return pv.X * pv.X + pv.Y * pv.Y
-    end
-    return s
+    if ok and parent and parent:IsValid() then return parent end
+    return nil
 end
 
 local function maxWalk(actor)
@@ -230,9 +273,16 @@ local function stopMountBoost()
     end
 end
 
-local function isMounted(pawn)
+-- returns mount actor (or nil). IsMounted() native first, class-name fallback.
+local function getMount(pawn)
+    local parent = attachParent(pawn)
     local ok, v = pcall(function() return pawn:IsMounted() end)
-    return ok and v or false
+    if ok and v then return parent or pawn end
+    if parent then
+        local okc, cn = pcall(function() return parent:GetClass():GetFName():ToString() end)
+        if okc and cn and cn:find("Mount") then return parent end
+    end
+    return nil
 end
 
 local function stopSprintAssist(pawn, asc)
@@ -263,26 +313,27 @@ LoopAsync(300, function()
                 log("combat: %s", tostring(inCombat))
             end
 
-            local shouldSprint = state.sprint and not inCombat
-                and speedSq(pawn) >= MIN_SPEED_SQ
+            -- mount resolved BEFORE the moving gate: rider velocity is ~0 while
+            -- mounted, so gating on pawn speed first killed the mount branch (v4 bug)
+            local mount = getMount(pawn)
+            local moveSq = mount and math.max(velSq(mount), velSq(pawn)) or velSq(pawn)
+
+            local shouldSprint = state.sprint and not inCombat and moveSq >= MIN_SPEED_SQ
             if not shouldSprint then
                 stopSprintAssist(pawn, asc)
                 return
             end
 
             -- mounted: boost the mount's own movement, nothing touches the rider
-            if isMounted(pawn) then
+            if mount and mount ~= pawn then
                 if tagInjected or speedBoosted then stopSprintAssist(pawn, asc) end
                 if not mountBoostRef then
-                    local okm, mount = pcall(function() return pawn:GetAttachParentActor() end)
-                    if okm and mount and mount:IsValid() then
-                        local orig = maxWalk(mount)
-                        if orig then
-                            pcall(function() mount.CharacterMovement.MaxWalkSpeed = orig * 1.4 end)
-                            mountBoostRef = mount
-                            mountBoostOrig = orig
-                            log("sprint: mount speed %.0f -> %.0f", orig, orig * 1.4)
-                        end
+                    local orig = maxWalk(mount)
+                    if orig then
+                        pcall(function() mount.CharacterMovement.MaxWalkSpeed = orig * 1.4 end)
+                        mountBoostRef = mount
+                        mountBoostOrig = orig
+                        log("sprint: mount speed %.0f -> %.0f", orig, orig * 1.4)
                     end
                 end
                 return
@@ -295,8 +346,8 @@ LoopAsync(300, function()
             end
 
             if sprintMode == "ability" then
-                local sprintClass = StaticFindObject(SPRINT_CLASS)
-                if sprintClass and sprintClass:IsValid() then
+                local sprintClass = getSprintClass()
+                if sprintClass then
                     asc:TryActivateAbilityByClass(sprintClass, true)
                     sprintTries = sprintTries + 1
                     if sprintTries >= 5 then
@@ -435,6 +486,8 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, New
         ready = true
         m1Held = false
     end
+    libCache = nil
+    sprintClassCache = nil
     registerAll()
 end)
 
@@ -456,5 +509,33 @@ bindToggle(Key.F6, "sprint", "AutoSprint")
 bindToggle(Key.F7, "chain", "AutoChain")
 bindToggle(Key.F8, "parry", "AutoParry")
 bindToggle(Key.F9, "reload", "AutoReload")
+
+-- F5: one-shot diagnostic dump (mount debugging etc)
+RegisterKeyBind(Key.F5, function()
+    ExecuteInGameThread(function()
+        local ok, err = pcall(function()
+            local pawn = getPawn()
+            if not pawn then log("diag: no pawn") return end
+            local cls = pawn:GetClass():GetFName():ToString()
+            local okm, mountedNative = pcall(function() return pawn:IsMounted() end)
+            local parent = attachParent(pawn)
+            local parentCls, parentVel = "none", 0
+            if parent then
+                parentCls = parent:GetClass():GetFName():ToString()
+                parentVel = math.sqrt(velSq(parent))
+            end
+            local asc = getASC(pawn)
+            local combat = asc and ascHasTag(asc, INCOMBAT_TAG) or false
+            local sprinting = asc and ascHasTag(asc, SPRINTING_TAG) or false
+            log("diag: pawn=%s vel=%.0f mountedNative=%s parent=%s parentVel=%.0f walk=%s parentWalk=%s mode=%s combat=%s sprintTag=%s",
+                cls, math.sqrt(velSq(pawn)),
+                okm and tostring(mountedNative) or "CALL-FAILED",
+                parentCls, parentVel,
+                tostring(maxWalk(pawn)), parent and tostring(maxWalk(parent)) or "-",
+                sprintMode, tostring(combat), tostring(sprinting))
+        end)
+        if not ok then log("diag error: %s", tostring(err)) end
+    end)
+end)
 
 log("loaded - F6 sprint / F7 chain / F8 parry / F9 reload / overlay via tools/overlay")

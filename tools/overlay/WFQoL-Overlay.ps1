@@ -1,9 +1,23 @@
 # WFQoL external overlay - reads the state file written by the WFQoL UE4SS mod.
 # Drag to move. Resize with the bottom-right grip (content scales). Lock button
 # makes it click-through; Ctrl+Alt+O unlocks. Position/size/lock persisted.
+# Diagnostics: %APPDATA%\wfqol-overlay.log (use start-overlay-debug.bat for console)
 param(
     [string]$StateFile = "D:\SteamLibrary\steamapps\common\Wayfinder\Atlas\Binaries\Win64\Mods\WFQoL\overlay-state.json"
 )
+
+$logPath = Join-Path $env:APPDATA "wfqol-overlay.log"
+function OLog($msg) {
+    $line = "{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $msg
+    try { Add-Content -Path $logPath -Value $line -Encoding utf8 } catch {}
+    Write-Host $line
+}
+try { Set-Content -Path $logPath -Value "" -Encoding utf8 } catch {}
+
+try {
+
+OLog "overlay starting (PS $($PSVersionTable.PSVersion))"
+OLog "state file: $StateFile (exists: $(Test-Path $StateFile))"
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
@@ -52,7 +66,6 @@ $parryText = $window.FindName("ParryText")
 $lockBtn = $window.FindName("LockBtn")
 $closeBtn = $window.FindName("CloseBtn")
 
-# feature rows: name, hotkey, state-file property
 $features = @(
     @{ Name = "SPRINT"; Key = "F6"; Prop = "sprint" },
     @{ Name = "CHAIN";  Key = "F7"; Prop = "chain" },
@@ -119,10 +132,22 @@ if (Test-Path $cfgPath) {
         if ($cfg.left -ne $null) { $window.Left = $cfg.left; $window.Top = $cfg.top }
         if ($cfg.width) { $window.Width = $cfg.width; $window.Height = $cfg.height }
         if ($cfg.locked) { $script:locked = $true }
-    } catch {}
+    } catch { OLog "config load failed: $_" }
 } else {
     $window.Left = 40; $window.Top = 200
 }
+
+# rescue off-screen positions (monitor changes etc)
+$vsLeft = [Windows.SystemParameters]::VirtualScreenLeft
+$vsTop = [Windows.SystemParameters]::VirtualScreenTop
+$vsRight = $vsLeft + [Windows.SystemParameters]::VirtualScreenWidth
+$vsBottom = $vsTop + [Windows.SystemParameters]::VirtualScreenHeight
+if ($window.Left -lt ($vsLeft - 30) -or $window.Left -gt ($vsRight - 60) -or
+    $window.Top -lt ($vsTop - 30) -or $window.Top -gt ($vsBottom - 60)) {
+    OLog "position off-screen ($($window.Left),$($window.Top)) - reset to 40,200"
+    $window.Left = 40; $window.Top = 200
+}
+OLog "window at $($window.Left),$($window.Top) size $($window.Width)x$($window.Height) locked=$($script:locked)"
 
 function Save-Config {
     @{ left = $window.Left; top = $window.Top; width = $window.Width; height = $window.Height; locked = $script:locked } |
@@ -152,24 +177,28 @@ $lockBtn.Add_Click({ $script:locked = $true; Apply-Lock })
 $closeBtn.Add_Click({ $window.Close() })
 $window.Add_MouseLeftButtonDown({ if (-not $script:locked) { try { $window.DragMove(); Save-Config } catch {} } })
 
-# Ctrl+Alt+O global hotkey -> unlock
 $window.Add_SourceInitialized({
-    $hwnd = (New-Object Windows.Interop.WindowInteropHelper($window)).Handle
-    [void][Win32.Native]::RegisterHotKey($hwnd, 9001, 0x3, 0x4F) # MOD_CONTROL|MOD_ALT, 'O'
-    $src = [Windows.Interop.HwndSource]::FromHwnd($hwnd)
-    $src.AddHook({
-        param($h, $msg, $w, $l, [ref]$handled)
-        if ($msg -eq 0x0312 -and $w.ToInt32() -eq 9001) {
-            $script:locked = -not $script:locked
-            Apply-Lock
-            $handled.Value = $true
-        }
-        return [IntPtr]::Zero
-    })
-    Apply-Lock
+    try {
+        $hwnd = (New-Object Windows.Interop.WindowInteropHelper($window)).Handle
+        [void][Win32.Native]::RegisterHotKey($hwnd, 9001, 0x3, 0x4F) # Ctrl+Alt+O
+        $src = [Windows.Interop.HwndSource]::FromHwnd($hwnd)
+        $src.AddHook({
+            param($h, $msg, $w, $l, [ref]$handled)
+            if ($msg -eq 0x0312 -and $w.ToInt32() -eq 9001) {
+                $script:locked = -not $script:locked
+                Apply-Lock
+                $handled.Value = $true
+            }
+            return [IntPtr]::Zero
+        })
+        Apply-Lock
+        OLog "hotkey + lock initialized"
+    } catch { OLog "SourceInitialized error: $_" }
 })
+$window.Add_Loaded({ try { $window.Activate() } catch {} })
 
 # ------------------------------------------------------------------ state poll
+$script:pollCount = 0
 $timer = New-Object Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromMilliseconds(300)
 $timer.Add_Tick({
@@ -188,12 +217,21 @@ $timer.Add_Tick({
                 $combatDot.Fill = if ($s.combat) { "#FF5A5A" } else { "#71F58A" }
                 $parryText.Text = if ($s.lastParry) { "last parry: $($s.lastParry)" } else { "" }
             }
-        } catch { $stale = $true }
+            $script:pollCount++
+            if ($script:pollCount -eq 1) { OLog "first state read OK (age ${age}s, stale=$stale)" }
+        } catch { $stale = $true; OLog "state read error: $_" }
     }
     $offlineText.Visibility = if ($stale) { "Visible" } else { "Collapsed" }
     $window.Opacity = if ($stale) { 0.55 } else { 1.0 }
 })
 $timer.Start()
 
-$window.Add_Closed({ Save-Config })
+$window.Add_Closed({ Save-Config; OLog "closed" })
+OLog "showing window"
 [void]$window.ShowDialog()
+
+} catch {
+    OLog "FATAL: $_"
+    OLog $_.ScriptStackTrace
+    exit 1
+}
