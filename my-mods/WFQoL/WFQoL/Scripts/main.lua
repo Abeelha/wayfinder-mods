@@ -735,8 +735,7 @@ local AIMCFG_ABS = "D:/SteamLibrary/steamapps/common/Wayfinder/Atlas/Binaries/Wi
 local aimCfg = { fov = 20.0, smooth = 0.15, adsOnly = true }
 local aimCfgRaw = nil
 
-local PULL_DEADZONE = 0.25  -- degrees; inside this, hands off
-local INPUT_SCALE = 1 / 2.5 -- AddController*Input units -> degrees (engine default 2.5)
+local PULL_DEADZONE = 0.25 -- degrees; inside this, hands off
 local lastPullYaw, lastPullPitch = 0.0, 0.0
 
 LoopAsync(1000, function()
@@ -796,7 +795,7 @@ local function applyAimSettings()
     end)
 end
 
-LoopAsync(150, function()
+LoopAsync(100, function()
     if not ready then return false end
     ExecuteInGameThread(function()
         local ok, err = pcall(function()
@@ -835,18 +834,23 @@ LoopAsync(150, function()
     return false
 end)
 
--- camera pull toward the magnetized target. look-at math done in plain Lua
--- (no struct-passing into engine calls to go wrong)
-LoopAsync(33, function()
+-- camera pull toward the magnetized target. look-at math in plain Lua, and
+-- the rotation is WRITTEN via SetControlRotation - the additive
+-- AddController*Input route went through the game's input pipeline which
+-- scales/dampens it to nothing during ADS (session 15: calls executed
+-- errorless, zero movement). direct writes bypass all of that; the mouse
+-- still fights back fine because every tick re-reads the current rotation.
+local aimPulling = false
+LoopAsync(16, function()
     if not (state.aim and ready) then return false end
     ExecuteInGameThread(function()
         local ok, err = pcall(function()
             local pawn = getPawn()
-            if not pawn or not aimEngaged(pawn) then return end
+            if not pawn or not aimEngaged(pawn) then aimPulling = false return end
             local tc = pawn.TargetingComponent
             if not tc or not tc:IsValid() then return end
             local target = tc:GetMagnetizedAimTarget()
-            if not target or not target:IsValid() then return end
+            if not target or not target:IsValid() then aimPulling = false return end
             local controller = pawn:GetController()
             if not controller or not controller:IsValid() then return end
 
@@ -868,20 +872,30 @@ LoopAsync(33, function()
             local cur = controller:GetControlRotation()
             local dyaw = normDeg(wantYaw - cur.Yaw)
             local dpitch = normDeg(wantPitch - cur.Pitch)
-            if math.abs(dyaw) > aimCfg.fov or math.abs(dpitch) > aimCfg.fov then return end
+            if math.abs(dyaw) > aimCfg.fov or math.abs(dpitch) > aimCfg.fov then
+                aimPulling = false
+                return
+            end
+            if math.abs(dyaw) < PULL_DEADZONE and math.abs(dpitch) < PULL_DEADZONE then return end
 
-            local cap = 8.0 * aimCfg.smooth -- deg/tick; smooth=1 -> hard snap
-            local function pull(d)
-                if math.abs(d) < PULL_DEADZONE then return 0 end
-                local p = d * aimCfg.smooth
+            -- exponential approach: smooth = fraction of remaining angle per
+            -- 16ms tick (1.0 = instant snap), capped so low smooth stays gentle
+            local k = aimCfg.smooth
+            local cap = 12.0 * k
+            local function step(d)
+                local p = d * k
                 if p > cap then p = cap elseif p < -cap then p = -cap end
                 return p
             end
-            local py, pp = pull(dyaw), pull(dpitch)
+            local py, pp = step(dyaw), step(dpitch)
             lastPullYaw, lastPullPitch = py, pp
-            -- pitch input is inverted by engine convention
-            if py ~= 0 then pawn:AddControllerYawInput(py * INPUT_SCALE) end
-            if pp ~= 0 then pawn:AddControllerPitchInput(-pp * INPUT_SCALE) end
+            local newPitch = normDeg(cur.Pitch + pp)
+            if newPitch > 75 then newPitch = 75 elseif newPitch < -75 then newPitch = -75 end
+            controller:SetControlRotation({ Pitch = newPitch, Yaw = normDeg(cur.Yaw + py), Roll = 0.0 })
+            if not aimPulling then
+                aimPulling = true
+                log("aim: pulling (dyaw=%.1f dpitch=%.1f)", dyaw, dpitch)
+            end
         end)
         if not ok then logErrorOnce("aimpull", tostring(err)) end
     end)
