@@ -144,10 +144,16 @@ local function distTo(a, b)
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
+-- returns "ok" (activated), "active" (block/parry already running - success),
+-- or false (rejected)
 local function tryActivateParry(asc)
     local blockAbility = asc:GetAbilityFromInputTag(BLOCK_TAG)
     if not blockAbility or not blockAbility:IsValid() then return false end
-    return asc:TryActivateAbilityByClass(blockAbility:GetClass(), true)
+    local isActive = false
+    pcall(function() isActive = blockAbility:IsActive() end)
+    if isActive then return "active" end
+    if asc:TryActivateAbilityByClass(blockAbility:GetClass(), true) then return "ok" end
+    return false
 end
 
 -- forcing ladder: plain activation -> cancel current swing montage + retry ->
@@ -164,7 +170,9 @@ local function doParry(className, delayMs, attempt)
             local asc = getASC(pawn)
             if not asc then return end
 
-            if tryActivateParry(asc) then
+            local r = tryActivateParry(asc)
+            if r == "active" then return end -- already blocking/parrying, nothing to force
+            if r == "ok" then
                 lastParry = now
                 lastParryInfo = string.format("%s @%dms", className:gsub("^GA_", ""):gsub("_C$", ""), delayMs)
                 log("parry vs %s (delay %dms)", className, delayMs)
@@ -173,7 +181,9 @@ local function doParry(className, delayMs, attempt)
 
             -- mid-swing: cancel the player's current montage and force it through
             pcall(function() asc:ServerCurrentMontageStop(0.15) end)
-            if tryActivateParry(asc) then
+            r = tryActivateParry(asc)
+            if r == "active" then return end
+            if r == "ok" then
                 lastParry = now
                 lastParryInfo = string.format("%s @%dms forced", className:gsub("^GA_", ""):gsub("_C$", ""), delayMs)
                 log("parry FORCED (cancelled swing) vs %s", className)
@@ -433,6 +443,11 @@ end
 LoopAsync(1000, function()
     writeState()
     return false
+end)
+
+-- auto-launch the external overlay with the game (single-instance guarded app-side)
+pcall(function()
+    os.execute('start "" /min "C:\\Users\\Abeelha\\Documents\\github\\wayfinder-mods\\tools\\overlay\\start-overlay.bat"')
 end)
 
 -- ---------------------------------------------------------------- hooks

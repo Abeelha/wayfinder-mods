@@ -16,6 +16,13 @@ try { Set-Content -Path $logPath -Value "" -Encoding utf8 } catch {}
 
 try {
 
+# single instance: the game mod auto-launches us on every boot
+$mutex = New-Object System.Threading.Mutex($false, "WFQoL-Overlay-SingleInstance")
+if (-not $mutex.WaitOne(0)) {
+    OLog "another instance already running - exiting"
+    exit 0
+}
+
 OLog "overlay starting (PS $($PSVersionTable.PSVersion))"
 OLog "state file: $StateFile (exists: $(Test-Path $StateFile))"
 
