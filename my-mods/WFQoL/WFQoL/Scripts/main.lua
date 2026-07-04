@@ -119,10 +119,14 @@ end)
 local LEAD = 0.25
 local DEFAULT_HIT = 0.6
 local PARRY_COOLDOWN = 0.3
-local PARRY_RANGE = 800.0
+local PARRY_RANGE = 800.0        -- schedule-time prefilter
+local CONNECT_RANGE = 450.0      -- fire-time: attack must actually reach us
+local FACING_DOT = 0.2           -- fire-time: enemy must be aimed at us
+local STAMINA_RESERVE = 0.35     -- keep this much stamina for dashing
 local lastParry = 0.0
 local lastScheduled = 0.0
 local lastParryInfo = "" -- for the external overlay
+local lastStaminaSkipLog = 0.0
 
 local function isMeleeAttack(ability)
     local hasAttack, hasMelee = false, false
@@ -144,6 +148,46 @@ local function distTo(a, b)
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
+-- stamina read via the HUD stamina meter widget (same trick ShowNameplates uses)
+local metersCache = nil
+local function staminaPct()
+    local ok, pct = pcall(function()
+        if not metersCache or not metersCache:IsValid() then
+            metersCache = nil
+            for _, m in pairs(FindAllOf("HUD_PlayerMeters_C") or {}) do
+                if m.PlayerShieldBar and m.PlayerShieldBar:IsValid() then
+                    metersCache = m
+                    break
+                end
+            end
+        end
+        if not metersCache then return nil end
+        return metersCache.HUD_PlayerStaminaMeters.PlayerStaminaMeter.Percent
+    end)
+    if ok then return pct end
+    return nil
+end
+
+-- fire-time check: is this attack actually going to land on us?
+local function willConnect(enemy, pawn)
+    local ok, res = pcall(function()
+        if not enemy or not enemy:IsValid() then return false end
+        local pe = enemy:K2_GetActorLocation()
+        local pp = pawn:K2_GetActorLocation()
+        local dx, dy, dz = pp.X - pe.X, pp.Y - pe.Y, pp.Z - pe.Z
+        local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if dist > CONNECT_RANGE then return false end
+        local fwd = enemy:GetActorForwardVector()
+        local len = math.sqrt(dx * dx + dy * dy)
+        if len > 1 then
+            local dot = (fwd.X * dx + fwd.Y * dy) / len
+            if dot < FACING_DOT then return false end
+        end
+        return true
+    end)
+    return ok and res
+end
+
 -- returns "ok" (activated), "active" (block/parry already running - success),
 -- or false (rejected)
 local function tryActivateParry(asc)
@@ -158,7 +202,7 @@ end
 
 -- forcing ladder: plain activation -> cancel current swing montage + retry ->
 -- two more delayed rounds -> give up loudly
-local function doParry(className, delayMs, attempt)
+local function doParry(className, delayMs, enemy, attempt)
     attempt = attempt or 1
     ExecuteInGameThread(function()
         local ok, err = pcall(function()
@@ -167,6 +211,20 @@ local function doParry(className, delayMs, attempt)
             if now - lastParry < PARRY_COOLDOWN then return end
             local pawn = getPawn()
             if not pawn then return end
+
+            -- only spend the parry if this attack is actually about to land on us
+            if not willConnect(enemy, pawn) then return end
+
+            -- keep a stamina reserve for dashing
+            local sp = staminaPct()
+            if sp and sp < STAMINA_RESERVE then
+                if now - lastStaminaSkipLog > 5 then
+                    lastStaminaSkipLog = now
+                    log("parry skipped: stamina %.0f%% below %.0f%% reserve", sp * 100, STAMINA_RESERVE * 100)
+                end
+                return
+            end
+
             local asc = getASC(pawn)
             if not asc then return end
 
@@ -191,7 +249,7 @@ local function doParry(className, delayMs, attempt)
             end
 
             if attempt < 3 then
-                ExecuteWithDelay(80, function() doParry(className, delayMs, attempt + 1) end)
+                ExecuteWithDelay(80, function() doParry(className, delayMs, enemy, attempt + 1) end)
             else
                 log("parry FAILED vs %s after %d attempts", className, attempt)
             end
@@ -224,9 +282,9 @@ local function onEnemyAbility(self)
         local delayMs = math.floor(math.max(hitTime - LEAD, 0) * 1000)
         lastScheduled = now
         if delayMs < 20 then
-            doParry(className, delayMs)
+            doParry(className, delayMs, enemy)
         else
-            ExecuteWithDelay(delayMs, function() doParry(className, delayMs) end)
+            ExecuteWithDelay(delayMs, function() doParry(className, delayMs, enemy) end)
         end
     end)
     if not ok then logErrorOnce("parry-schedule", err) end
@@ -326,29 +384,52 @@ LoopAsync(300, function()
             -- mount resolved BEFORE the moving gate: rider velocity is ~0 while
             -- mounted, so gating on pawn speed first killed the mount branch (v4 bug)
             local mount = getMount(pawn)
-            local moveSq = mount and math.max(velSq(mount), velSq(pawn)) or velSq(pawn)
 
-            local shouldSprint = state.sprint and not inCombat and moveSq >= MIN_SPEED_SQ
-            if not shouldSprint then
-                stopSprintAssist(pawn, asc)
-                return
-            end
-
-            -- mounted: boost the mount's own movement, nothing touches the rider
+            -- mounted: boost the mount's own movement, nothing touches the rider.
+            -- combat gate ignored (you can't fight mounted), hysteresis on the
+            -- moving gate (start >100u/s, stop <30u/s), and the boost is
+            -- RE-APPLIED every tick because the game periodically rewrites
+            -- the mount's MaxWalkSpeed (the v5 start/stop jitter)
             if mount and mount ~= pawn then
-                if tagInjected or speedBoosted then stopSprintAssist(pawn, asc) end
+                if tagInjected or speedBoosted then
+                    pcall(function() asc:RemoveGameplayTag(SPRINTING_TAG) end)
+                    tagInjected = false
+                    if origMaxWalk then pcall(function() pawn.CharacterMovement.MaxWalkSpeed = origMaxWalk end) end
+                    speedBoosted = false
+                end
+                if mountBoostRef and mountBoostRef ~= mount then stopMountBoost() end
+
+                local mv = velSq(mount)
+                local threshold = mountBoostRef and (30 * 30) or MIN_SPEED_SQ
+                if not state.sprint or mv < threshold then
+                    stopMountBoost()
+                    return
+                end
+
                 if not mountBoostRef then
                     local orig = maxWalk(mount)
                     if orig then
-                        pcall(function() mount.CharacterMovement.MaxWalkSpeed = orig * 1.4 end)
                         mountBoostRef = mount
                         mountBoostOrig = orig
+                        pcall(function() mount.CharacterMovement.MaxWalkSpeed = orig * 1.4 end)
                         log("sprint: mount speed %.0f -> %.0f", orig, orig * 1.4)
+                    end
+                else
+                    local cur = maxWalk(mount)
+                    local target = mountBoostOrig * 1.4
+                    if cur and cur < target - 1 then
+                        pcall(function() mount.CharacterMovement.MaxWalkSpeed = target end)
                     end
                 end
                 return
             end
             stopMountBoost() -- just dismounted
+
+            local shouldSprint = state.sprint and not inCombat and velSq(pawn) >= MIN_SPEED_SQ
+            if not shouldSprint then
+                stopSprintAssist(pawn, asc)
+                return
+            end
 
             if ascHasTag(asc, SPRINTING_TAG) and not tagInjected then
                 sprintTries = 0 -- real sprint is running
@@ -445,10 +526,8 @@ LoopAsync(1000, function()
     return false
 end)
 
--- auto-launch the external overlay with the game (single-instance guarded app-side)
-pcall(function()
-    os.execute('start "" /min "C:\\Users\\Abeelha\\Documents\\github\\wayfinder-mods\\tools\\overlay\\start-overlay.bat"')
-end)
+-- overlay is a resident tray app (login autostart via tools/overlay/install-autostart.ps1);
+-- it shows itself whenever the heartbeat in overlay-state.json is fresh
 
 -- ---------------------------------------------------------------- hooks
 local pending = {}

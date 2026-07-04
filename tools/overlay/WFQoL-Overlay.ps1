@@ -39,7 +39,7 @@ $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="WFQoL Overlay" WindowStyle="None" AllowsTransparency="True"
-        Background="Transparent" Topmost="True" ShowInTaskbar="True"
+        Background="Transparent" Topmost="True" ShowInTaskbar="False"
         Width="280" Height="230" MinWidth="180" MinHeight="150"
         ResizeMode="CanResizeWithGrip">
   <Border CornerRadius="14" Background="#DD0E1116" BorderBrush="#2FFFFFFF" BorderThickness="1" Padding="6">
@@ -132,13 +132,13 @@ function Set-Pill($prop, $on) {
 
 # ------------------------------------------------------------------ settings
 $cfgPath = Join-Path $env:APPDATA "wfqol-overlay.json"
-$script:locked = $false
+$script:locked = $true # click-through by default; Ctrl+Alt+O or tray menu unlocks
 if (Test-Path $cfgPath) {
     try {
         $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
         if ($cfg.left -ne $null) { $window.Left = $cfg.left; $window.Top = $cfg.top }
         if ($cfg.width) { $window.Width = $cfg.width; $window.Height = $cfg.height }
-        if ($cfg.locked) { $script:locked = $true }
+        if ($cfg.locked -ne $null) { $script:locked = [bool]$cfg.locked }
     } catch { OLog "config load failed: $_" }
 } else {
     $window.Left = 40; $window.Top = 200
@@ -228,14 +228,39 @@ $timer.Add_Tick({
             if ($script:pollCount -eq 1) { OLog "first state read OK (age ${age}s, stale=$stale)" }
         } catch { $stale = $true; OLog "state read error: $_" }
     }
-    $offlineText.Visibility = if ($stale) { "Visible" } else { "Collapsed" }
-    $window.Opacity = if ($stale) { 0.55 } else { 1.0 }
+    # resident behavior: card only exists on screen while the game heartbeat is fresh
+    if ($stale) {
+        if ($window.IsVisible) { $window.Hide(); OLog "game heartbeat stale - hiding" }
+    } else {
+        if (-not $window.IsVisible) { $window.Show(); OLog "game heartbeat fresh - showing" }
+    }
 })
 $timer.Start()
 
-$window.Add_Closed({ Save-Config; OLog "closed" })
-OLog "showing window"
-[void]$window.ShowDialog()
+# ------------------------------------------------------------------ tray icon
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+$tray = New-Object System.Windows.Forms.NotifyIcon
+$tray.Icon = [System.Drawing.SystemIcons]::Application
+$tray.Text = "WFQoL Overlay"
+$tray.Visible = $true
+$menu = New-Object System.Windows.Forms.ContextMenuStrip
+[void]$menu.Items.Add("Lock / Unlock  (Ctrl+Alt+O)").add_Click({ $script:locked = -not $script:locked; Apply-Lock })
+[void]$menu.Items.Add("Reset position").add_Click({ $window.Left = 40; $window.Top = 200; Save-Config })
+[void]$menu.Items.Add("Exit overlay").add_Click({ $window.Close() })
+$tray.ContextMenuStrip = $menu
+$tray.add_DoubleClick({ $script:locked = -not $script:locked; Apply-Lock })
+
+$window.Add_Closed({
+    Save-Config
+    $tray.Visible = $false
+    $tray.Dispose()
+    OLog "closed"
+    [Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown()
+})
+
+OLog "showing window (locked=$($script:locked)); entering message loop"
+$window.Show()
+[Windows.Threading.Dispatcher]::Run()
 
 } catch {
     OLog "FATAL: $_"
