@@ -25,7 +25,11 @@ local function resolveHUD()
     if hudMeters and hudMeters:IsValid() then return true end
     hudMeters = nil
     for _, entry in pairs(FindAllOf("HUD_PlayerMeters_C") or {}) do
-        local ok, valid = pcall(function() return entry.PlayerShieldBar and entry.PlayerShieldBar:IsValid() end)
+        -- skip the class default object (CDO); it has no real bars
+        local ok, valid = pcall(function()
+            if entry:GetFName():ToString():sub(1, 9) == "Default__" then return false end
+            return entry.PlayerShieldBar and entry.PlayerShieldBar:IsValid()
+        end)
         if ok and valid then hudMeters = entry break end
     end
     return hudMeters ~= nil and hudMeters:IsValid()

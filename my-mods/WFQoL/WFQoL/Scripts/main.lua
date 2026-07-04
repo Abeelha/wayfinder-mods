@@ -18,6 +18,16 @@ local state = {
 
 local function log(fmt, ...) print(string.format("[WFQoL] " .. fmt .. "\n", ...)) end
 
+-- FindAllOf returns the class DEFAULT OBJECT (CDO, "Default__...") alongside real
+-- instances. the CDO passes :IsValid() but has no world/components, so native
+-- calls that treat it as a live actor (K2_GetActorLocation, GetASC, ...) read
+-- garbage or crash (pcall can't catch native AVs). skip it.
+local function isReal(obj)
+    if not (obj and obj:IsValid()) then return false end
+    local ok, nm = pcall(function() return obj:GetFName():ToString() end)
+    return not (ok and nm and nm:sub(1, 9) == "Default__")
+end
+
 local seenErrors = {}
 local function logErrorOnce(tag, err)
     local msg = tag .. ": " .. tostring(err)
@@ -60,7 +70,7 @@ local function getPawn()
     pawnRef = nil
     pcall(function()
         for _, p in pairs(FindAllOf(CHAR_CLASS_ONLY) or {}) do
-            if p:IsValid() then pawnRef = p break end
+            if isReal(p) then pawnRef = p break end
         end
     end)
     return pawnRef
@@ -114,7 +124,7 @@ local function reloadInProgress()
 end
 
 LoopAsync(70, function()
-    if not (state.chain and m1Held and ready) then return false end
+    if not (state.chain and m1Held and ready) or settling() then return false end
     if reloadInProgress() then return false end
     ExecuteInGameThread(function()
         if not pawnRef or not pawnRef:IsValid() then return end
@@ -216,7 +226,7 @@ local function staminaPct()
         if not metersCache or not metersCache:IsValid() then
             metersCache = nil
             for _, m in pairs(FindAllOf("HUD_PlayerMeters_C") or {}) do
-                if m.PlayerShieldBar and m.PlayerShieldBar:IsValid() then
+                if isReal(m) and m.PlayerShieldBar and m.PlayerShieldBar:IsValid() then
                     metersCache = m
                     break
                 end
@@ -618,7 +628,7 @@ local function forceWindowOpen(ab)
     -- whichever operand the check reads, cover it: widen the attribute window too
     pcall(function()
         for _, s in pairs(FindAllOf("WFRangedWeaponAttributeSet") or {}) do
-            if s:IsValid() then
+            if isReal(s) then
                 pcall(function()
                     s.ActiveReloadBounds.CurrentValue = 200.0
                     s.ActiveReloadBounds.BaseValue = 200.0
