@@ -216,7 +216,17 @@ local function preloadAbilityGraph(ability)
     local ok, key = pcall(function() return ability:GetClass():GetFName():ToString() end)
     if not ok or not key or abilityGraphPreloaded[key] then return end
     abilityGraphPreloaded[key] = true
-    log("parry: block ability = %s (add its cost GE to PRELOAD if it crashes)", key)
+    -- log the exact ability CLASS path + its cost-GE path (safe reads: class refs
+    -- persist, all pcall'd + IsValid'd, one-shot per weapon, NO LoadAsset) so the
+    -- precise paths can be added to the static PRELOAD list.
+    local classPath = "?"
+    pcall(function() classPath = ability:GetClass():GetFullName() end)
+    local costGE = "none"
+    pcall(function()
+        local ge = ability.CostGameplayEffectClass
+        if ge and ge:IsValid() then costGE = ge:GetFullName() end
+    end)
+    log("parry: block ability=%s | class=%s | costGE=%s", key, classPath, costGE)
 end
 
 -- stamina read via the HUD stamina meter widget (same trick ShowNameplates uses)
@@ -484,12 +494,12 @@ LoopAsync(300, function()
             if inCombat ~= lastCombat then
                 lastCombat = inCombat
                 log("combat: %s", tostring(inCombat))
-                -- preload the equipped weapon's parry graph at combat start (game
-                -- thread, well before the first parry) so activation never
-                -- off-thread async-loads a cost GE = AssembleReferenceTokenStream
-                if inCombat and state.parry then
-                    pcall(function() preloadAbilityGraph(asc:GetAbilityFromInputTag(BLOCK_TAG)) end)
-                end
+            end
+            -- name the equipped weapon's block ability + cost GE once per class
+            -- (deduped). runs every tick so equipping a weapon logs it immediately,
+            -- no combat needed - diagnostic to fill the static PRELOAD precisely.
+            if state.parry then
+                pcall(function() preloadAbilityGraph(asc:GetAbilityFromInputTag(BLOCK_TAG)) end)
             end
 
             -- mount resolved BEFORE the moving gate: rider velocity is ~0 while
