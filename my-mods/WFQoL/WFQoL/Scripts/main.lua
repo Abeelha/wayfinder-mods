@@ -384,17 +384,24 @@ LoopAsync(300, function()
             -- mount resolved BEFORE the moving gate: rider velocity is ~0 while
             -- mounted, so gating on pawn speed first killed the mount branch (v4 bug)
             local mount = getMount(pawn)
+            -- some mount systems swap possession: the PAWN becomes the mount
+            if not mount then
+                local okc, cn = pcall(function() return pawn:GetClass():GetFName():ToString() end)
+                if okc and cn and cn:find("Mount") then mount = pawn end
+            end
 
             -- mounted: boost the mount's own movement, nothing touches the rider.
             -- combat gate ignored (you can't fight mounted), hysteresis on the
             -- moving gate (start >100u/s, stop <30u/s), and the boost is
             -- RE-APPLIED every tick because the game periodically rewrites
             -- the mount's MaxWalkSpeed (the v5 start/stop jitter)
-            if mount and mount ~= pawn then
+            if mount then
                 if tagInjected or speedBoosted then
                     pcall(function() asc:RemoveGameplayTag(SPRINTING_TAG) end)
                     tagInjected = false
-                    if origMaxWalk then pcall(function() pawn.CharacterMovement.MaxWalkSpeed = origMaxWalk end) end
+                    if speedBoosted and origMaxWalk then
+                        pcall(function() pawn.CharacterMovement.MaxWalkSpeed = origMaxWalk end)
+                    end
                     speedBoosted = false
                 end
                 if mountBoostRef and mountBoostRef ~= mount then stopMountBoost() end
@@ -483,21 +490,49 @@ LoopAsync(300, function()
 end)
 
 -- ---------------------------------------------------------------- AutoReload
--- force the active-reload minigame checks to always pass, and auto-press the
--- second reload input shortly after the reload starts
+-- poll the ability's own CheckInWindow(InputTime) every 40ms during the reload
+-- and press exactly when the slider enters the white (perfect) zone.
+local reloadPolling = false
+
 local function onReloadActivated(self)
-    if not state.reload then return end
-    ExecuteWithDelay(300, function()
+    if not state.reload or reloadPolling then return end
+    local ab = self:get()
+    local t0 = os.clock()
+    reloadPolling = true
+    local ticks = 0
+    local done = false
+
+    LoopAsync(40, function()
+        ticks = ticks + 1
+        if done or ticks > 150 then -- 6s safety cap
+            reloadPolling = false
+            return true
+        end
         ExecuteInGameThread(function()
             local ok, err = pcall(function()
-                if not state.reload then return end
-                if not pawnRef or not pawnRef:IsValid() then return end
-                injecting = true
-                pawnRef:InpActEvt_Reload_K2Node_InputActionEvent_12(RKEY)
-                injecting = false
+                if done then return end
+                if not state.reload or not ab:IsValid() or not ab:IsActive() then
+                    done = true
+                    return
+                end
+                local elapsed = os.clock() - t0
+                local inWindow = ab:CheckInWindow(elapsed)
+                if inWindow then
+                    if pawnRef and pawnRef:IsValid() then
+                        injecting = true
+                        pawnRef:InpActEvt_Reload_K2Node_InputActionEvent_12(RKEY)
+                        injecting = false
+                        log("reload: perfect press at %.2fs", elapsed)
+                    end
+                    done = true
+                end
             end)
-            if not ok then logErrorOnce("reload", err) end
+            if not ok then
+                logErrorOnce("reload", err)
+                done = true
+            end
         end)
+        return false
     end)
 end
 
@@ -556,13 +591,6 @@ local function registerAll()
     end)
     tryHook(AIBASE .. ":K2_ActivateAbility", onEnemyAbility)
     tryHook(RELOAD_GA .. ":K2_ActivateAbility", onReloadActivated)
-    -- any press timing counts as perfect while reload feature is on
-    tryHook(RELOAD_GA .. ":CheckInWindow", function()
-        if state.reload then return true end
-    end)
-    tryHook(RELOAD_GA .. ":CheckInForgivenessWindow", function()
-        if state.reload then return true end
-    end)
 end
 
 registerAll()
@@ -579,6 +607,7 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, New
         pawnRef = p
         ready = true
         m1Held = false
+        pcall(function() log("pawn: %s", p:GetClass():GetFName():ToString()) end)
     end
     libCache = nil
     sprintClassCache = nil

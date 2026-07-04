@@ -45,7 +45,7 @@ $xaml = @'
   <Border CornerRadius="14" Background="#DD0E1116" BorderBrush="#2FFFFFFF" BorderThickness="1" Padding="6">
     <Viewbox Stretch="Uniform">
       <StackPanel Width="260" Margin="8">
-        <DockPanel Margin="0,0,0,8">
+        <DockPanel x:Name="Header" Margin="0,0,0,8" Background="#01000000">
           <Ellipse x:Name="CombatDot" Width="10" Height="10" Fill="#71F58A" VerticalAlignment="Center"/>
           <TextBlock Text="  WFQoL" FontFamily="Consolas" FontSize="16" FontWeight="Bold" Foreground="#7CFFD4" VerticalAlignment="Center"/>
           <TextBlock x:Name="OfflineText" Text="  offline" FontFamily="Consolas" FontSize="11" Foreground="#8A8A93" VerticalAlignment="Center" Visibility="Collapsed"/>
@@ -58,7 +58,6 @@ $xaml = @'
         </DockPanel>
         <StackPanel x:Name="Rows"/>
         <TextBlock x:Name="ParryText" Text="" FontFamily="Consolas" FontSize="10" Foreground="#6E6E78" Margin="2,8,0,0" TextTrimming="CharacterEllipsis"/>
-        <TextBlock x:Name="HintText" Text="Ctrl+Alt+O unlock" FontFamily="Consolas" FontSize="9" Foreground="#44FFFFFF" Margin="2,2,0,0"/>
       </StackPanel>
     </Viewbox>
   </Border>
@@ -66,6 +65,23 @@ $xaml = @'
 '@
 
 $window = [Windows.Markup.XamlReader]::Parse($xaml)
+
+# lock chip: a tiny second window that is NEVER click-through, so lock/unlock is
+# always one click away even while the card ignores the mouse
+$chipXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        Title="WFQoL Lock" WindowStyle="None" AllowsTransparency="True"
+        Background="Transparent" Topmost="True" ShowInTaskbar="False"
+        Width="64" Height="24" ResizeMode="NoResize" Visibility="Hidden">
+  <Border CornerRadius="12" Background="#DD1A2027" BorderBrush="#2FFFFFFF" BorderThickness="1" Cursor="Hand">
+    <TextBlock Name="ChipText" Text="UNLOCK" FontFamily="Consolas" FontSize="10" FontWeight="Bold"
+               Foreground="#F5C871" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+  </Border>
+</Window>
+'@
+$lockChip = [Windows.Markup.XamlReader]::Parse($chipXaml)
+$lockChipText = $lockChip.FindName("ChipText")
+
 $rows = $window.FindName("Rows")
 $combatDot = $window.FindName("CombatDot")
 $offlineText = $window.FindName("OfflineText")
@@ -165,6 +181,11 @@ function Save-Config {
 $WS_EX_TRANSPARENT = 0x20
 $GWL_EXSTYLE = -20
 
+function Move-Chip {
+    $lockChip.Left = $window.Left + $window.ActualWidth + 6
+    $lockChip.Top = $window.Top
+}
+
 function Apply-Lock {
     $hwnd = (New-Object Windows.Interop.WindowInteropHelper($window)).Handle
     $style = [Win32.Native]::GetWindowLong($hwnd, $GWL_EXSTYLE)
@@ -172,37 +193,32 @@ function Apply-Lock {
         [void][Win32.Native]::SetWindowLong($hwnd, $GWL_EXSTYLE, $style -bor $WS_EX_TRANSPARENT)
         $window.ResizeMode = "NoResize"
         $lockBtn.Content = "LOCKED"
+        $lockChipText.Text = "UNLOCK"
+        $lockChipText.Foreground = "#F5C871"
     } else {
         [void][Win32.Native]::SetWindowLong($hwnd, $GWL_EXSTYLE, $style -band (-bnot $WS_EX_TRANSPARENT))
         $window.ResizeMode = "CanResizeWithGrip"
         $lockBtn.Content = "LOCK"
+        $lockChipText.Text = "LOCK"
+        $lockChipText.Foreground = "#71F58A"
     }
     Save-Config
 }
 
 $lockBtn.Add_Click({ $script:locked = $true; Apply-Lock })
 $closeBtn.Add_Click({ $window.Close() })
-$window.Add_MouseLeftButtonDown({ if (-not $script:locked) { try { $window.DragMove(); Save-Config } catch {} } })
+$lockChip.Add_MouseLeftButtonDown({ $script:locked = -not $script:locked; Apply-Lock })
+
+# drag by the header row only (when unlocked); resize via bottom-right grip
+$header = $window.FindName("Header")
+$header.Add_MouseLeftButtonDown({
+    if (-not $script:locked) { try { $window.DragMove(); Save-Config; Move-Chip } catch {} }
+})
 
 $window.Add_SourceInitialized({
-    try {
-        $hwnd = (New-Object Windows.Interop.WindowInteropHelper($window)).Handle
-        [void][Win32.Native]::RegisterHotKey($hwnd, 9001, 0x3, 0x4F) # Ctrl+Alt+O
-        $src = [Windows.Interop.HwndSource]::FromHwnd($hwnd)
-        $src.AddHook({
-            param($h, $msg, $w, $l, [ref]$handled)
-            if ($msg -eq 0x0312 -and $w.ToInt32() -eq 9001) {
-                $script:locked = -not $script:locked
-                Apply-Lock
-                $handled.Value = $true
-            }
-            return [IntPtr]::Zero
-        })
-        Apply-Lock
-        OLog "hotkey + lock initialized"
-    } catch { OLog "SourceInitialized error: $_" }
+    try { Apply-Lock; OLog "lock initialized" } catch { OLog "SourceInitialized error: $_" }
 })
-$window.Add_Loaded({ try { $window.Activate() } catch {} })
+$window.Add_Loaded({ try { $window.Activate(); Move-Chip } catch {} })
 
 # ------------------------------------------------------------------ state poll
 $script:pollCount = 0
@@ -230,9 +246,10 @@ $timer.Add_Tick({
     }
     # resident behavior: card only exists on screen while the game heartbeat is fresh
     if ($stale) {
-        if ($window.IsVisible) { $window.Hide(); OLog "game heartbeat stale - hiding" }
+        if ($window.IsVisible) { $window.Hide(); $lockChip.Hide(); OLog "game heartbeat stale - hiding" }
     } else {
-        if (-not $window.IsVisible) { $window.Show(); OLog "game heartbeat fresh - showing" }
+        if (-not $window.IsVisible) { $window.Show(); $lockChip.Show(); OLog "game heartbeat fresh - showing" }
+        Move-Chip # cheap follow: keeps the chip glued through drags and resizes
     }
 })
 $timer.Start()
@@ -244,8 +261,8 @@ $tray.Icon = [System.Drawing.SystemIcons]::Application
 $tray.Text = "WFQoL Overlay"
 $tray.Visible = $true
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
-[void]$menu.Items.Add("Lock / Unlock  (Ctrl+Alt+O)").add_Click({ $script:locked = -not $script:locked; Apply-Lock })
-[void]$menu.Items.Add("Reset position").add_Click({ $window.Left = 40; $window.Top = 200; Save-Config })
+[void]$menu.Items.Add("Lock / Unlock").add_Click({ $script:locked = -not $script:locked; Apply-Lock })
+[void]$menu.Items.Add("Reset position").add_Click({ $window.Left = 40; $window.Top = 200; Move-Chip; Save-Config })
 [void]$menu.Items.Add("Exit overlay").add_Click({ $window.Close() })
 $tray.ContextMenuStrip = $menu
 $tray.add_DoubleClick({ $script:locked = -not $script:locked; Apply-Lock })
@@ -260,7 +277,9 @@ $window.Add_Closed({
 
 OLog "showing window (locked=$($script:locked)); entering message loop"
 $window.Show()
+OLog "Show() returned; starting dispatcher"
 [Windows.Threading.Dispatcher]::Run()
+OLog "dispatcher exited"
 
 } catch {
     OLog "FATAL: $_"
