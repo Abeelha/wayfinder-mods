@@ -37,3 +37,7 @@ Per-repo memory. Append-only, concise. Format: `### YYYY-MM-DD - Category - entr
 - Mount facts: player pawn STAYS the pawn while mounted (`WFCharacter.m_pMountComponent`, `IsMounted()`); sprint is the same GA_Player_Sprint (mount speed via GE_Mount_SprintSpeed passed to PlayerToggleMount). Rider velocity ~0 while mounted -> read `GetAttachParentActor():GetVelocity()`.
 - Sprint status tag: `Character.State.Generic.Sprinting` (granted by GE_Status_Sprint; blocked by Character.State.Disable.Sprint / Exhausted / InAir).
 - Re-run timing extractor after game updates (dump refresh) to regenerate timings.lua.
+
+### 2026-07-04 - Gotcha - boot crash: no FindAllOf/ExecuteInGameThread before player spawn
+- v2 AutoSprint crashed game AT LAUNCH (AV right after "Event loop start"): its LoopAsync ran FindAllOf("WFPlayerCharacter_Base_C") + ExecuteInGameThread at the MAIN MENU while the BP class was not loaded yet.
+- RULE for this game: mods with periodic loops gate ALL engine access behind a `ready` flag set by the `PlayerController:ClientRestart` hook (plus boot-time `StaticFindObject(class):IsValid()` check to survive "Restart All Mods" mid-map - that pattern is safe, ShowNameplates uses it). Commit 9ab5d15.
