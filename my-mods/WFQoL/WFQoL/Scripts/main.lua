@@ -3,7 +3,6 @@
 --   F8  AutoParry  - timed parry/block just before enemy melee hits land
 --   F6  AutoSprint - sprint while moving out of combat (foot + mount)
 --   F9  AutoReload - reload minigame always lands the perfect window
---   F4  AutoLoot   - vacuum nearby loot/resource pickups to the player
 --   INS overlay on/off
 --
 -- Safety rule (learned the hard way): no FindAllOf/ExecuteInGameThread engine
@@ -14,7 +13,6 @@ local state = {
     parry = true,
     sprint = true,
     reload = true,
-    loot = true,
     overlay = true,
 }
 
@@ -720,59 +718,6 @@ local function onReloadEnded(self)
     if not ok then logErrorOnce("reload-end", "handler failed") end
 end
 
--- ---------------------------------------------------------------- AutoLoot
--- vacuum: every AWFPickup within range is teleported onto the player so the
--- game's own overlap collection fires. covers drops the game wouldn't pull in
--- yet (out of its vacuum range) and pickups flagged interaction-only. AWFPickup
--- is the C++ base; FindAllOf returns its blueprint subclass instances too.
-local LOOT_RANGE = 3000.0
-local lootSeen = {}          -- class names logged once (know what we pull)
-local lastLootLog = 0.0
-
-local function lootVacuum()
-    local pawn = getPawn()
-    if not pawn then return end
-    local pp = pawn:K2_GetActorLocation()
-    local pulled = 0
-    for _, pk in pairs(FindAllOf("WFPickup") or {}) do
-        if pk:IsValid() then
-            pcall(function()
-                local loc = pk:K2_GetActorLocation()
-                local dx, dy, dz = loc.X - pp.X, loc.Y - pp.Y, loc.Z - pp.Z
-                local d = math.sqrt(dx * dx + dy * dy + dz * dz)
-                if d > 5 and d < LOOT_RANGE then
-                    -- log each distinct pickup class once so we learn the set
-                    local cn = pk:GetClass():GetFName():ToString()
-                    if not lootSeen[cn] then
-                        lootSeen[cn] = true
-                        log("loot: pulling class %s", cn)
-                    end
-                    pcall(function() pk.bRequireInteractionToCollect = false end)
-                    pcall(function() pk.bCanBePickedUp = true end)
-                    pk:K2_SetActorLocation(pp, false, {}, true)
-                    pulled = pulled + 1
-                end
-            end)
-        end
-    end
-    if pulled > 0 then
-        local now = os.clock()
-        if now - lastLootLog > 3 then
-            lastLootLog = now
-            log("loot: vacuumed %d pickup(s)", pulled)
-        end
-    end
-end
-
-LoopAsync(400, function()
-    if not (ready and state.loot) then return false end
-    ExecuteInGameThread(function()
-        local ok, err = pcall(lootVacuum)
-        if not ok then logErrorOnce("loot", tostring(err)) end
-    end)
-    return false
-end)
-
 -- ---------------------------------------------------------------- overlay state file
 -- consumed by the external overlay app (tools/overlay/WFQoL-Overlay.ps1).
 -- pure Lua io: safe to run any time, no engine access.
@@ -784,9 +729,9 @@ local function writeState()
         local f = io.open(STATE_FILE, "w") or io.open(STATE_FILE_ABS, "w")
         if not f then error("cannot open " .. STATE_FILE) end
         f:write(string.format(
-            '{"chain":%s,"parry":%s,"sprint":%s,"reload":%s,"loot":%s,"sprintMode":"%s","combat":%s,"lastParry":"%s","ts":%d}',
+            '{"chain":%s,"parry":%s,"sprint":%s,"reload":%s,"sprintMode":"%s","combat":%s,"lastParry":"%s","ts":%d}',
             tostring(state.chain), tostring(state.parry), tostring(state.sprint),
-            tostring(state.reload), tostring(state.loot), sprintMode,
+            tostring(state.reload), sprintMode,
             tostring(lastCombat == true), lastParryInfo, os.time()))
         f:close()
     end)
@@ -929,7 +874,6 @@ bindToggle(Key.F6, "sprint", "AutoSprint")
 bindToggle(Key.F7, "chain", "AutoChain")
 bindToggle(Key.F8, "parry", "AutoParry")
 bindToggle(Key.F9, "reload", "AutoReload")
-bindToggle(Key.F4, "loot", "AutoLoot")
 
 -- F5: one-shot diagnostic dump (mount debugging etc)
 RegisterKeyBind(Key.F5, function()
@@ -959,4 +903,4 @@ RegisterKeyBind(Key.F5, function()
     end)
 end)
 
-log("loaded - F4 loot / F6 sprint / F7 chain / F8 parry / F9 reload / overlay via tools/overlay")
+log("loaded - F6 sprint / F7 chain / F8 parry / F9 reload / overlay via tools/overlay")
