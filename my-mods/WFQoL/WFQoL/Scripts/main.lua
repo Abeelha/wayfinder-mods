@@ -597,8 +597,10 @@ local function readWindow(ab)
         center = wcenter
     end
     if not center then return nil end
-    local scale = (wmax and wmax > 1.001) and 1.0 or maxT
-    return center * scale, wmin or -1, wmax or -1, maxT
+    -- values seen in the wild: 0-100 percent of the slider (session 12 log:
+    -- "window 40-60 max 1.5s"), possibly 0-1 normalized on other weapons
+    if center > 1.001 then center = center / 100 end
+    return center * maxT, wmin or -1, wmax or -1, maxT
 end
 
 local windowUnreadable = false
@@ -693,13 +695,16 @@ local function onReloadSucceeded(self)
 end
 
 -- ---------------------------------------------------------------- AimAssist
--- soft lock / aim magnetism / camera assist only run when the game believes a
--- gamepad is driving. two native queries decide that (WFPlayerCharacter:
--- IsUsingGamepad and WFGameplayBlueprintLibrary:GetPlayerInputSource); both
--- are hooked to lie while state.aim is on. bCameraAssistOnGamepad is the
--- settings-menu master switch for the assist itself (defaults false even on
--- real controllers) so it gets flipped on at spawn.
-local aimCalls = { gamepad = 0, source = 0 } -- proof the hooks are live (F5 diag)
+-- the game's own magnetizer only runs for gamepad input and the input-source
+-- checks are pure C++ (zero blueprint callers of IsUsingGamepad /
+-- GetPlayerInputSource in the whole dump - UFunction hooks never fire). so:
+-- run our OWN soft-lock loop. while aiming, ask the pawn's TargetingComponent
+-- for the best soft-lock target and write it into m_MagnetizedAimTarget - the
+-- same slot the native gamepad path fills. gamepad-spoof hooks kept only as
+-- diag counters; bCameraAssistOnGamepad still flipped on at spawn.
+local aimCalls = { gamepad = 0, source = 0 } -- proof whether the hooks fire (F5 diag)
+local aimWeights = { Radius = 3000.0, Yaw = 40.0, bCanTargetFriendly = false, bIgnoreHardLockedTarget = false }
+local aimMagnetized = false
 local aimSettingsDone = false
 local function applyAimSettings()
     if aimSettingsDone then return end
@@ -715,6 +720,49 @@ local function applyAimSettings()
         end
     end)
 end
+
+LoopAsync(150, function()
+    if not ready then return false end
+    ExecuteInGameThread(function()
+        local ok, err = pcall(function()
+            local pawn = getPawn()
+            if not pawn then return end
+            local tc = pawn.TargetingComponent
+            if not tc or not tc:IsValid() then return end
+
+            local aiming = false
+            if state.aim then
+                pcall(function() aiming = pawn:IsAiming() end)
+                if not aiming then pcall(function() aiming = pawn:IsFreeFireAiming() end) end
+            end
+            if not aiming then
+                if aimMagnetized then
+                    pcall(function() tc:ClearMagnetizedAimTarget() end)
+                    aimMagnetized = false
+                end
+                return
+            end
+
+            -- bIsResultTransient=false stores results on the component; reading
+            -- the stored property avoids UE4SS struct-return marshaling
+            tc:FindSoftLockTarget(aimWeights, false, true)
+            local best = nil
+            pcall(function()
+                local targets = tc.m_CurrentSoftLockTargetResults.AssociatedTargets
+                if targets and #targets > 0 then best = targets[1] end
+            end)
+            if best and best:IsValid() then
+                tc.m_MagnetizedAimTarget = best
+                if not aimMagnetized then
+                    aimMagnetized = true
+                    pcall(function() log("aim: magnetized %s", best:GetClass():GetFName():ToString()) end)
+                end
+            end
+        end)
+        if not ok then logErrorOnce("aim", tostring(err)) end
+    end)
+    return false
+end)
 
 -- ---------------------------------------------------------------- overlay state file
 -- consumed by the external overlay app (tools/overlay/WFQoL-Overlay.ps1).
@@ -856,6 +904,14 @@ RegisterKeyBind(Key.F5, function()
             local asc = getASC(pawn)
             local combat = asc and ascHasTag(asc, INCOMBAT_TAG) or false
             local sprinting = asc and ascHasTag(asc, SPRINTING_TAG) or false
+            local magnet, magnetizing = "-", "?"
+            pcall(function()
+                local t = pawn.TargetingComponent:GetMagnetizedAimTarget()
+                if t and t:IsValid() then magnet = t:GetClass():GetFName():ToString() end
+            end)
+            pcall(function() magnetizing = tostring(pawn:IsMagnetizingAim()) end)
+            log("diag: magnet=%s magnetizing=%s aiming=%s", magnet, magnetizing,
+                tostring((function() local a = false pcall(function() a = pawn:IsAiming() end) return a end)()))
             log("diag: pawn=%s vel=%.0f mountedNative=%s parent=%s parentVel=%.0f walk=%s parentWalk=%s mode=%s combat=%s sprintTag=%s aimCalls=g%d/s%d",
                 cls, math.sqrt(velSq(pawn)),
                 okm and tostring(mountedNative) or "CALL-FAILED",
