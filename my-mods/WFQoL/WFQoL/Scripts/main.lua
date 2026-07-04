@@ -32,6 +32,7 @@ local CHAR = "/Game/Blueprints/Main/WFPlayerCharacter_Base.WFPlayerCharacter_Bas
 local CHAR_CLASS_ONLY = "WFPlayerCharacter_Base_C"
 local AIBASE = "/Game/Blueprints/Abilities/AIGeneric/GA_AI_Base.GA_AI_Base_C"
 local RELOAD_GA = "/Game/Blueprints/Player/GAS/GameplayAbilities/RangedWeapon/GA_Player_RangedWeapon_ActiveReload.GA_Player_RangedWeapon_ActiveReload_C"
+local RELOAD_OK_GA = "/Game/Blueprints/Player/GAS/GameplayAbilities/RangedWeapon/GA_Player_RangedWeapon_ActiveReloadSucceeded.GA_Player_RangedWeapon_ActiveReloadSucceeded_C"
 local SPRINT_CLASS = "/Game/Blueprints/Player/GAS/GameplayAbilities/GA_Player_Sprint.GA_Player_Sprint_C"
 local WFLIB = "/Script/Wayfinder.Default__WFAbilitySystemBlueprintLibrary"
 local KISMET = "/Script/Engine.Default__KismetSystemLibrary"
@@ -146,6 +147,30 @@ local function distTo(a, b)
     local pb = b:K2_GetActorLocation()
     local dx, dy, dz = pa.X - pb.X, pa.Y - pb.Y, pa.Z - pb.Z
     return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+-- the parry abilities reference their stamina-cost effects via SOFT class refs;
+-- lazy-loading those mid-combat can land on a non-game thread = fatal crash
+-- ("AssembleReferenceTokenStream ... called on a non-game thread"). preload them
+-- from a guaranteed game-thread context instead.
+local PRELOAD = {
+    "/Game/Blueprints/Player/GAS/GameplayAbilities/2H/GameplayEffects/GE_2H_Parry_Cooldown",
+    "/Game/Blueprints/Player/GAS/GameplayAbilities/2H/GameplayEffects/GE_2H_Parry_DamageReduction",
+    "/Game/Blueprints/Player/GAS/GameplayAbilities/DW/GameplayEffects/GE_Player_DW_ConsumeStamina_Parry",
+    "/Game/Blueprints/Player/GAS/GameplayAbilities/DW/GameplayEffects/GE_Player_DW_ConsumeStamina_Parry_Survivalist",
+    "/Game/Blueprints/Player/GAS/GameplayAbilities/DW/GA_Player_DW_Parry_Pushback",
+    "/Game/Blueprints/Player/GAS/GameplayAbilities/DW/TA_Player_DW_Parry_Pushback",
+    "/Game/Blueprints/Player/GAS/GameplayAbilities/SnS/GE_Player_SNS_ConsumeStamina_Parry",
+    "/Game/Blueprints/Player/GAS/GameplayAbilities/SnS/GE_Player_SNS_ConsumeStamina_Parry_Survivalist",
+}
+local preloaded = false
+local function preloadParryAssets()
+    if preloaded then return end
+    preloaded = true
+    for _, path in ipairs(PRELOAD) do
+        pcall(function() LoadAsset(path) end)
+    end
+    log("parry cost assets preloaded")
 end
 
 -- stamina read via the HUD stamina meter widget (same trick ShowNameplates uses)
@@ -326,18 +351,27 @@ local function maxWalk(actor)
 end
 
 -- mount speed assist tracked separately: boost lives on the MOUNT actor, never
--- inject the sprint tag on the rider while mounted (anim/dismount jank)
+-- inject the sprint tag on the rider while mounted (anim/dismount jank).
+-- baselines keyed by actor ADDRESS: RemoteObject wrappers don't compare with ~=
+-- (the v8 clunk: identity misfires re-captured mid-gallop speeds as baselines)
+local mountBaselines = {}
 local mountBoostRef = nil
-local mountBoostOrig = nil
+local mountBoostAddr = nil
+
+local function addrOf(obj)
+    local ok, a = pcall(function() return obj:GetAddress() end)
+    return ok and a or nil
+end
 
 local function stopMountBoost()
     if mountBoostRef then
-        local ref, orig = mountBoostRef, mountBoostOrig
+        local ref = mountBoostRef
+        local base = mountBoostAddr and mountBaselines[mountBoostAddr]
         pcall(function()
-            if ref:IsValid() and orig then ref.CharacterMovement.MaxWalkSpeed = orig end
+            if ref:IsValid() and base then ref.CharacterMovement.MaxWalkSpeed = base end
         end)
         mountBoostRef = nil
-        mountBoostOrig = nil
+        mountBoostAddr = nil
     end
 end
 
@@ -404,33 +438,32 @@ LoopAsync(300, function()
                     end
                     speedBoosted = false
                 end
-                if mountBoostRef and mountBoostRef ~= mount then stopMountBoost() end
+                local addr = addrOf(mount)
+                if mountBoostAddr and mountBoostAddr ~= addr then stopMountBoost() end
 
                 if not state.sprint then
                     stopMountBoost()
                     return
                 end
 
-                -- persistent while mounted: baseline captured ONCE per mount (the
-                -- v7 clunk was re-capturing mid-gallop speeds as new baselines and
-                -- compounding). MaxWalkSpeed is a cap - holding it high while
-                -- standing is harmless, so no velocity gating at all here.
-                if not mountBoostRef then
-                    local orig = maxWalk(mount)
-                    if orig then
-                        mountBoostRef = mount
-                        mountBoostOrig = orig
-                        pcall(function() mount.CharacterMovement.MaxWalkSpeed = orig * 1.4 end)
-                        log("sprint: mount boost engaged (%.0f -> %.0f)", orig, orig * 1.4)
-                    end
-                else
-                    local cur = maxWalk(mount)
-                    local target = mountBoostOrig * 1.4
-                    -- re-assert only if the game dropped it BELOW target; if the
-                    -- game itself goes faster (its own gallop state), leave it be
-                    if cur and cur < target - 1 then
-                        pcall(function() mount.CharacterMovement.MaxWalkSpeed = target end)
-                    end
+                -- persistent while mounted, baseline captured ONCE per mount actor
+                -- (address-keyed for the whole session). MaxWalkSpeed is a cap -
+                -- holding it high while standing is harmless, no velocity gating.
+                local base = addr and mountBaselines[addr]
+                if not base then
+                    base = maxWalk(mount)
+                    if not base then return end
+                    if addr then mountBaselines[addr] = base end
+                    log("sprint: mount baseline %.0f, boosting to %.0f", base, base * 1.4)
+                end
+                mountBoostRef = mount
+                mountBoostAddr = addr
+                local target = base * 1.4
+                local cur = maxWalk(mount)
+                -- re-assert only if the game dropped it BELOW target; its own
+                -- faster states are left alone
+                if cur and cur < target - 1 then
+                    pcall(function() mount.CharacterMovement.MaxWalkSpeed = target end)
                 end
                 return
             end
@@ -494,13 +527,49 @@ LoopAsync(300, function()
 end)
 
 -- ---------------------------------------------------------------- AutoReload
--- poll the ability's own CheckInWindow(InputTime) every 40ms during the reload
--- and press exactly when the slider enters the white (perfect) zone.
+-- two paths:
+--  LEARNED: if a perfect press time is known for this weapon's reload montage
+--           (taught by YOUR manual perfect reloads, or a prior auto success),
+--           replay the press at that exact time.
+--  PROBE:   otherwise poll the ability's CheckInWindow every 40ms and press
+--           when the window opens. every success teaches the LEARNED path.
+local LEARN_REL = "Mods/WFQoL/reload-times.txt"
+local LEARN_ABS = "D:/SteamLibrary/steamapps/common/Wayfinder/Atlas/Binaries/Win64/Mods/WFQoL/reload-times.txt"
+local learned = {}
+local currentReload = nil -- { montage, t0, pressAt }
 local reloadPolling = false
+local reloadCallStyle = nil
+
+pcall(function()
+    local f = io.open(LEARN_REL, "r") or io.open(LEARN_ABS, "r")
+    if not f then return end
+    for line in f:lines() do
+        local k, v = line:match("^(.+)=([%d%.]+)$")
+        if k and tonumber(v) then learned[k] = tonumber(v) end
+    end
+    f:close()
+end)
+
+local function saveLearned()
+    pcall(function()
+        local f = io.open(LEARN_REL, "w") or io.open(LEARN_ABS, "w")
+        if not f then return end
+        for k, v in pairs(learned) do f:write(string.format("%s=%.3f\n", k, v)) end
+        f:close()
+    end)
+end
+
+local function pressReload(elapsed) -- game thread only
+    if pawnRef and pawnRef:IsValid() then
+        injecting = true
+        pawnRef:InpActEvt_Reload_K2Node_InputActionEvent_12(RKEY)
+        injecting = false
+        if currentReload then currentReload.pressAt = elapsed end
+    end
+end
 
 -- UE4SS out-param calling convention differs by version: try out-table first,
 -- fall back to multi-return; remember whichever works
-local reloadCallStyle = nil
 local function checkInWindow(ab, elapsed)
     if reloadCallStyle ~= "multi" then
         local ok, res = pcall(function()
@@ -521,50 +590,89 @@ local function checkInWindow(ab, elapsed)
     return nil
 end
 
-local function onReloadActivated(self)
-    if not state.reload or reloadPolling then return end
-    local ab = self:get()
-    local t0 = os.clock()
+local function startProbe(ab, t0)
+    if reloadPolling then return end
     reloadPolling = true
     local ticks = 0
     local done = false
-
     LoopAsync(40, function()
         ticks = ticks + 1
-        if done or ticks > 150 then -- 6s safety cap
+        if done or ticks > 150 then
             reloadPolling = false
             return true
         end
         ExecuteInGameThread(function()
+            local phase = "start"
             local ok, err = pcall(function()
                 if done then return end
-                if not state.reload or not ab:IsValid() or not ab:IsActive() then
-                    done = true
-                    return
-                end
+                if not state.reload then done = true return end
+                phase = "isvalid"
+                if not ab:IsValid() then done = true return end
+                phase = "isactive"
+                if not ab:IsActive() then done = true return end
+                phase = "checkwindow"
                 local elapsed = os.clock() - t0
                 local inWindow = checkInWindow(ab, elapsed)
                 if inWindow == nil then
-                    logErrorOnce("reload", "CheckInWindow call failed in both styles")
+                    logErrorOnce("reload", "CheckInWindow failed in both call styles")
                     done = true
                     return
                 end
                 if inWindow then
-                    if pawnRef and pawnRef:IsValid() then
-                        injecting = true
-                        pawnRef:InpActEvt_Reload_K2Node_InputActionEvent_12(RKEY)
-                        injecting = false
-                        log("reload: perfect press at %.2fs", elapsed)
-                    end
+                    phase = "press"
+                    pressReload(elapsed)
+                    log("reload: window press at %.2fs", elapsed)
                     done = true
                 end
             end)
             if not ok then
-                logErrorOnce("reload", err)
+                logErrorOnce("reload@" .. phase, tostring(err))
                 done = true
             end
         end)
         return false
+    end)
+end
+
+local function onReloadActivated(self)
+    local ok, err = pcall(function()
+        local ab = self:get()
+        local montage = "unknown"
+        pcall(function() montage = ab.ReloadMontage:GetFName():ToString() end)
+        local t0 = os.clock()
+        currentReload = { montage = montage, t0 = t0, pressAt = nil }
+        if not state.reload then return end
+
+        local t = learned[montage]
+        if t then
+            ExecuteWithDelay(math.max(math.floor((t - 0.03) * 1000), 20), function()
+                ExecuteInGameThread(function()
+                    pcall(function()
+                        if state.reload and ab:IsValid() and ab:IsActive() then
+                            pressReload(os.clock() - t0)
+                        end
+                    end)
+                end)
+            end)
+        else
+            startProbe(ab, t0)
+        end
+    end)
+    if not ok then logErrorOnce("reload-activate", tostring(err)) end
+end
+
+-- success = the game activated the Succeeded ability; whatever press time led
+-- here (manual or injected) becomes the learned perfect time for this montage
+local function onReloadSucceeded(self)
+    local ok = pcall(function()
+        if currentReload and currentReload.pressAt and currentReload.montage ~= "unknown" then
+            local first = learned[currentReload.montage] == nil
+            learned[currentReload.montage] = currentReload.pressAt
+            saveLearned()
+            if first then
+                log("reload: LEARNED perfect time %.2fs for %s", currentReload.pressAt, currentReload.montage)
+            end
+        end
     end)
 end
 
@@ -623,6 +731,14 @@ local function registerAll()
     end)
     tryHook(AIBASE .. ":K2_ActivateAbility", onEnemyAbility)
     tryHook(RELOAD_GA .. ":K2_ActivateAbility", onReloadActivated)
+    tryHook(RELOAD_OK_GA .. ":K2_ActivateAbility", onReloadSucceeded)
+    -- capture YOUR manual reload presses so successes teach the perfect time
+    tryHook(CHAR .. ":InpActEvt_Reload_K2Node_InputActionEvent_12", function(self)
+        if injecting then return end
+        if currentReload then
+            currentReload.pressAt = os.clock() - currentReload.t0
+        end
+    end)
 end
 
 registerAll()
@@ -643,6 +759,7 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, New
     end
     libCache = nil
     sprintClassCache = nil
+    preloadParryAssets() -- ClientRestart hook = guaranteed game thread
     registerAll()
 end)
 
