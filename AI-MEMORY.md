@@ -211,3 +211,10 @@ Per-repo memory. Append-only, concise. Format: `### YYYY-MM-DD - Category - entr
 - OTHER source = the AGENT's own shell commands: every Bash/PowerShell/deploy I run while user is in-game spawns a cmd/conhost/powershell console that steals foreground + dings. Mitigation: batch/minimize shell commands during active play; the wscript-hidden overlay launch itself does NOT flash.
 - GOTCHA (self-inflicted): Get-CimInstance ... Where CommandLine -like '*WFQoL-Overlay*' MATCHES ITS OWN QUERY PROCESS (the pattern text is in the -Command line). Looked like duplicate overlays; was false. Exclude with -notmatch '-Command'. Mutex "WFQoL-Overlay-SingleInstance" works - single instance confirmed.
 - SESSION WIN: v27 transition hardening held - no crash 19:28->19:45+, reload/parry/overlay-click all working in log.
+
+## v29 (2026-07-04) - log-driven tuning: parry stamina reserve + bulletproof ClientRestart
+- LOG REVIEW (19:28->19:51, clean/no-crash, reload PERFECT throughout, overlay no-activate working): two improvements.
+- (1) STAMINA_RESERVE 0.35 -> 0.20. Log showed constant "parry skipped: stamina X% below 35%" at 25/26/28/31/33/35% = mod refusing parries right when needed. AutoParry exists to land parries; a blocked hit beats a saved dash. 0.20 keeps a small dash buffer, lands far more parries.
+- (2) ClientRestart callback FULLY pcall-wrapped. Log had 2x "Error executing hook pre-callback ClientRestart: ... Was unable to register a hook" on transitions. WFQoL's registerAll is a no-op on re-entry (registered[] guard) so likely NOT us (prob ShowNameplates re-hooking HUD), but wrapping the whole body means WFQoL can PROVABLY never emit that line now. If it persists post-v29 = ShowNameplates confirmed.
+- "no timing for <class>" entries (GA_AI_Atk_Melee_L/R/_ALC_C, GA_AI_Atk_180_L/R_ALC_C, GA_Elemental_Flowing_Bubble_C, GA_Turtlesaur_Atk_Bite_Swamp_C) left at default 0.6s - can't extract real frame data from logs, and fire-time willConnect recheck makes exact timing non-critical. Extend timings.lua offline if a dump becomes available.
+- Applies on NEXT game launch (hot-reload disabled). Needs test: fewer stamina skips, more parries landing.

@@ -139,7 +139,10 @@ local PARRY_COOLDOWN = 0.3
 local PARRY_RANGE = 800.0        -- schedule-time prefilter
 local CONNECT_RANGE = 450.0      -- fire-time: attack must actually reach us
 local FACING_DOT = 0.2           -- fire-time: enemy must be aimed at us
-local STAMINA_RESERVE = 0.35     -- keep this much stamina for dashing
+local STAMINA_RESERVE = 0.20     -- keep this much stamina for dashing (was 0.35:
+                                 -- log showed constant skips at 25-34%, missing
+                                 -- parries the mod exists to land; a blocked hit
+                                 -- beats a saved dash. still holds a small buffer)
 local lastParry = 0.0
 local lastScheduled = 0.0
 local lastParryInfo = "" -- for the external overlay
@@ -862,20 +865,25 @@ LoopAsync(5000, function()
 end)
 
 RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, NewPawn)
-    transitionAt = os.clock() -- arm the settle gate: actors are (un)constructing
-    local ok, p = pcall(function() return NewPawn:get() end)
-    if ok then
-        pawnRef = p
-        ready = true
-        m1Held = false
-        pcall(function() log("pawn: %s", p:GetClass():GetFName():ToString()) end)
-    end
-    libCache = nil
-    sprintClassCache = nil
-    metersCache = nil -- HUD widgets are rebuilt on the new level; drop stale ref
-    preloadParryAssets() -- ClientRestart hook = guaranteed game thread
-    launchOverlay()
-    registerAll()
+    -- whole body guarded: an uncaught throw here surfaces as UE4SS
+    -- "Error executing hook pre-callback ClientRestart" and can abort a transition
+    local hookOk, hookErr = pcall(function()
+        transitionAt = os.clock() -- arm the settle gate: actors are (un)constructing
+        local ok, p = pcall(function() return NewPawn:get() end)
+        if ok then
+            pawnRef = p
+            ready = true
+            m1Held = false
+            pcall(function() log("pawn: %s", p:GetClass():GetFName():ToString()) end)
+        end
+        libCache = nil
+        sprintClassCache = nil
+        metersCache = nil -- HUD widgets are rebuilt on the new level; drop stale ref
+        preloadParryAssets() -- ClientRestart hook = guaranteed game thread
+        launchOverlay()
+        registerAll()
+    end)
+    if not hookOk then logErrorOnce("clientrestart", tostring(hookErr)) end
 end)
 
 -- ---------------------------------------------------------------- keybinds
