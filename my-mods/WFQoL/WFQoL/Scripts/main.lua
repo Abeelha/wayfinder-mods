@@ -159,7 +159,14 @@ end)
 
 -- ---------------------------------------------------------------- AutoParry
 local LEAD = 0.25
-local DEFAULT_HIT = 0.6
+-- fallback hit-time for attacks with no extracted montage timing. many common
+-- enemy attacks CAN'T be statically timed: the generic AI melee (GA_AI_Atk_Melee_
+-- *_ALC) resolves its montage at runtime per-enemy via the ALC "Atk_Basic" key, and
+-- ranged casts (Farseer Blast/Channel/Meteor) have no weapon-trace notify. so those
+-- ride this default. measured across the 250 real melee timings the median is
+-- ~0.94s (old 0.60 fired ~0.35s too early); 0.8 sits near the light-melee cluster
+-- (0.65-0.85) - late enough for slow swings, still early enough for basics.
+local DEFAULT_HIT = 0.8
 local PARRY_COOLDOWN = 0.3
 local PARRY_RANGE = 800.0        -- schedule-time prefilter
 local CONNECT_RANGE = 450.0      -- fire-time: attack must actually reach us
@@ -462,7 +469,9 @@ local tagBaseline = nil
 local tagVerified = false
 local speedBoosted = false
 local origMaxWalk = nil
-local lastCombat = nil
+local lastCombat = nil     -- raw InCombat tag (drives sprint gate + overlay, updated instantly)
+local loggedCombat = nil   -- last LOGGED combat state (debounced - tag flaps rapidly near enemies)
+local combatPendingSince = 0.0
 
 local function velSq(actor)
     local ok, s = pcall(function()
@@ -568,8 +577,15 @@ LoopAsync(300, function()
 
             local inCombat = ascHasTag(asc, INCOMBAT_TAG)
             if inCombat ~= lastCombat then
-                lastCombat = inCombat
-                log("combat: %s", tostring(inCombat))
+                lastCombat = inCombat            -- raw: gate + overlay react immediately
+                combatPendingSince = os.clock()  -- start the log-debounce window
+            end
+            -- only LOG a combat state that has settled >=0.75s (the game's InCombat
+            -- tag micro-flaps near enemies: 199 flips in one session was pure noise).
+            -- a state that flips back inside the window keeps resetting -> never logged.
+            if loggedCombat ~= lastCombat and (os.clock() - combatPendingSince) >= 0.75 then
+                loggedCombat = lastCombat
+                log("combat: %s", tostring(lastCombat))
             end
             -- name the equipped weapon's block ability + cost GE once per class
             -- (deduped). runs every tick so equipping a weapon logs it immediately,
