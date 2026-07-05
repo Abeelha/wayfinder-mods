@@ -348,16 +348,16 @@ end
 
 -- SORT OWNED ITEMS (overlay button): idempotent, self-correcting pass over the inventory.
 -- for each item it computes the DESIRED mark and applies it only if it DIFFERS from the
--- current one - so re-clicking SORT also CLEARS stale/wrong marks (un-dusts what should not
--- be dusted), no manual deselect needed. MARKS ONLY, never sells. rules:
+-- current one - so re-clicking SORT also CLEARS stale/wrong marks (un-dusts), no manual
+-- deselect. MARKS ONLY, never sells. rules:
 --   * FAVORITED (flag 2) + equipped items: never touched (respect the player's choice).
---   * UNIQUE (single copy): never junked -> desired NONE (clears any stale mark).
---   * WEAPON/ACCESSORY duplicates: keep the highest-LEVEL copy (NONE), junk the rest.
---   * ECHO duplicates: keep the highest-RARITY (then level) copy (NONE); of the rest, DUST
---     only the low-rarity ones (common/uncommon) and keep rare+ (NONE). higher-rarity
---     echoes NEVER get dusted.
+--   * UNIQUE (single copy): kept -> desired NONE (clears any stale mark). always >=1 of each.
+--   * DUPLICATES: keep exactly ONE - the BEST copy (echoes: highest RARITY then most XP;
+--     weapons/accessories: most XP / highest level) -> NONE. DUST every other echo dupe,
+--     JUNK every other weapon/accessory dupe, REGARDLESS of rarity (so rare/epic dupes are
+--     not hoarded - the single best of each item is kept, the extras marked). the highest
+--     rarity/most-upgraded copy is always the keeper, so the good one is never marked.
 -- favorites are left entirely to the player (never auto-applied). flag 0 = no flags.
-local ECHO_DUST_MAX_RARITY = 2 -- dust only common(1)/uncommon(2) echo dupes; keep rare+
 local function sortOwnedItems(pic)
     local items = pic:GetItemsByTag({ GameplayTags = {}, ParentTags = {} })
     local groups = {}
@@ -366,12 +366,13 @@ local function sortOwnedItems(pic)
         pcall(function()
             local cat = ss_category(entry); if not cat then return end
             local key = ss_key(entry); if not key then return end
-            local rarity, cur, equipped = 0, 0, false
+            local rarity, exp, cur, equipped = 0, 0, 0, false
             pcall(function() rarity = entry.Spec.echoRarity or 0 end)
+            pcall(function() exp = entry.Spec.CurrentExp or 0 end)
             pcall(function() cur = entry.Spec.ItemFlags or 0 end)
             pcall(function() equipped = (entry.Spec.bEquipped or entry.Spec.Equipped) and true or false end)
             groups[key] = groups[key] or {}
-            table.insert(groups[key], { entry = entry, cat = cat, lvl = ss_level(entry, cat), rarity = rarity, cur = cur, equipped = equipped })
+            table.insert(groups[key], { entry = entry, cat = cat, rarity = rarity, exp = exp, cur = cur, equipped = equipped })
         end)
     end
     local marked, cleared = 0, 0
@@ -385,24 +386,21 @@ local function sortOwnedItems(pic)
         if #list == 1 then
             want(list[1], 0) -- UNIQUE: keep, clear any stale mark
         else
-            local keepIdx, bR, bL = 1, -1, -1
+            -- keeper = best copy: echoes rank by RARITY then XP; others by XP (level/upgrade)
+            local keepIdx, bR, bE = 1, -1, -1
             for i, it in ipairs(list) do
                 local better
                 if it.cat == "echo" then
-                    better = (it.rarity > bR) or (it.rarity == bR and it.lvl > bL)
+                    better = (it.rarity > bR) or (it.rarity == bR and it.exp > bE)
                 else
-                    better = (it.lvl > bL)
+                    better = (it.exp > bE)
                 end
-                if better then bR = it.rarity; bL = it.lvl; keepIdx = i end
+                if better then bR = it.rarity; bE = it.exp; keepIdx = i end
             end
             for i, it in ipairs(list) do
-                if i == keepIdx then
-                    want(it, 0)                              -- keeper: keep, clear any mark
-                elseif it.cat == "echo" then
-                    want(it, (it.rarity <= ECHO_DUST_MAX_RARITY) and 4 or 0) -- dust low-rarity echo dupes only
-                else
-                    want(it, 1)                              -- weapon/accessory dupe: junk
-                end
+                if i == keepIdx then want(it, 0)             -- keeper: keep
+                elseif it.cat == "echo" then want(it, 4)     -- dust every other echo dupe
+                else want(it, 1) end                         -- junk every other weapon/accessory dupe
             end
         end
     end
