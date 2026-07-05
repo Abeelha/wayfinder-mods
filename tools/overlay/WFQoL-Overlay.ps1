@@ -112,10 +112,7 @@ $features = @(
     @{ Name = "CHAIN";  Key = "F7";  Prop = "chain" },
     @{ Name = "PARRY";  Key = "F8";  Prop = "parry" },
     @{ Name = "RELOAD"; Key = "F9";  Prop = "reload" },
-    @{ Name = "DODGE";  Key = "clk"; Prop = "dodge" },
-    @{ Name = "HOMING"; Key = "clk"; Prop = "homing" },
-    @{ Name = "HEAL";   Key = "clk"; Prop = "heal" },
-    @{ Name = "FACE";   Key = "clk"; Prop = "face" }
+    @{ Name = "HOMING"; Key = "clk"; Prop = "homing" }
 )
 $script:rowMap = @{}
 foreach ($f in $features) {
@@ -236,21 +233,17 @@ $timer.Add_Tick({
                 Set-Row "chain" $s.chain
                 Set-Row "parry" $s.parry
                 Set-Row "reload" $s.reload
-                Set-Row "dodge" $s.dodge
                 Set-Row "homing" $s.homing
-                Set-Row "heal" $s.heal
-                Set-Row "face" $s.face
                 $combatDot.Fill = if ($s.combat) { "#FF5A5A" } else { "#5CE08A" }
-                # incoming-attack telegraph (parry = amber, dodge = blue); shows ~2s
+                # incoming parryable-attack telegraph (amber); shows ~2s
                 if ($s.incoming -and (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$s.incomingTs) -lt 2)) {
-                    if ("$($s.incomingKind)" -eq "dodge") { $telegraphText.Foreground = "#66C7FF"; $telegraphText.Text = "DODGE  $($s.incoming)" }
-                    else { $telegraphText.Foreground = "#FFC24B"; $telegraphText.Text = "PARRY  $($s.incoming)" }
+                    $telegraphText.Foreground = "#FFC24B"; $telegraphText.Text = "PARRY  $($s.incoming)"
                     $telegraphBar.Visibility = "Visible"
                 } else {
                     $telegraphBar.Visibility = "Collapsed"
                 }
                 $mode = "$($s.sprintMode)"
-                $footerText.Text = "P$($s.statParry) D$($s.statDodge) H$($s.statHeal) | $mode"
+                $footerText.Text = "parries:$($s.statParry) seen:$($s.statSeen) | $mode"
             }
         } catch { $stale = $true }
     }
