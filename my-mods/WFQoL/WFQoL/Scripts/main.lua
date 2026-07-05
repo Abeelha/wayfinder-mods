@@ -366,12 +366,21 @@ local incoming = { name = "", kind = "", ts = 0 }
 -- anything is missing the callers just no-op (no target = feature idles, never crashes).
 local function getSoftTarget(pawn)
     local ok, tgt = pcall(function()
+        -- verified-in-game: component is pawn.TargetingComponent (UWFTargetingComponent).
         local tc = nil
-        pcall(function() tc = pawn.WFTargetingComponent end)
-        if not (tc and tc:IsValid()) then pcall(function() tc = pawn:GetWFTargetingComponent() end) end
+        pcall(function() tc = pawn.TargetingComponent end)
+        if not (tc and tc:IsValid()) then pcall(function() tc = pawn.WFTargetingComponent end) end
         if not (tc and tc:IsValid()) then return nil end
         local t = nil
         pcall(function() t = tc.m_MagnetizedAimTarget end)
+        -- m_MagnetizedAimTarget is only populated while aim-assist is driving; if empty,
+        -- run a soft-lock query and read the first associated target (verified sig).
+        if not (t and t:IsValid()) then
+            pcall(function()
+                tc:FindSoftLockTarget({ Radius = 3000.0, Yaw = 40.0, bCanTargetFriendly = false, bIgnoreHardLockedTarget = false }, false, true)
+                t = tc.m_CurrentSoftLockTargetResults.AssociatedTargets[1]
+            end)
+        end
         if t and t:IsValid() and isReal(t) then return t end
         return nil
     end)
@@ -984,46 +993,59 @@ local function onReloadEnded(self)
 end
 
 -- ---------------------------------------------------------------- Homing bullets
--- every player projectile derives from MayhemBaseProjectile, so one NotifyOnNewObject
--- on the base catches every shot (incl child classes). filter to OUR shots
--- (GetInstigator == our pawn) and steer them at the soft-lock target via the standard
--- UE homing fields on the movement component (verified present on the airship movement
--- comp: bIsHomingProjectile / HomingAccelerationMagnitude), plus native SetHomingTarget
--- as primary (pcall'd - it's header-only, may not be BP-exposed). ExecuteWithDelay(30)
--- lets spawn-time props initialize before we touch them. no target = shot flies normally.
+-- POOLING TRAP (verified previously): projectiles are pooled -> NotifyOnNewObject NEVER
+-- fires per shot. instead hook the projectile BP's per-launch UFunctions (fire each time
+-- the pool reactivates an actor) and dedup by ADDRESS+time (the pool reuses addresses).
+-- basic ranged fire is HITSCAN (no projectile actor) so homing only affects weapon
+-- projectile abilities (ArcBeam/Slug/etc). filter to OUR shots via GetInstigator. steer
+-- via the standard UE homing fields on the movement comp (verified: bIsHomingProjectile /
+-- HomingAccelerationMagnitude) + native SetHomingTarget (pcall'd). no target = flies straight.
+local PROJ_BASE = "/Game/Blueprints/Projectiles/WFProjectile_Base_BP.WFProjectile_Base_BP_C"
 local HOMING_ACCEL = 12000.0
-pcall(function()
-    NotifyOnNewObject("/Script/Wayfinder.MayhemBaseProjectile", function(proj)
+local homedProj = {} -- addr -> os.clock() of last home (pool reuses addresses)
+local function applyHoming(proj)
+    pcall(function()
         if not state.homing then return end
-        ExecuteWithDelay(30, function()
-            ExecuteInGameThread(function()
-                pcall(function()
-                    if not state.homing then return end
-                    if not (proj and proj:IsValid()) then return end
-                    local pawn = getPawn(); if not pawn then return end
-                    local inst = nil
-                    pcall(function() inst = proj:GetInstigator() end)
-                    if not (inst and inst:IsValid()) then return end
-                    if addrOf(inst) ~= addrOf(pawn) then return end -- only home OUR shots
-                    local target = getSoftTarget(pawn); if not target then return end
-                    pcall(function() proj:SetHomingTarget(target) end)
-                    local mc = nil
-                    pcall(function() mc = proj.ProjectileMovementComponent end)
-                    if not (mc and mc:IsValid()) then pcall(function() mc = proj.MovementComponent end) end
-                    if mc and mc:IsValid() then
-                        pcall(function() mc.bIsHomingProjectile = true end)
-                        pcall(function() mc.HomingAccelerationMagnitude = HOMING_ACCEL end)
-                        pcall(function()
-                            local rc = target.RootComponent
-                            if rc and rc:IsValid() then mc.HomingTargetComponent = rc end
-                        end)
-                    end
-                end)
+        if not (proj and proj:IsValid()) then return end
+        local pawn = getPawn(); if not pawn then return end
+        local inst = nil
+        pcall(function() inst = proj:GetInstigator() end)
+        if not (inst and inst:IsValid()) then return end
+        if addrOf(inst) ~= addrOf(pawn) then return end -- only home OUR shots
+        local target = getSoftTarget(pawn); if not target then return end
+        pcall(function() proj:SetHomingTarget(target) end)
+        local mc = nil
+        pcall(function() mc = proj.ProjectileMovementComponent end)
+        if not (mc and mc:IsValid()) then pcall(function() mc = proj.MovementComponent end) end
+        if mc and mc:IsValid() then
+            pcall(function() mc.bIsHomingProjectile = true end)
+            pcall(function() mc.HomingAccelerationMagnitude = HOMING_ACCEL end)
+            pcall(function()
+                local rc = target.RootComponent
+                if rc and rc:IsValid() then mc.HomingTargetComponent = rc end
             end)
-        end)
+        end
     end)
-    log("homing: projectile notify registered")
-end)
+end
+local function onProjectileLaunch(self)
+    if not state.homing then return end
+    local proj = self:get()
+    local a = addrOf(proj)
+    if not a then return end
+    local now = os.clock()
+    if homedProj[a] and (now - homedProj[a]) < 0.5 then return end -- pool dedup
+    homedProj[a] = now
+    ExecuteWithDelay(30, function() ExecuteInGameThread(function() applyHoming(proj) end) end)
+end
+-- try the known per-launch hook points (pcall'd - whichever exist register; the others
+-- no-op). dedup means multiple firing for one shot is harmless.
+for _, fn in ipairs({ "ReceiveBeginPlay", "ComputeInitialSpeed", "FindTargetActor" }) do
+    pcall(function()
+        if RegisterHook(PROJ_BASE .. ":" .. fn, onProjectileLaunch) then
+            log("homing: hooked projectile %s (pooled, deduped)", fn)
+        end
+    end)
+end
 
 -- ---------------------------------------------------------------- AutoHeal (default OFF)
 -- GA_ConsumeItem_Base_C = the potion/flask consumable ability. auto-use it when HP drops
