@@ -19,6 +19,7 @@ local playerNameplate = nil    -- current player's nameplate widget
 local hudMeters       = nil    -- source HUD meters (health/shield/stamina)
 local currentPlayer   = nil    -- player pawn, refreshed on each ClientRestart
 local hooksInstalled  = false  -- register the UFunction hooks exactly once
+local enemySeen       = {}     -- enemy owner class names logged once (find bosses)
 
 -- (re)find the HUD meters widget; cached until it goes invalid (level change)
 local function resolveHUD()
@@ -79,7 +80,23 @@ local function installHooks()
     RegisterHook("/Game/UI/UI_WF_Blueprints/UI_WF_HUD/HUD_PlayerMeters.HUD_PlayerMeters_C:OnHealthChanged", updateNameplate)
     RegisterHook("/Game/UI/UI_WF_Blueprints/UI_WF_HUD/HUD_PlayerStaminaMeters.HUD_PlayerStaminaMeters_C:OnStaminaChanged", updateNameplate)
 
-    OverrideReturn(NP_ENEMY .. ":ShouldBeVisible", true)
+    -- force normal enemy nameplates visible, but HIDE the boss's small nameplate:
+    -- forcing it on conflicts with the boss's dedicated health bar. detect boss by
+    -- owner class name (logged once each so the match can be made precise). returns
+    -- true for normal enemies, false for bosses (their big boss bar shows health).
+    RegisterHook(NP_ENEMY .. ":ShouldBeVisible", function(self)
+        local show = true
+        pcall(function()
+            local np = self:get()
+            if not (np and np:IsValid()) then return end
+            local owner = np.AttachedOwnerActor
+            if not (owner and owner:IsValid()) then return end
+            local cn = owner:GetClass():GetFName():ToString()
+            if not enemySeen[cn] then enemySeen[cn] = true; print("[ShowNameplates] enemy owner " .. cn .. "\n") end
+            if cn:lower():find("boss") then show = false end
+        end)
+        return show
+    end)
     OverrideReturn(NP_PLAYER .. ":ShouldBeVisible", true, function(self)
         local np = self:get()
         local ok, mine = pcall(function()
@@ -110,10 +127,15 @@ end
 -- refresh the player + widget refs; the widget is rebuilt per level so drop the
 -- cached nameplate and let ShouldBeVisible re-capture it for the new pawn
 local function onRestart(pawn)
+    installHooks() -- once, regardless of pawn type
+    -- co-op downs swap the pawn to BP_Spectator_Pawn_C; binding the self-nameplate
+    -- to a spectator/edit pawn shows wrong health ("breaks sometimes"). only track
+    -- the real player character - keep the last real one through a down/respawn.
+    local ok, cn = pcall(function() return pawn:GetClass():GetFName():ToString() end)
+    if not (ok and cn == "WFPlayerCharacter_Base_C") then return end
     currentPlayer   = pawn
     playerNameplate = nil
     hudMeters       = nil
-    installHooks()
 end
 
 RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, NewPawn)

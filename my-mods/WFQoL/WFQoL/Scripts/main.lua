@@ -166,6 +166,7 @@ local lastParry = 0.0
 local lastScheduled = 0.0
 local lastParryInfo = "" -- for the external overlay
 local lastStaminaSkipLog = 0.0
+local lastConnectLog = 0.0
 
 local function isMeleeAttack(ability)
     local hasAttack, hasMelee = false, false
@@ -297,14 +298,29 @@ end
 
 -- returns "ok" (activated), "active" (block/parry already running - success),
 -- or false (rejected)
+-- block ability is activated by CLASS, so caching the class makes parry survive an
+-- in-game keybind rebind (which can leave GetAbilityFromInputTag(Input.Combat.Block)
+-- returning nil even though the ability is still granted).
+local lastBlockClass = nil
+local blockNilLogged = false
 local function tryActivateParry(asc)
     local blockAbility = asc:GetAbilityFromInputTag(BLOCK_TAG)
-    if not blockAbility or not blockAbility:IsValid() then return false end
-    preloadAbilityGraph(blockAbility) -- one-shot/class: log block ability name (diagnostic)
-    local isActive = false
-    pcall(function() isActive = blockAbility:IsActive() end)
-    if isActive then return "active" end
-    if asc:TryActivateAbilityByClass(blockAbility:GetClass(), true) then return "ok" end
+    if blockAbility and blockAbility:IsValid() then
+        preloadAbilityGraph(blockAbility)
+        pcall(function() lastBlockClass = blockAbility:GetClass() end)
+        blockNilLogged = false
+    elseif not blockNilLogged then
+        blockNilLogged = true
+        log("parry: Input.Combat.Block tag has no ability (keybind changed?) - falling back to last-known class")
+    end
+    local cls = (blockAbility and blockAbility:IsValid() and blockAbility:GetClass()) or lastBlockClass
+    if not (cls and cls:IsValid()) then return false end
+    if blockAbility and blockAbility:IsValid() then
+        local isActive = false
+        pcall(function() isActive = blockAbility:IsActive() end)
+        if isActive then return "active" end
+    end
+    if asc:TryActivateAbilityByClass(cls, true) then return "ok" end
     return false
 end
 
@@ -322,7 +338,13 @@ local function doParry(className, delayMs, enemy, attempt)
             if not pawn then return end
 
             -- only spend the parry if this attack is actually about to land on us
-            if not willConnect(enemy, pawn) then return end
+            if not willConnect(enemy, pawn) then
+                if now - lastConnectLog > 5 then
+                    lastConnectLog = now
+                    log("parry: %s scheduled but not connecting (out of range/not facing)", className)
+                end
+                return
+            end
 
             -- keep a stamina reserve for dashing
             local sp = staminaPct()
@@ -381,6 +403,13 @@ local function onEnemyAbility(self)
         -- (0x10) through pcall. validate the ability before any native call.
         if not (ab and ab:IsValid()) then return end
         local className = ab:GetClass():GetFName():ToString()
+        -- DIAGNOSTIC: log every enemy ability this hook catches (once/class). if a
+        -- boss fight logs nothing here, the boss doesn't derive from GA_AI_Base and
+        -- we must hook its ability base class too for parry to work vs it.
+        if not meleeCache["_seen_" .. className] then
+            meleeCache["_seen_" .. className] = true
+            log("parry: enemy GA seen %s", className)
+        end
         local verdict = meleeCache[className]
         if verdict == nil then
             verdict = isMeleeAttack(ab)
