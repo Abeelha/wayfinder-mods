@@ -401,3 +401,6 @@ Per-repo memory. Append-only, concise. Format: `### YYYY-MM-DD - Category - entr
 - STAMINA FIX: v53 used np:GetStaminaPercentage(owner) (ASC compute, wrong/unresponsive). Now mirror the live HUD stamina meter .Percent = the real value the HUD shows = responsive. (Teammate stamina still not driven - can't read remote ASC safely; teammate health is native.)
 - ENEMY NAMEPLATES REMOVED: user - "enemies enabled by default, don't double-enable; mod is for us + teammates, not NPCs." Dropped the NP_ENEMY OverrideReturn entirely (also removes a hook + the boss-skip 0x10 surface for good). Enemy nameplates left to the game.
 - NET: players only, event-driven (no fps hit), self health+stamina responsive (HUD mirror), teammates visible + health native, remote ASC never touched (no MP-join crash), settle-gated, no GetClass. Deployed game+repo, committed 458c493.
+
+## 2026-07-05 — v56: allies healthbar-only (no stamina)
+- User: allies just need healthbar, no stamina. ShowNameplates now forces SetHealthMeterVisibility(true) for ALL player nameplates (self + allies) but SetStaminaMeterVisibility(true) ONLY on the local player's nameplate (gated addrOf(np)==addrOf(selfNameplate) in ShouldBeVisible; driveSelf is local-only). Allies = health only; self = health + stamina (HUD-mirrored, responsive). Committed 6bdfdd7.
