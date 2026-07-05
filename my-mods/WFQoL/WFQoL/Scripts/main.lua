@@ -1,5 +1,5 @@
 -- WFQoL: Wayfinder quality-of-life bundle with on-screen overlay.
---   F7  AutoChain  - hold M1 to auto-chain melee attacks
+--   F7  AutoChain  - hold M1 to auto-chain light attacks, M2 for heavy attacks
 --   F8  AutoParry  - timed parry/block just before enemy melee hits land
 --   F6  AutoSprint - sprint while moving out of combat (foot + mount)
 --   F9  AutoReload - reload minigame always lands the perfect window
@@ -48,6 +48,7 @@ local SPRINT_CLASS = "/Game/Blueprints/Player/GAS/GameplayAbilities/GA_Player_Sp
 local WFLIB = "/Script/Wayfinder.Default__WFAbilitySystemBlueprintLibrary"
 
 local LMB = { KeyName = FName("LeftMouseButton") }
+local RMB = { KeyName = FName("RightMouseButton") }  -- Attack2 = heavy melee, bound to RMB (verified Input.ini)
 local BLOCK_TAG = { TagName = FName("Input.Combat.Block") }
 local INCOMBAT_TAG = { TagName = FName("Character.State.Generic.InCombat") }
 local SPRINTING_TAG = { TagName = FName("Character.State.Generic.Sprinting") }
@@ -126,9 +127,14 @@ local function ascHasTag(asc, tag)
 end
 
 -- ---------------------------------------------------------------- AutoChain
+-- one loop chains BOTH: hold M1 -> auto light attacks (Attack1), hold M2 -> auto heavy
+-- attacks (Attack2). same F7 toggle. the game gates the next swing by animation, so a
+-- 70ms inject just keeps the combo flowing (light AND heavy combos: HeavyAttack1->2->3).
 local m1Held = false
+local m2Held = false
 local injecting = false
 local sendRelease = false
+local sendRelease2 = false
 
 -- reload minigame state lives up here: AutoChain must stop injecting M1 while
 -- the minigame runs (Attack1 AND Reload both count as minigame inputs - a
@@ -140,20 +146,25 @@ local function reloadInProgress()
 end
 
 LoopAsync(70, function()
-    if not (state.chain and m1Held and ready) or settling() then return false end
+    if not (state.chain and ready) or settling() then return false end
+    if not (m1Held or m2Held) then return false end
     if reloadInProgress() then return false end
     ExecuteInGameThread(function()
         if not pawnRef or not pawnRef:IsValid() then return end
         injecting = true
         pcall(function()
-            if sendRelease then
-                pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_37(LMB)
-            else
-                pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_36(LMB)
+            if m1Held then
+                if sendRelease then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_37(LMB)
+                else pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_36(LMB) end
+                sendRelease = not sendRelease
+            end
+            if m2Held then
+                if sendRelease2 then pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_41(RMB)
+                else pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_40(RMB) end
+                sendRelease2 = not sendRelease2
             end
         end)
         injecting = false
-        sendRelease = not sendRelease
     end)
     return false
 end)
@@ -1090,6 +1101,17 @@ local function registerAll()
     tryHook(CHAR .. ":InpActEvt_Attack1_K2Node_InputActionEvent_37", function(self)
         if injecting then return end
         m1Held = false
+    end)
+    -- heavy attack (Attack2 = RMB): _40 press / _41 release, mirrors Attack1
+    tryHook(CHAR .. ":InpActEvt_Attack2_K2Node_InputActionEvent_40", function(self)
+        if injecting then return end
+        m2Held = true
+        local p = self:get()
+        if p and p:IsValid() then pawnRef = p end
+    end)
+    tryHook(CHAR .. ":InpActEvt_Attack2_K2Node_InputActionEvent_41", function(self)
+        if injecting then return end
+        m2Held = false
     end)
     tryHook(AIBASE .. ":K2_ActivateAbility", onEnemyAbility)
     tryHook(RELOAD_GA .. ":K2_ActivateAbility", onReloadActivated)
