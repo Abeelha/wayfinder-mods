@@ -111,8 +111,7 @@ $features = @(
     @{ Name = "SPRINT"; Key = "F6";  Prop = "sprint" },
     @{ Name = "CHAIN";  Key = "F7";  Prop = "chain" },
     @{ Name = "PARRY";  Key = "F8";  Prop = "parry" },
-    @{ Name = "RELOAD"; Key = "F9";  Prop = "reload" },
-    @{ Name = "HOMING"; Key = "clk"; Prop = "homing" }
+    @{ Name = "RELOAD"; Key = "F9";  Prop = "reload" }
 )
 $script:rowMap = @{}
 foreach ($f in $features) {
@@ -233,7 +232,6 @@ $timer.Add_Tick({
                 Set-Row "chain" $s.chain
                 Set-Row "parry" $s.parry
                 Set-Row "reload" $s.reload
-                Set-Row "homing" $s.homing
                 $combatDot.Fill = if ($s.combat) { "#FF5A5A" } else { "#5CE08A" }
                 # incoming parryable-attack telegraph (amber); shows ~2s
                 if ($s.incoming -and (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$s.incomingTs) -lt 2)) {

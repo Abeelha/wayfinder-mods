@@ -14,7 +14,6 @@ local state = {
     sprint = true,
     reload = true,
     overlay = true,
-    homing = true,   -- Homing bullets: steer OUR projectiles into the soft-lock target
 }
 
 local function log(fmt, ...) print(string.format("[WFQoL] " .. fmt .. "\n", ...)) end
@@ -386,33 +385,6 @@ end
 -- session stat counters (shown on the overlay) + the current incoming-attack telegraph
 local stat = { parry = 0, parryFail = 0, seen = 0 }
 local incoming = { name = "", kind = "", ts = 0 }
-
--- WFTargetingComponent holds the soft-lock / magnetized target (what the player is
--- aiming near). source for homing projectiles + the soft auto-face. fully guarded: if
--- anything is missing the callers just no-op (no target = feature idles, never crashes).
-local function getSoftTarget(pawn)
-    if settling() then return nil end -- never touch targeting during a transition (teardown AV)
-    local ok, tgt = pcall(function()
-        -- verified-in-game: component is pawn.TargetingComponent (UWFTargetingComponent).
-        local tc = nil
-        pcall(function() tc = pawn.TargetingComponent end)
-        if not (tc and tc:IsValid()) then pcall(function() tc = pawn.WFTargetingComponent end) end
-        if not (tc and tc:IsValid()) then return nil end
-        local t = nil
-        pcall(function() t = tc.m_MagnetizedAimTarget end)
-        -- m_MagnetizedAimTarget is only populated while aim-assist is driving; if empty,
-        -- run a soft-lock query and read the first associated target (verified sig).
-        if not (t and t:IsValid()) then
-            pcall(function()
-                tc:FindSoftLockTarget({ Radius = 3000.0, Yaw = 40.0, bCanTargetFriendly = false, bIgnoreHardLockedTarget = false }, false, true)
-                t = tc.m_CurrentSoftLockTargetResults.AssociatedTargets[1]
-            end)
-        end
-        if t and t:IsValid() and isReal(t) then return t end
-        return nil
-    end)
-    return ok and tgt or nil
-end
 
 -- forcing ladder: plain activation -> cancel current swing montage + retry ->
 -- two more delayed rounds -> give up loudly
@@ -967,54 +939,6 @@ local function onReloadEnded(self)
     if not ok then logErrorOnce("reload-end", "handler failed") end
 end
 
--- ---------------------------------------------------------------- Homing bullets
--- POOLING TRAP (verified previously): projectiles are pooled -> NotifyOnNewObject NEVER
--- fires per shot. instead hook the projectile BP's per-launch UFunctions (fire each time
--- the pool reactivates an actor) and dedup by ADDRESS+time (the pool reuses addresses).
--- basic ranged fire is HITSCAN (no projectile actor) so homing only affects weapon
--- projectile abilities (ArcBeam/Slug/etc). filter to OUR shots via GetInstigator. steer
--- via the standard UE homing fields on the movement comp (verified: bIsHomingProjectile /
--- HomingAccelerationMagnitude) + native SetHomingTarget (pcall'd). no target = flies straight.
-local PROJ_BASE = "/Game/Blueprints/Projectiles/WFProjectile_Base_BP.WFProjectile_Base_BP_C"
-local HOMING_ACCEL = 12000.0
-local homedProj = {} -- addr -> os.clock() of last home (pool reuses addresses)
-local function applyHoming(proj)
-    pcall(function()
-        if not state.homing or settling() then return end -- skip during teardown (AV)
-        if not (proj and proj:IsValid()) then return end
-        local pawn = getPawn(); if not pawn then return end
-        local inst = nil
-        pcall(function() inst = proj:GetInstigator() end)
-        if not (inst and inst:IsValid()) then return end
-        if addrOf(inst) ~= addrOf(pawn) then return end -- only home OUR shots
-        local target = getSoftTarget(pawn); if not target then return end
-        pcall(function() proj:SetHomingTarget(target) end)
-        local mc = nil
-        pcall(function() mc = proj.ProjectileMovementComponent end)
-        if not (mc and mc:IsValid()) then pcall(function() mc = proj.MovementComponent end) end
-        if mc and mc:IsValid() then
-            pcall(function() mc.bIsHomingProjectile = true end)
-            pcall(function() mc.HomingAccelerationMagnitude = HOMING_ACCEL end)
-            pcall(function()
-                local rc = target.RootComponent
-                if rc and rc:IsValid() then mc.HomingTargetComponent = rc end
-            end)
-        end
-    end)
-end
-local function onProjectileLaunch(self)
-    if not state.homing or settling() then return end -- skip projectile spawns during teardown
-    local proj = self:get()
-    local a = addrOf(proj)
-    if not a then return end
-    local now = os.clock()
-    if homedProj[a] and (now - homedProj[a]) < 0.5 then return end -- pool dedup
-    homedProj[a] = now
-    ExecuteWithDelay(30, function() ExecuteInGameThread(function() applyHoming(proj) end) end)
-end
--- the projectile hooks are registered in registerAll() (called on ClientRestart) so the
--- projectile BP class is actually loaded first - registering here at mod-init fails.
-
 -- ---------------------------------------------------------------- overlay state file
 -- consumed by the external overlay app (tools/overlay/WFQoL-Overlay.ps1).
 -- pure Lua io: safe to run any time, no engine access.
@@ -1026,9 +950,9 @@ local function writeState()
         local f = io.open(STATE_FILE, "w") or io.open(STATE_FILE_ABS, "w")
         if not f then error("cannot open " .. STATE_FILE) end
         f:write(string.format(
-            '{"chain":%s,"parry":%s,"sprint":%s,"reload":%s,"overlay":%s,"homing":%s,"sprintMode":"%s","combat":%s,"lastParry":"%s","incoming":"%s","incomingKind":"%s","incomingTs":%d,"statParry":%d,"statParryFail":%d,"statSeen":%d,"ts":%d}',
+            '{"chain":%s,"parry":%s,"sprint":%s,"reload":%s,"overlay":%s,"sprintMode":"%s","combat":%s,"lastParry":"%s","incoming":"%s","incomingKind":"%s","incomingTs":%d,"statParry":%d,"statParryFail":%d,"statSeen":%d,"ts":%d}',
             tostring(state.chain), tostring(state.parry), tostring(state.sprint),
-            tostring(state.reload), tostring(state.overlay), tostring(state.homing), sprintMode,
+            tostring(state.reload), tostring(state.overlay), sprintMode,
             tostring(lastCombat == true), lastParryInfo,
             incoming.name, incoming.kind, incoming.ts,
             stat.parry, stat.parryFail, stat.seen, os.time()))
@@ -1102,7 +1026,6 @@ end)
 -- ---------------------------------------------------------------- hooks
 local pending = {}
 local registered = {}
-local homingHooked = false
 
 -- launch the external overlay when the game starts (once). the overlay
 -- self-exits when our heartbeat goes stale, so it lives and dies with the
@@ -1160,20 +1083,6 @@ local function registerAll()
     tryHook("/Game/Blueprints/GameplayCueNotifies/Ability/2HR/GCNA_2HR_ActiveReload_Fail.GCNA_2HR_ActiveReload_Fail_C:K2_HandleGameplayCue", function()
         log("reload: FAIL cue (should be impossible - report this)")
     end)
-    -- homing: projectile pool per-launch hooks. registered here (not via tryHook) because
-    -- some candidate fns don't exist -> tryHook would retry them in `pending` forever.
-    -- guarded by homingHooked so once one takes we stop. runs on ClientRestart when the
-    -- projectile BP is loaded (fails silently at mod-init before the world exists).
-    if not homingHooked then
-        for _, fn in ipairs({ "ReceiveBeginPlay", "ComputeInitialSpeed", "FindTargetActor" }) do
-            pcall(function()
-                if RegisterHook(PROJ_BASE .. ":" .. fn, onProjectileLaunch) then
-                    homingHooked = true
-                    log("homing: hooked projectile %s (pooled, deduped)", fn)
-                end
-            end)
-        end
-    end
 end
 
 registerAll()
@@ -1265,4 +1174,4 @@ RegisterKeyBind(Key.F5, function()
     end)
 end)
 
-log("loaded - F6 sprint / F7 chain / F8 parry / F9 reload / INS overlay / Homing ON")
+log("loaded - F6 sprint / F7 chain / F8 parry / F9 reload / INS overlay")
