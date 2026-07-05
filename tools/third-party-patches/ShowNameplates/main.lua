@@ -44,21 +44,38 @@ local function setPct(np, name, pct)
     end)
 end
 
--- drive ONE player nameplate from its own owner: force the health + stamina meters visible
--- and push the owner's current values. self and every teammate flow through here, each
--- reading ITS OWN owner -> MP-correct, no local-HUD dependency, no cross-contamination.
-local function driveNameplate(np)
+-- cheap, safe pointer read (returns the address value; no object-internal deref, so it is
+-- safe even on a transient/remote owner)
+local function addrOf(o)
+    local ok, a = pcall(function() return o:GetAddress() end)
+    return ok and a or nil
+end
+
+-- the LOCAL player's pawn, directly (never iterates remote pawns)
+local function localPawn()
+    local ok, p = pcall(function()
+        local UEHelpers = require("UEHelpers")
+        return UEHelpers:GetPlayerController().Pawn
+    end)
+    if ok and p and p:IsValid() then return p end
+    return nil
+end
+
+-- drive ONE player nameplate. VISIBILITY is forced for EVERYONE (self + teammates) - a
+-- pure widget toggle, no owner-ASC read, safe; re-asserted each tick via the widget's
+-- INTENDED toggles (not raw SetVisibility) to counter its own re-hide -> fixes flicker.
+-- VALUES (health/stamina) are pushed ONLY for the LOCAL player: GetHealth/StaminaPercentage
+-- reads the owner's ability-system, and a REMOTE teammate's ASC can be null/unresolved
+-- client-side -> native access violation (crash on MP join) that pcall CANNOT catch.
+-- teammates' HEALTH self-drives natively once the meter is visible; their stamina is
+-- best-effort (meter shown, fill left to the game).
+local function driveNameplate(np, lpAddr)
     if not (np and np:IsValid()) then return end
     local owner = np.AttachedOwnerActor
     if not (owner and owner:IsValid()) then return end
-    -- the game hides the local player's own health meter (shown on the HUD instead) and
-    -- the stamina meter; re-assert every tick via the widget's INTENDED toggles (not raw
-    -- SetVisibility) to counter its own re-hide -> fixes the flicker.
     pcall(function() np:SetHealthMeterVisibility(true) end)
     pcall(function() np:SetStaminaMeterVisibility(true) end)
-    -- HEALTH: the widget self-drives it off the owner's attribute set once visible (native
-    -- OnHealthUpdated); push the current value too so it is populated immediately. these
-    -- are the widget's OWN getters (same code the game runs) - as safe as the game itself.
+    if not lpAddr or addrOf(owner) ~= lpAddr then return end -- remote nameplate: visibility only
     pcall(function()
         local ok, pct = np:GetHealthPercentage(owner)
         if ok and pct then
@@ -66,8 +83,6 @@ local function driveNameplate(np)
             setPct(np, "PlayerLastHealthBar", pct)
         end
     end)
-    -- STAMINA: no native update event exists -> push every tick. a remote teammate may not
-    -- replicate stamina (Success=false) -> then leave the bar as-is, do not blank it.
     pcall(function()
         local ok, pct = np:GetStaminaPercentage(owner)
         if ok and pct then setPct(np, "characterStaminaFill", pct) end
@@ -93,8 +108,10 @@ LoopAsync(200, function()
     if settling() then return false end
     ExecuteInGameThread(function()
         pcall(function()
+            local lp = localPawn()
+            local lpAddr = lp and addrOf(lp) or nil
             for _, np in pairs(FindAllOf("UI_NameplateWidget_Player_C") or {}) do
-                if isReal(np) then driveNameplate(np) end
+                if isReal(np) then driveNameplate(np, lpAddr) end
             end
         end)
     end)
