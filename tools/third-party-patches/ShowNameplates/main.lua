@@ -38,6 +38,19 @@ local function setPct(np, name, pct)
     end)
 end
 
+-- reveal a sub-widget directly (ESlateVisibility 0 = Visible). the widget's own
+-- SetHealthMeterVisibility/SetStaminaMeterVisibility toggles proved unreliable solo; raw
+-- SetVisibility on the bar widgets is the method that actually shows self health/stamina.
+local function showWidget(np, name)
+    pcall(function()
+        local w = np[name]
+        if w and w:IsValid() then w:SetVisibility(0) end
+    end)
+end
+
+local svbLogged = false -- one-shot diag: player ShouldBeVisible fired
+local drove = false     -- one-shot diag: driveSelf succeeded (capture + HUD resolve OK)
+
 -- safe pointer read (address value only, no object-internal deref -> safe on any owner)
 local function addrOf(o)
     local ok, a = pcall(function() return o:GetAddress() end)
@@ -89,6 +102,15 @@ local function driveSelf()
     setPct(np, "PlayerLastHealthBar",      healthP)  -- damage trail
     setPct(np, "PlayerHealthBar_Additive", shieldP)  -- shield overlay
     setPct(np, "characterStaminaFill",     staminaP) -- stamina fill
+    -- raw-reveal the bars too (the meter-visibility toggles proved unreliable solo)
+    showWidget(np, "PlayerHealthBar")
+    showWidget(np, "PlayerLastHealthBar")
+    showWidget(np, "PlayerHealthBar_Additive")
+    showWidget(np, "characterStaminaFill")
+    if not drove then
+        drove = true
+        print(string.format("[ShowNameplates] self drive OK: hp=%.2f shield=%.2f stam=%.2f\n", healthP or -1, shieldP or -1, staminaP or -1))
+    end
 end
 
 local function installHooks()
@@ -110,7 +132,11 @@ local function installHooks()
         pcall(function()
             local np = self:get()
             if not (np and np:IsValid()) then return end
+            if not svbLogged then svbLogged = true; print("[ShowNameplates] player ShouldBeVisible firing\n") end
             np:SetHealthMeterVisibility(true) -- HEALTH for self AND allies
+            showWidget(np, "PlayerHealthBar")
+            showWidget(np, "PlayerLastHealthBar")
+            showWidget(np, "PlayerHealthBar_Additive")
             -- capture the LOCAL nameplate once
             if not (selfNameplate and selfNameplate:IsValid()) then
                 local owner = np.AttachedOwnerActor
@@ -118,6 +144,7 @@ local function installHooks()
                     local lp = localPawn()
                     if lp and addrOf(owner) == addrOf(lp) then
                         selfNameplate = np
+                        print("[ShowNameplates] self nameplate captured\n")
                         driveSelf() -- populate immediately on capture
                     end
                 end
@@ -125,6 +152,7 @@ local function installHooks()
             -- STAMINA only on the LOCAL player's nameplate (allies get health only)
             if selfNameplate and selfNameplate:IsValid() and addrOf(np) == addrOf(selfNameplate) then
                 np:SetStaminaMeterVisibility(true)
+                showWidget(np, "characterStaminaFill")
             end
         end)
     end)

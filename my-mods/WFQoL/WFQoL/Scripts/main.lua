@@ -514,14 +514,8 @@ end
 --   tag:     inject Character.State.Generic.Sprinting loose tag
 --   speed:   write CharacterMovement.MaxWalkSpeed directly (x1.5)
 local MIN_SPEED_SQ = 100 * 100
-local sprintMode = "ability"
-local sprintTries = 0
-local tagInjected = false
-local tagTicks = 0
-local tagBaseline = nil
-local tagVerified = false
-local speedBoosted = false
-local origMaxWalk = nil
+local sprintMode = "real"  -- static now (only the real sprint ability); kept for overlay/diag
+local preloadTick = 0      -- throttles the per-tick weapon-swap parry preload
 local lastCombat = nil     -- raw InCombat tag (drives sprint gate + overlay, updated instantly)
 local loggedCombat = nil   -- last LOGGED combat state (debounced - tag flaps rapidly near enemies)
 local combatPendingSince = 0.0
@@ -595,19 +589,6 @@ local function getMount(pawn)
     return nil
 end
 
-local function stopSprintAssist(pawn, asc)
-    if tagInjected then
-        pcall(function() asc:RemoveGameplayTag(SPRINTING_TAG) end)
-        tagInjected = false
-        tagTicks = 0
-    end
-    if speedBoosted and origMaxWalk then
-        setMaxWalk(pawn, origMaxWalk)
-        speedBoosted = false
-    end
-    stopMountBoost()
-end
-
 LoopAsync(300, function()
     if not ready or settling() then return false end
     ExecuteInGameThread(function()
@@ -643,7 +624,10 @@ LoopAsync(300, function()
             -- name the equipped weapon's block ability + cost GE once per class
             -- (deduped). runs every tick so equipping a weapon logs it immediately,
             -- no combat needed - diagnostic to fill the static PRELOAD precisely.
-            if state.parry then
+            -- weapon-swap parry preload: throttled to ~every 10th tick (~3s) instead of a
+            -- native GetAbilityFromInputTag every 300ms tick (moderate perf trim).
+            preloadTick = (preloadTick + 1) % 10
+            if state.parry and preloadTick == 0 then
                 pcall(function() preloadAbilityGraph(asc:GetAbilityFromInputTag(BLOCK_TAG)) end)
             end
 
@@ -662,12 +646,6 @@ LoopAsync(300, function()
             -- RE-APPLIED every tick because the game periodically rewrites
             -- the mount's MaxWalkSpeed (the v5 start/stop jitter)
             if mount then
-                if tagInjected or speedBoosted then
-                    pcall(function() asc:RemoveGameplayTag(SPRINTING_TAG) end)
-                    tagInjected = false
-                    if speedBoosted and origMaxWalk then setMaxWalk(pawn, origMaxWalk) end
-                    speedBoosted = false
-                end
                 local addr = addrOf(mount)
                 if mountBoostAddr and mountBoostAddr ~= addr then stopMountBoost() end
 
@@ -697,60 +675,17 @@ LoopAsync(300, function()
                 end
                 return
             end
-            stopMountBoost() -- just dismounted
+            stopMountBoost() -- on foot (or just dismounted)
 
-            -- ALWAYS auto-run when moving, in OR out of combat (user accepts the stamina
-            -- drain). was gated by `not inCombat`; that gate is gone now.
-            local shouldSprint = state.sprint and velSq(pawn) >= MIN_SPEED_SQ
-            if not shouldSprint then
-                stopSprintAssist(pawn, asc)
-                return
-            end
-
-            if ascHasTag(asc, SPRINTING_TAG) and not tagInjected then
-                sprintTries = 0 -- real sprint is running
-                return
-            end
-
-            if sprintMode == "ability" then
+            -- ON FOOT: only the REAL sprint. the moment you're moving (W), activate
+            -- GA_Player_Sprint (the ability bound to Input.Sprint) - the game runs its real
+            -- sprint (anim / stamina / state). re-activating each tick keeps it going while
+            -- moving; TryActivate is a cheap no-op when it's already active. NO fake speed
+            -- hacks or fallbacks - if the ability is inert in some content it just does
+            -- nothing, instead of the old direct-MaxWalkSpeed ping-pong that spammed + tanked fps.
+            if state.sprint and velSq(pawn) >= MIN_SPEED_SQ then
                 local sprintClass = getSprintClass()
-                if sprintClass then
-                    asc:TryActivateAbilityByClass(sprintClass, true)
-                    sprintTries = sprintTries + 1
-                    if sprintTries >= 5 then
-                        sprintMode = "tag"
-                        log("sprint: ability path inert, trying tag injection")
-                    end
-                end
-            elseif sprintMode == "tag" then
-                if not tagInjected then
-                    tagBaseline = maxWalk(pawn)
-                    pcall(function() asc:AddUniqueGameplayTag(SPRINTING_TAG) end)
-                    tagInjected = true
-                    tagTicks = 0
-                else
-                    tagTicks = tagTicks + 1
-                    if tagTicks == 3 and not tagVerified then
-                        local now = maxWalk(pawn)
-                        if tagBaseline and now and now > tagBaseline + 1 then
-                            tagVerified = true
-                            log("sprint: tag injection works (walk %.0f -> %.0f)", tagBaseline, now)
-                        else
-                            stopSprintAssist(pawn, asc)
-                            sprintMode = "speed"
-                            log("sprint: tag inert (walk stuck at %s), using direct speed", tostring(now))
-                        end
-                    end
-                end
-            else -- speed mode
-                if not speedBoosted then
-                    origMaxWalk = maxWalk(pawn)
-                    if origMaxWalk then
-                        setMaxWalk(pawn, origMaxWalk * 1.5)
-                        speedBoosted = true
-                        log("sprint: direct speed %.0f -> %.0f", origMaxWalk, origMaxWalk * 1.5)
-                    end
-                end
+                if sprintClass then asc:TryActivateAbilityByClass(sprintClass, true) end
             end
         end)
         if not ok then logErrorOnce("sprint", err) end
