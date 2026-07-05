@@ -64,6 +64,12 @@ local pawnRef = nil
 local SETTLE_SECS = 1.5
 local transitionAt = 0.0
 local function settling() return (os.clock() - transitionAt) < SETTLE_SECS end
+-- open-world streaming / zone travel swaps the pawn WITHOUT firing ClientRestart,
+-- so the settle gate above never armed for those loads and our game-thread loops
+-- kept driving torn-down actors (suspected perma-load cause). track the pawn
+-- address in the sprint loop; any change = a transition we got no ClientRestart
+-- for -> arm the settle gate the same way.
+local lastPawnAddr = nil
 
 local function getPawn()
     if pawnRef and pawnRef:IsValid() then return pawnRef end
@@ -225,6 +231,7 @@ end
 local abilityGraphPreloaded = {}
 local function preloadAbilityGraph(ability)
     if not ability or not ability:IsValid() then return end
+    if settling() then return end -- never sync-LoadAsset in a transition window (retries after settle)
     local ok, key = pcall(function() return ability:GetClass():GetFName():ToString() end)
     if not ok or not key or abilityGraphPreloaded[key] then return end
     abilityGraphPreloaded[key] = true
@@ -546,6 +553,16 @@ LoopAsync(300, function()
             if settling() then return end
             local pawn = getPawn()
             if not pawn then return end
+            -- transition detection (open-world streaming doesn't fire ClientRestart):
+            -- a changed pawn address means actors were rebuilt; arm the settle gate
+            -- and skip this tick so we don't drive half-constructed movement/ASC
+            -- through a loading screen (perma-load guard).
+            local pa = addrOf(pawn)
+            if pa and pa ~= lastPawnAddr then
+                local firstSeen = (lastPawnAddr == nil)
+                lastPawnAddr = pa
+                if not firstSeen then transitionAt = os.clock(); return end
+            end
             local asc = getASC(pawn)
             if not asc then return end
 
@@ -876,6 +893,13 @@ end
 -- stutters with what's happening and tune Engine.ini. cheap: just clock math.
 local perfLastTick = os.clock()
 local perfLastLog = 0.0
+-- game-thread freeze fingerprint: a perma-load / native hang freezes the GAME
+-- thread but NOT UE4SS's async loops, so it leaves no crash and no lua error - the
+-- log just stops. this watchdog (async thread) pings the game thread each tick; if
+-- several pings go unanswered while the watchdog keeps ticking, the game thread is
+-- frozen. log it once so the NEXT perma-load leaves a fingerprint (base-game stream
+-- hang vs a mod hang). re-arms after a normal (finite) zone load recovers.
+local gtBeat, gtAck, gtFrozenLogged = 0, 0, false
 LoopAsync(1000, function()
     writeState()
     local now = os.clock()
@@ -884,6 +908,16 @@ LoopAsync(1000, function()
     if dt > 2.0 and now - perfLastLog > 10 then
         perfLastLog = now
         log("perf: hitch %.1fs (combat=%s) - engine.ini tuning candidate", dt, tostring(lastCombat == true))
+    end
+    gtBeat = gtBeat + 1
+    local myBeat = gtBeat
+    ExecuteInGameThread(function() gtAck = myBeat end)
+    local behind = gtBeat - gtAck
+    if behind >= 6 and not gtFrozenLogged then
+        gtFrozenLogged = true
+        log("GAME THREAD FROZEN ~%ds: async watchdog alive but game thread not responding (perma-load / native hang, no lua error)", behind)
+    elseif behind < 3 then
+        gtFrozenLogged = false -- recovered (normal zone load), re-arm
     end
     return false
 end)
