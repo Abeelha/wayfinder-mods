@@ -57,7 +57,7 @@ local ACCESSORY_CURVE = {
 
 
 -- CONFIG
-local debug = true -- Enabled debug logging (WFQoL: on to trace auto-sort)
+local debug = false -- WFQoL: off again (auto-sort confirmed; per-item spam added freeze pressure)
 
 
 -- Text Strings
@@ -255,14 +255,30 @@ function FlagItems(PlayerInventoryComponent)
     end
 end
 
+-- BULK-BURST GUARD: a full-inventory sync (menu open / MP join / reward claim)
+-- fires CLIENT_NotifyItemAdded for HUNDREDS of items at once. processing them all
+-- synchronously - each matching weapon does RegisterHook + SERVER_TryApplyItemFlags
+-- (a server RPC, round-trips to the host in MP) + UnregisterHook - FREEZES the game
+-- thread. cap auto-sorts per 1s window; the overflow is sorted by a manual
+-- RunSmartSort (F10 console) which the user opts into (the mod warns it may hitch).
+local burstCount, burstStart = 0, 0
+local BURST_CAP = 12
 RegisterHook("/Script/Wayfinder.PlayerInventoryComponent:CLIENT_NotifyItemAdded",
     function(_, ItemEntry)
-        Log("CLIENT_NotifyItemAdded fired")
+        local now = os.clock()
+        if now - burstStart > 1.0 then burstStart = now; burstCount = 0 end
+        burstCount = burstCount + 1
+        if burstCount > BURST_CAP then
+            if burstCount == BURST_CAP + 1 then
+                print("[SmartSort] bulk item burst - auto-sort paused (run RunSmartSort to sort all)\n")
+            end
+            return
+        end
         local ok, err = pcall(function()
             local PlayerInventoryComponent = FindFirstOf("PlayerInventoryComponent");
             FlagItem(PlayerInventoryComponent, ItemEntry["Handle"])
         end)
-        if not ok then Log(string.format("auto-sort ERROR: %s", tostring(err))) end
+        if not ok then print(string.format("[SmartSort] auto-sort ERROR: %s\n", tostring(err))) end
     end)
 
 RegisterConsoleCommandHandler("RunSmartSort", function(FullCommand, Parameters, OutputDevice)
