@@ -382,7 +382,7 @@ local function sortOwnedItems(pic)
         enqueueFlag(pic, it.entry.Handle, desired)
         if desired == 0 then cleared = cleared + 1 else marked = marked + 1 end
     end
-    for _, list in pairs(groups) do
+    for key, list in pairs(groups) do
         if #list == 1 then
             want(list[1], 0) -- UNIQUE: keep, clear any stale mark
         else
@@ -397,6 +397,15 @@ local function sortOwnedItems(pic)
                 end
                 if better then bR = it.rarity; bE = it.exp; keepIdx = i end
             end
+            -- diag: reveals WHY a dupe wasn't marked - flag=2 (favorite) or eq=true (equipped)
+            -- both block marking; a dupe you expected here showing up as a lone group instead
+            -- means it has a different RowName (not grouped). one line per dupe group.
+            local dbg = {}
+            for i, it in ipairs(list) do
+                dbg[#dbg + 1] = string.format("[%d exp=%d flag=%d eq=%s%s]",
+                    i, it.exp, it.cur, tostring(it.equipped), i == keepIdx and " KEEP" or "")
+            end
+            print(string.format("[SmartSort] group '%s' n=%d %s\n", key, #list, table.concat(dbg, " ")))
             for i, it in ipairs(list) do
                 if i == keepIdx then want(it, 0)             -- keeper: keep
                 elseif it.cat == "echo" then want(it, 4)     -- dust every other echo dupe

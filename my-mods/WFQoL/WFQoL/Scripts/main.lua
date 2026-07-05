@@ -514,7 +514,7 @@ end
 --   tag:     inject Character.State.Generic.Sprinting loose tag
 --   speed:   write CharacterMovement.MaxWalkSpeed directly (x1.5)
 local MIN_SPEED_SQ = 100 * 100
-local sprintMode = "speed" -- foot: direct MaxWalkSpeed cap (real ability is inert); mount: same
+local sprintMode = "real"  -- foot: game's own WFLocomotionComponent BeginSprint/EndSprint
 local preloadTick = 0      -- throttles the per-tick weapon-swap parry preload
 local lastCombat = nil     -- raw InCombat tag (drives sprint gate + overlay, updated instantly)
 local loggedCombat = nil   -- last LOGGED combat state (debounced - tag flaps rapidly near enemies)
@@ -577,21 +577,17 @@ local function stopMountBoost()
     end
 end
 
--- ON-FOOT sprint uses the SAME proven direct-MaxWalkSpeed cap as the mount. the real
--- GA_Player_Sprint is input-HELD: activating it by class fires + ends instantly = inert on
--- foot (log confirmed zero on-foot sprint). baseline captured ONCE per pawn address,
--- restored on combat / sprint-off.
-local footBaselines = {}
-local footBoostRef = nil
-local footBoostAddr = nil
-local function stopFootBoost()
-    if footBoostRef then
-        local ref = footBoostRef
-        local base = footBoostAddr and footBaselines[footBoostAddr]
-        if base then setMaxWalk(ref, base) end
-        footBoostRef = nil
-        footBoostAddr = nil
-    end
+-- ON-FOOT sprint = the game's OWN sprint (WFLocomotionComponent:BeginSprint/EndSprint):
+-- real anim/stamina/speed, no MaxWalkSpeed hacks. the component lives at
+-- pawn.LocomotionComponent (verified in the object dump).
+local function getLoco(pawn)
+    local ok, c = pcall(function() return pawn.LocomotionComponent end)
+    if ok and c and c:IsValid() then return c end
+    return nil
+end
+local function isSprinting(loco)
+    local ok, v = pcall(function() return loco:IsSprintingLocomotionStateActive() end)
+    return ok and v or false
 end
 
 -- returns mount actor (or nil). IsMounted() native first, class-name fallback.
@@ -694,31 +690,20 @@ LoopAsync(300, function()
             end
             stopMountBoost() -- on foot (or just dismounted)
 
-            -- ON FOOT: hold the sprint speed cap directly, the SAME way the mount branch does
-            -- (which works + never spammed). GA_Player_Sprint activated by class is inert here
-            -- (input-held ability ends instantly). the cap is harmless at standstill (velocity
-            -- 0), so the moment you press W you're already at sprint speed = insta-sprint. out
-            -- of combat only; re-assert ONLY when the game drops it below target (no per-tick
-            -- write = no spam); ONE-shot baseline log.
-            local footAddr = addrOf(pawn)
-            if footBoostAddr and footBoostAddr ~= footAddr then stopFootBoost() end
-            if not state.sprint or lastCombat then
-                stopFootBoost()
-                return
-            end
-            local fbase = footAddr and footBaselines[footAddr]
-            if not fbase then
-                fbase = maxWalk(pawn)
-                if not fbase then return end
-                if footAddr then footBaselines[footAddr] = fbase end
-                log("sprint: foot baseline %.0f, boosting to %.0f", fbase, fbase * 1.5)
-            end
-            footBoostRef = pawn
-            footBoostAddr = footAddr
-            local ftarget = fbase * 1.5
-            local fcur = maxWalk(pawn)
-            if fcur and fcur < ftarget - 1 then
-                setMaxWalk(pawn, ftarget)
+            -- ON FOOT: the game's OWN sprint. BeginSprint the moment you're moving out of
+            -- combat, EndSprint otherwise. real anim/stamina/speed - NO MaxWalkSpeed writes.
+            -- guarded by IsSprintingLocomotionStateActive so Begin/End fire ONLY on a state
+            -- CHANGE = near-zero work per tick (no spam, no fps hit). velocity gate = you must
+            -- actually be moving (press W) to sprint.
+            local loco = getLoco(pawn)
+            if loco then
+                local wantSprint = state.sprint and not lastCombat and velSq(pawn) >= MIN_SPEED_SQ
+                local active = isSprinting(loco)
+                if wantSprint and not active then
+                    pcall(function() loco:BeginSprint() end)
+                elseif active and not wantSprint then
+                    pcall(function() loco:EndSprint() end)
+                end
             end
         end)
         if not ok then logErrorOnce("sprint", err) end
