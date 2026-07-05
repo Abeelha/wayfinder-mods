@@ -240,7 +240,13 @@ $timer.Add_Tick({
         }
     } else {
         $script:staleSince = $null; $offlineText.Visibility = "Collapsed"
-        if (-not $window.IsVisible) { $window.Show() }
+        # INS toggle: state.overlay=false hides the window (app stays alive polling,
+        # so pressing INS again re-shows it). null/true = shown (backward compatible).
+        if ($s.overlay -eq $false) {
+            if ($window.IsVisible) { $window.Hide() }
+        } elseif (-not $window.IsVisible) {
+            $window.Show()
+        }
     }
     # always-autosave: persist any position/size change (drag, resize, OS snap)
     $geo = "$($window.Left),$($window.Top),$($window.Width),$($window.Height)"

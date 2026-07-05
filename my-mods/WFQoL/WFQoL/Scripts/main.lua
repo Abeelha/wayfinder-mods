@@ -833,9 +833,9 @@ local function writeState()
         local f = io.open(STATE_FILE, "w") or io.open(STATE_FILE_ABS, "w")
         if not f then error("cannot open " .. STATE_FILE) end
         f:write(string.format(
-            '{"chain":%s,"parry":%s,"sprint":%s,"reload":%s,"sprintMode":"%s","combat":%s,"lastParry":"%s","ts":%d}',
+            '{"chain":%s,"parry":%s,"sprint":%s,"reload":%s,"overlay":%s,"sprintMode":"%s","combat":%s,"lastParry":"%s","ts":%d}',
             tostring(state.chain), tostring(state.parry), tostring(state.sprint),
-            tostring(state.reload), sprintMode,
+            tostring(state.reload), tostring(state.overlay), sprintMode,
             tostring(lastCombat == true), lastParryInfo, os.time()))
         f:close()
     end)
@@ -986,6 +986,18 @@ bindToggle(Key.F6, "sprint", "AutoSprint")
 bindToggle(Key.F7, "chain", "AutoChain")
 bindToggle(Key.F8, "parry", "AutoParry")
 bindToggle(Key.F9, "reload", "AutoReload")
+
+-- INS: show/hide the overlay window. flips state.overlay -> writeState; the overlay
+-- app hides/shows itself on this flag (stays alive polling, so INS re-shows it).
+pcall(function()
+    local insKey = Key.INS or Key.INSERT
+    if insKey then
+        bindToggle(insKey, "overlay", "Overlay")
+        log("overlay show/hide bound to INS")
+    else
+        log("overlay toggle: no INS key found in UE4SS Key enum")
+    end
+end)
 
 -- F5: one-shot diagnostic dump (mount debugging etc)
 RegisterKeyBind(Key.F5, function()
