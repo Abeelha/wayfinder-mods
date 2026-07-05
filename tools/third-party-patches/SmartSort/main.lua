@@ -346,12 +346,18 @@ local function ss_ruleFlag(entry, cat, lvl)
     return nil
 end
 
--- SORT OWNED ITEMS (overlay button): one pass over the whole inventory.
---   DUPLICATES (same item id, >1 copy) -> favorite the HIGHEST-level copy, junk the rest.
---     re-running also de-favorites a stale best when a higher copy exists, so only the
---     current best stays favorited (no favorite stacking).
---   UNIQUE items -> apply the config level/rarity junk + favorite rules.
--- all flag ops go through the batched queue (no freeze). marks only - never sells.
+-- SORT OWNED ITEMS (overlay button): idempotent, self-correcting pass over the inventory.
+-- for each item it computes the DESIRED mark and applies it only if it DIFFERS from the
+-- current one - so re-clicking SORT also CLEARS stale/wrong marks (un-dusts what should not
+-- be dusted), no manual deselect needed. MARKS ONLY, never sells. rules:
+--   * FAVORITED (flag 2) + equipped items: never touched (respect the player's choice).
+--   * UNIQUE (single copy): never junked -> desired NONE (clears any stale mark).
+--   * WEAPON/ACCESSORY duplicates: keep the highest-LEVEL copy (NONE), junk the rest.
+--   * ECHO duplicates: keep the highest-RARITY (then level) copy (NONE); of the rest, DUST
+--     only the low-rarity ones (common/uncommon) and keep rare+ (NONE). higher-rarity
+--     echoes NEVER get dusted.
+-- favorites are left entirely to the player (never auto-applied). flag 0 = no flags.
+local ECHO_DUST_MAX_RARITY = 2 -- dust only common(1)/uncommon(2) echo dupes; keep rare+
 local function sortOwnedItems(pic)
     local items = pic:GetItemsByTag({ GameplayTags = {}, ParentTags = {} })
     local groups = {}
@@ -360,34 +366,47 @@ local function sortOwnedItems(pic)
         pcall(function()
             local cat = ss_category(entry); if not cat then return end
             local key = ss_key(entry); if not key then return end
+            local rarity, cur, equipped = 0, 0, false
+            pcall(function() rarity = entry.Spec.echoRarity or 0 end)
+            pcall(function() cur = entry.Spec.ItemFlags or 0 end)
+            pcall(function() equipped = (entry.Spec.bEquipped or entry.Spec.Equipped) and true or false end)
             groups[key] = groups[key] or {}
-            table.insert(groups[key], { entry = entry, cat = cat, lvl = ss_level(entry, cat) })
+            table.insert(groups[key], { entry = entry, cat = cat, lvl = ss_level(entry, cat), rarity = rarity, cur = cur, equipped = equipped })
         end)
     end
-    local queued, favN, junkN = 0, 0, 0
+    local marked, cleared = 0, 0
+    local function want(it, desired)
+        if it.cur == 2 or it.equipped then return end -- never override a favorite / equipped item
+        if desired == it.cur then return end          -- already correct -> nothing to do
+        enqueueFlag(pic, it.entry.Handle, desired)
+        if desired == 0 then cleared = cleared + 1 else marked = marked + 1 end
+    end
     for _, list in pairs(groups) do
-        if #list > 1 then
-            local bestIdx, bestLvl = 1, -1
-            for i, it in ipairs(list) do if it.lvl > bestLvl then bestLvl = it.lvl; bestIdx = i end end
-            for i, it in ipairs(list) do
-                local flag = (i == bestIdx) and 2 or ((it.cat == "echo") and 4 or 1)
-                enqueueFlag(pic, it.entry.Handle, flag); queued = queued + 1
-                if flag == 2 then favN = favN + 1 else junkN = junkN + 1 end
-            end
+        if #list == 1 then
+            want(list[1], 0) -- UNIQUE: keep, clear any stale mark
         else
-            -- UNIQUE (single copy) -> NEVER junked. always keep >=1 of every item, even if
-            -- lower level than your gear. also CLEAR a stale junk mark left by an earlier
-            -- sort (self-heal on re-SORT); favorites (2) and already-neutral (0) are left
-            -- alone. flag 0 = no flags.
-            local it = list[1]
-            local ff = nil
-            pcall(function() ff = it.entry.Spec.ItemFlags end)
-            if ff == 1 or ff == 4 then
-                enqueueFlag(pic, it.entry.Handle, 0); queued = queued + 1
+            local keepIdx, bR, bL = 1, -1, -1
+            for i, it in ipairs(list) do
+                local better
+                if it.cat == "echo" then
+                    better = (it.rarity > bR) or (it.rarity == bR and it.lvl > bL)
+                else
+                    better = (it.lvl > bL)
+                end
+                if better then bR = it.rarity; bL = it.lvl; keepIdx = i end
+            end
+            for i, it in ipairs(list) do
+                if i == keepIdx then
+                    want(it, 0)                              -- keeper: keep, clear any mark
+                elseif it.cat == "echo" then
+                    want(it, (it.rarity <= ECHO_DUST_MAX_RARITY) and 4 or 0) -- dust low-rarity echo dupes only
+                else
+                    want(it, 1)                              -- weapon/accessory dupe: junk
+                end
             end
         end
     end
-    print(string.format("[SmartSort] SORT: %d items scanned, %d queued (%d fav, %d junk)\n", #items, queued, favN, junkN))
+    print(string.format("[SmartSort] SORT: %d items, %d marked, %d cleared\n", #items, marked, cleared))
     processQueue()
 end
 
