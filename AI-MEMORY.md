@@ -305,3 +305,14 @@ Per-repo memory. Append-only, concise. Format: `### YYYY-MM-DD - Category - entr
 - FIX C (main.lua): preloadAbilityGraph now bails `if settling() then return` before any sync LoadAsset (belt-and-suspenders; our rule = never sync-LoadAsset in a transition).
 - Log was otherwise clean: parry working (many "parry vs X"), nameplates fine. "no timing for X" lines (GA_AI_Atk_180_R_ALC, Flowing_Bubble/Water_Ring, Flea_Latch, Bandit_Brawler_Catalyst_Punch) use 0.60s default - most don't connect anyway, not worth guessing timings.
 - Deployed + committed 78393e5. NEEDS IN-GAME TEST: if it perma-loads again, check UE4SS.log for "GAME THREAD FROZEN" (= confirms hang, tells us thread state) and whether the streaming-settle stopped mod activity during the load.
+
+## 2026-07-05 — clean session + parry-default tune (v43)
+- RELAUNCH after v42: CLEAN. Ran 03:29->04:31 (>1h), multiple zone transitions all COMPLETED (pawn: lines 03:32/03:35/03:40/03:50/04:31), mount boost worked, parries landing. NO "GAME THREAD FROZEN", NO errors, NO perf hitch, NO perma-load. v42 streaming-settle held (or base-game bug didn't recur).
+- RESOLVED open question: MINIBOSSES fire GA_AI_Base -> autoparry SEES boss/miniboss attacks (log: GA_Gloom_Farseer_SoI_Miniboss_Atk_Meteor_Cast_C seen+scheduled). The "boss doesn't derive from GA_AI_Base" worry is DISPROVEN for minibosses. (Full raid bosses still untested.)
+- UNTIMED ATTACKS ARE NOT STATICALLY FIXABLE (investigated via Atlas/Content dump, 135k jsons):
+  * GA_AI_Atk_Melee_*_ALC / GA_AI_Atk_180_*_ALC (the MOST COMMON enemy melee): CDO has Montage=null + "Get Montage From ALC"=true + "ALC Montage Key"={RowName Atk_Basic}. Montage resolved at RUNTIME per-enemy from the enemy's AnimLayerController datatable -> different montage/timing per enemy -> a GA-class-keyed table (timings.lua) physically can't hold one value. Only the runtime default applies.
+  * GA_Gloom_Farseer_Atk_Channel/Blast/Meteor: HAVE a montage but NO weapon-trace notify (ranged Beam/projectile casts). No melee hit-time exists; they fail willConnect (out of range) anyway. Don't try to time ranged casts.
+  * => extract-attack-timings.py correctly emits nothing for these; DON'T hand-add guessed numbers.
+- TUNE: DEFAULT_HIT 0.6 -> 0.8s. Empirical median of the 295 real timings = 1.0s, melee-band(0.15-1.6) median 0.94; old 0.60 fired untimed parries ~0.35s TOO EARLY. 0.8 = near light-melee cluster (0.65-0.85), late enough for slow swings, still early. Only affects UNTIMED attacks (measured ones use exact timings.lua).
+- CLEANUP: combat-state log debounce. InCombat tag micro-flaps near enemies (199 flips/session, e.g. 8 in 7s). Now lastCombat (raw) still drives sprint gate + overlay instantly; only LOG fires after state settles >=0.75s (loggedCombat/combatPendingSince). Cuts log noise, zero behavior change.
+- Committed. All in main.lua. No in-game test blocker; parry-default change is felt only on untimed attacks.
