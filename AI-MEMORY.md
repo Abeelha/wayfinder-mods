@@ -346,3 +346,9 @@ Per-repo memory. Append-only, concise. Format: `### YYYY-MM-DD - Category - entr
 - KEPT: Homing (uses getSoftTarget - stays), telegraph (incoming, now always kind="parry"), session stats (parry/parryFail/seen). Overlay: removed DODGE/HEAL/FACE rows, footer now "parries:N seen:N | mode".
 - APIs still valid if ever re-added (in reference memory): dodge=GA_Player_PrepDodge_C/Input.Combat.Dodge, heal=GA_ConsumeItem_Base_C, face=SetControlRotation. Deployed 4fd8f20.
 - SIDEQUEST (not mod): set up OptiScaler for FSR2->FSR4.1.1 on the RX 9070 XT (proxy=dxgi.dll NOT dwmapi/UE4SS; ShortcutKey=0x23 End off INS; Dx12Upscaler=fsr31 auto-loads FSR4 on RDNA4; DLSS-spoof via fakenvapi). Working. Then perf: game GPU-bound on Ultra (93% GPU/41% CPU, 1% low 34) -> retuned game Engine.ini (%LOCALAPPDATA%/Wayfinder/Saved/Config/WindowsNoEditor/Engine.ini, [SystemSettings] overrides menu): shadows 2/1024/2cascades, effects 2, fog cheaper, SSR 1, view 3. Advise FSR4 Quality->Balanced + FreeSync + cap 120 for stable fps.
+
+## 2026-07-05 — AutoChain heavy attacks (v47)
+- Extended AutoChain (F7) to also chain HEAVY melee attacks. Hold M1 = light combo (Attack1), hold M2 = heavy combo (Attack2). Same toggle, one loop.
+- VERIFIED (dump WFPlayerCharacter_Base.json + Input.ini): Attack2 = InpActEvt_Attack2_K2Node_InputActionEvent_40 (press) / _41 (release), bound to RightMouseButton. Mirrors Attack1 _36/_37 (LMB).
+- IMPL: RMB const; m2Held + sendRelease2 vars; AutoChain loop injects Attack1 when m1Held AND/OR Attack2 when m2Held (game gates next swing by animation, 70ms tick just keeps combo flowing); Attack2 _40/_41 hooks in registerAll mirror Attack1 (injecting-guard so injected presses don't re-set m2Held; cache pawnRef on press). Deployed + committed.
+- NOTE: user's manual heavy attacks did NOT appear in UE4SS.log (mod wasn't hooking Attack2 yet) - the BP dump is the source of truth for input UFunction names, not the log.
