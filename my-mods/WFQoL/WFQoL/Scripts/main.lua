@@ -697,22 +697,26 @@ LoopAsync(300, function()
             -- guarded by IsSprintingLocomotionStateActive so Begin/End fire ONLY on a state
             -- CHANGE = near-zero work per tick (no spam, no fps hit). velocity gate = you must
             -- actually be moving (press W) to sprint.
+            -- ON FOOT: drive sprint by INJECTING the Sprinting gameplay tag - the native
+            -- OnSprintingTagChanged listener on WFLocomotionComponent applies the sprint speed
+            -- (the verified working lever). BeginSprint() alone was inert (diag: active=false)
+            -- because the locomotion state machine keys off the TAG, not the call - so we add the
+            -- tag THEN BeginSprint. add when moving out of combat, remove otherwise; state-change
+            -- guarded by ascHasTag = near-zero per-tick work.
             local loco = getLoco(pawn)
-            if loco then
-                local wantSprint = state.sprint and not lastCombat and velSq(pawn) >= MIN_SPEED_SQ
-                local active = isSprinting(loco)
-                if wantSprint and not active then
-                    pcall(function() loco:BeginSprint() end)
-                    if not locoLogged then
-                        locoLogged = true
-                        log("sprint: foot BeginSprint - active now=%s", tostring(isSprinting(loco)))
-                    end
-                elseif active and not wantSprint then
-                    pcall(function() loco:EndSprint() end)
+            local wantSprint = state.sprint and not lastCombat and velSq(pawn) >= MIN_SPEED_SQ
+            local hasTag = ascHasTag(asc, SPRINTING_TAG)
+            if wantSprint and not hasTag then
+                pcall(function() asc:AddUniqueGameplayTag(SPRINTING_TAG) end)
+                if loco then pcall(function() loco:BeginSprint() end) end
+                if not locoLogged then
+                    locoLogged = true
+                    log("sprint: foot tag+Begin - tag=%s active=%s",
+                        tostring(ascHasTag(asc, SPRINTING_TAG)), tostring(loco and isSprinting(loco)))
                 end
-            elseif not locoLogged then
-                locoLogged = true
-                log("sprint: foot NO LocomotionComponent on pawn")
+            elseif hasTag and not wantSprint then
+                pcall(function() asc:RemoveGameplayTag(SPRINTING_TAG) end)
+                if loco then pcall(function() loco:EndSprint() end) end
             end
         end)
         if not ok then logErrorOnce("sprint", err) end
