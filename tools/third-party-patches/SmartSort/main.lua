@@ -387,7 +387,16 @@ local function sortOwnedItems(pic)
             pcall(function() rarity = entry.Spec.echoRarity or 0 end)
             pcall(function() exp = entry.Spec.CurrentExp or 0 end)
             pcall(function() cur = entry.Spec.ItemFlags or 0 end)
-            pcall(function() equipped = (entry.Spec.bEquipped or entry.Spec.Equipped) and true or false end)
+            -- EQUIPPED (on THIS or ANY character): InventoryItemSpec.EquippedToSlotName is the
+            -- real field (no bEquipped/Equipped bool exists - the old read was always false).
+            -- set to a slot name when equipped anywhere, "None"/empty otherwise. the game blocks
+            -- selling equipped items (incl. equipped on another char) server-side, so we must
+            -- NOT mark them - skip = respect it, and stop re-enqueuing marks the game rejects.
+            pcall(function()
+                local sn = entry.Spec.EquippedToSlotName
+                local s = sn and sn:ToString() or "None"
+                equipped = (s ~= "None" and s ~= "")
+            end)
             groups[key] = groups[key] or {}
             table.insert(groups[key], { entry = entry, cat = cat, rarity = rarity, exp = exp, cur = cur, equipped = equipped })
         end)
