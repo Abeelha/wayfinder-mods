@@ -294,3 +294,139 @@ RegisterConsoleCommandHandler("RunSmartSort", function(FullCommand, Parameters, 
 
     return true
 end)
+
+-- ==================== WFQoL: dedup + overlay SORT button ====================
+-- BATCHED flag applier. SERVER_TryApplyItemFlags is a server RPC (round-trips to the host
+-- in MP); doing hundreds synchronously froze the game (why SmartSort was disabled). the
+-- owned-items sort ENQUEUES flag ops and drains a few per tick so the game thread never
+-- stalls.
+local flagQueue = {}
+local flagRunning = false
+local function processQueue()
+    if flagRunning then return end
+    flagRunning = true
+    local function step()
+        local n = 0
+        while #flagQueue > 0 and n < 8 do
+            local job = table.remove(flagQueue, 1)
+            pcall(function() applyTagToItem(job.pic, job.handle, job.flag) end)
+            n = n + 1
+        end
+        if #flagQueue > 0 then
+            ExecuteWithDelay(60, step)
+        else
+            flagRunning = false
+            print("[SmartSort] sort complete\n")
+        end
+    end
+    step()
+end
+local function enqueueFlag(pic, handle, flag)
+    table.insert(flagQueue, { pic = pic, handle = handle, flag = flag })
+end
+
+-- item helpers (mirror the field access FlagItem/handleApplyItemFlag already use)
+local function ss_category(entry)
+    local ok, t = pcall(function() return entry["Handle"]["Data"]["DataTable"]:GetFullName() end)
+    if not ok then return nil end
+    if existsInTable(t, ITEM_TYPES.Weapon) then return "weapon" end
+    if existsInTable(t, ITEM_TYPES.Accessory) then return "accessory" end
+    if existsInTable(t, ITEM_TYPES.Echo) then return "echo" end
+    return nil
+end
+local function ss_level(entry, cat)
+    local spec = entry.Spec
+    if cat == "echo" then return echoExpToLevel(spec.CurrentExp, spec.echoRarity) end
+    if cat == "weapon" then return expToLevel(spec.CurrentExp, WEAPON_CURVE) end
+    return expToLevel(spec.CurrentExp, ACCESSORY_CURVE)
+end
+local function ss_key(entry)
+    local ok, rn = pcall(function() return entry["Handle"]["Data"]["RowName"]:ToString() end)
+    return ok and rn or nil
+end
+-- config junk/favorite rule eval for a UNIQUE item -> flag (2 fav / 1 junk / 4 echo-junk) or nil
+local function ss_ruleFlag(entry, cat, lvl)
+    local favRules, junkRules, junkFlag
+    if cat == "weapon" then favRules = Rules.weaponFavoriteFilters; junkRules = Rules.weaponJunkFilters; junkFlag = 1
+    elseif cat == "accessory" then favRules = Rules.accessoryFavoriteFilters; junkRules = Rules.accessoryJunkFilters; junkFlag = 1
+    else favRules = Rules.echoFavoriteFilters; junkRules = Rules.echoJunkFilters; junkFlag = 4 end
+    local function match(rules)
+        for _, rule in ipairs(rules or {}) do
+            if rule.belowLevel and lvl <= rule.belowLevel then return true end
+            if rule.aboveLevel and lvl >= rule.aboveLevel then return true end
+            if rule.rarity then
+                local ok, has = pcall(function() return existsInTable(entry.Spec.echoRarity, rule.rarity) end)
+                if ok and has then return true end
+            end
+        end
+        return false
+    end
+    if match(favRules) then return 2 end
+    if match(junkRules) then return junkFlag end
+    return nil
+end
+
+-- SORT OWNED ITEMS (overlay button): one pass over the whole inventory.
+--   DUPLICATES (same item id, >1 copy) -> favorite the HIGHEST-level copy, junk the rest.
+--     re-running also de-favorites a stale best when a higher copy exists, so only the
+--     current best stays favorited (no favorite stacking).
+--   UNIQUE items -> apply the config level/rarity junk + favorite rules.
+-- all flag ops go through the batched queue (no freeze). marks only - never sells.
+local function sortOwnedItems(pic)
+    local items = pic:GetItemsByTag({ GameplayTags = {}, ParentTags = {} })
+    local groups = {}
+    for _, item in ipairs(items) do
+        local entry = item["Handle"]
+        pcall(function()
+            local cat = ss_category(entry); if not cat then return end
+            local key = ss_key(entry); if not key then return end
+            groups[key] = groups[key] or {}
+            table.insert(groups[key], { entry = entry, cat = cat, lvl = ss_level(entry, cat) })
+        end)
+    end
+    local queued, favN, junkN = 0, 0, 0
+    for _, list in pairs(groups) do
+        if #list > 1 then
+            local bestIdx, bestLvl = 1, -1
+            for i, it in ipairs(list) do if it.lvl > bestLvl then bestLvl = it.lvl; bestIdx = i end end
+            for i, it in ipairs(list) do
+                local flag = (i == bestIdx) and 2 or ((it.cat == "echo") and 4 or 1)
+                enqueueFlag(pic, it.entry.Handle, flag); queued = queued + 1
+                if flag == 2 then favN = favN + 1 else junkN = junkN + 1 end
+            end
+        else
+            local it = list[1]
+            local flag = ss_ruleFlag(it.entry, it.cat, it.lvl)
+            if flag then
+                enqueueFlag(pic, it.entry.Handle, flag); queued = queued + 1
+                if flag == 2 then favN = favN + 1 else junkN = junkN + 1 end
+            end
+        end
+    end
+    print(string.format("[SmartSort] SORT: %d items scanned, %d queued (%d fav, %d junk)\n", #items, queued, favN, junkN))
+    processQueue()
+end
+
+-- overlay command channel: the WFQoL overlay's SORT button writes smartsort-cmd.json {seq};
+-- on a NEW seq, run the owned-items sort. low-freq poll of a tiny file (no object scan).
+local SS_CMD_REL = "Mods/SmartSort/smartsort-cmd.json"
+local SS_CMD_ABS = "D:/SteamLibrary/steamapps/common/Wayfinder/Atlas/Binaries/Win64/Mods/SmartSort/smartsort-cmd.json"
+local lastSortSeq = nil
+LoopAsync(500, function()
+    pcall(function()
+        local f = io.open(SS_CMD_REL, "r") or io.open(SS_CMD_ABS, "r")
+        if not f then return end
+        local raw = f:read("*a"); f:close()
+        local seq = raw:match('"seq"%s*:%s*(%d+)')
+        if not seq then return end
+        if lastSortSeq == nil then lastSortSeq = seq; return end -- ignore the stale seq at load
+        if seq ~= lastSortSeq then
+            lastSortSeq = seq
+            print("[SmartSort] overlay SORT clicked - sorting owned items...\n")
+            local pic = FindFirstOf("PlayerInventoryComponent")
+            if pic and pic:IsValid() then pcall(function() sortOwnedItems(pic) end)
+            else print("[SmartSort] SORT: no inventory component yet\n") end
+        end
+    end)
+    return false
+end)

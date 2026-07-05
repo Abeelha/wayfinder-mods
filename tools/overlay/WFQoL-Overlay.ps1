@@ -146,6 +146,28 @@ foreach ($f in $features) {
     $script:rowMap[$f.Prop] = $state
 }
 
+# ---- SmartSort action button: writes smartsort-cmd.json -> SmartSort mod runs a sort on
+#      owned items (dedup + level/rarity junk). NOT a toggle; a momentary action. ----
+$script:ssCmdFile = Join-Path (Split-Path (Split-Path $StateFile)) "SmartSort\smartsort-cmd.json"
+$sortBtn = New-Object Windows.Controls.Border
+$sortBtn.Background = "#17222E"; $sortBtn.Height = 26; $sortBtn.Cursor = "Hand"; $sortBtn.Margin = "8,5,8,2"
+$sortBtn.BorderBrush = "#2C3A4A"; $sortBtn.BorderThickness = 1
+$sortTxt = New-Object Windows.Controls.TextBlock
+$sortTxt.Text = "SORT OWNED ITEMS"; $sortTxt.FontFamily = $FONT; $sortTxt.FontSize = 11; $sortTxt.FontWeight = "Bold"
+$sortTxt.Foreground = "#8FD6FF"; $sortTxt.HorizontalAlignment = "Center"; $sortTxt.VerticalAlignment = "Center"
+$sortBtn.Child = $sortTxt
+$sortBtn.Add_MouseEnter({ $this.Background = "#22384A" })
+$sortBtn.Add_MouseLeave({ $this.Background = "#17222E"; $this.Child.Text = "SORT OWNED ITEMS" })
+$sortBtn.Add_MouseLeftButtonUp({
+    try {
+        $seq = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        "{`"seq`":$seq}" | Set-Content -Path $script:ssCmdFile -Encoding ascii
+        $this.Child.Text = "SORTING..."
+        OLog "smartsort SORT clicked (seq $seq)"
+    } catch { OLog "smartsort cmd err: $_" }
+})
+[void]$rows.Children.Add($sortBtn)
+
 function Set-Row($prop, $on) {
     $t = $script:rowMap[$prop]
     if ($null -eq $t) { return }
