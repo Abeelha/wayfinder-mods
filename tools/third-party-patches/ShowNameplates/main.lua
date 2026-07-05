@@ -1,7 +1,8 @@
--- ShowNameplates - makes the PLAYER nameplates show health + stamina (self + co-op
--- teammates). Enemy nameplates are left ALONE (the game shows those by default). Only the
--- LOCAL player's own nameplate needs values pushed - the game hides your own health/stamina
--- meters (shown on the HUD instead); teammates' nameplates show health natively.
+-- ShowNameplates - PLAYER nameplates only. SELF nameplate shows health + stamina; ALLY
+-- (co-op teammate) nameplates show health ONLY (no stamina). Enemy nameplates are left
+-- ALONE (the game shows those by default). Only the LOCAL player's own nameplate needs
+-- values pushed - the game hides your own health/stamina meters (shown on the HUD instead);
+-- teammates' health self-drives natively once its meter is visible.
 --
 -- EVENT-DRIVEN: no polling loop, no per-tick FindAllOf object scan (that scan over ~135k
 -- objects 5x/sec was the fps killer). Work happens only inside the widget's own
@@ -109,8 +110,8 @@ local function installHooks()
         pcall(function()
             local np = self:get()
             if not (np and np:IsValid()) then return end
-            np:SetHealthMeterVisibility(true)
-            np:SetStaminaMeterVisibility(true)
+            np:SetHealthMeterVisibility(true) -- HEALTH for self AND allies
+            -- capture the LOCAL nameplate once
             if not (selfNameplate and selfNameplate:IsValid()) then
                 local owner = np.AttachedOwnerActor
                 if owner and owner:IsValid() then
@@ -120,6 +121,10 @@ local function installHooks()
                         driveSelf() -- populate immediately on capture
                     end
                 end
+            end
+            -- STAMINA only on the LOCAL player's nameplate (allies get health only)
+            if selfNameplate and selfNameplate:IsValid() and addrOf(np) == addrOf(selfNameplate) then
+                np:SetStaminaMeterVisibility(true)
             end
         end)
     end)
