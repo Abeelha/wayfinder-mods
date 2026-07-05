@@ -126,7 +126,9 @@ function applyTagToItem(PlayerInventoryComponent, itemHandle, flagToAPply)
         end)
 
 
-    PlayerInventoryComponent:SERVER_TryApplyItemFlags({}, flagToAPply)
+    if PlayerInventoryComponent and PlayerInventoryComponent:IsValid() then
+        PlayerInventoryComponent:SERVER_TryApplyItemFlags({}, flagToAPply)
+    end
 
     UnregisterHook("/Script/Wayfinder.PlayerInventoryComponent:SERVER_TryApplyItemFlags", pre0, post0)
 end
@@ -184,7 +186,8 @@ function handleApplyItemFlag(PlayerInventoryComponent, itemEntry, rules, levelCu
         end
 
         if rule.upgraded and isEcho then
-            if itemSpec.currentExp > itemSpec.startingExp then
+            local cur, start = itemSpec.CurrentExp, itemSpec.StartingExp
+            if cur and start and cur > start then -- nil-guarded: field may be absent (was nil>nil error)
                 hasTriggeredRule = true
             end
         end
@@ -280,12 +283,20 @@ end)
 -- in MP); doing hundreds synchronously froze the game (why SmartSort was disabled). the
 -- owned-items sort ENQUEUES flag ops and drains a few per tick so the game thread never
 -- stalls.
+-- teardown guard: on close / return-to-menu, stop touching the freeing inventory. the poll,
+-- the queue drain, and sortOwnedItems all check this. hook sets only a Lua flag = crash-safe.
+local tearing = false
+RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenu", function() tearing = true end)
+RegisterHook("/Script/Engine.PlayerController:ClientGameEnded", function() tearing = true end)
+RegisterHook("/Script/Engine.PlayerController:ClientRestart", function() tearing = false end)
+
 local flagQueue = {}
 local flagRunning = false
 local function processQueue()
     if flagRunning then return end
     flagRunning = true
     local function step()
+        if tearing then flagQueue = {}; flagRunning = false; return end -- world tearing down: drop pending
         local n = 0
         while #flagQueue > 0 and n < 8 do
             local job = table.remove(flagQueue, 1)
@@ -376,6 +387,7 @@ local function findInventory()
 end
 
 local function sortOwnedItems(pic)
+    if tearing or not (pic and pic:IsValid()) then return end
     local items = pic:GetItemsByTag({ GameplayTags = {}, ParentTags = {} })
     local groups = {}
     for _, item in ipairs(items) do
@@ -450,6 +462,7 @@ local SS_CMD_ABS = "D:/SteamLibrary/steamapps/common/Wayfinder/Atlas/Binaries/Wi
 local lastSortSeq = nil
 LoopAsync(500, function()
     pcall(function()
+        if tearing then return end -- don't launch a sort into a tearing-down world
         local f = io.open(SS_CMD_REL, "r") or io.open(SS_CMD_ABS, "r")
         if not f then return end
         local raw = f:read("*a"); f:close()

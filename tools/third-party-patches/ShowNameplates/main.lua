@@ -76,7 +76,10 @@ local function resolveHUD()
     for _, e in pairs(FindAllOf("HUD_PlayerMeters_C") or {}) do
         local ok, valid = pcall(function()
             if e:GetFName():ToString():sub(1, 9) == "Default__" then return false end -- skip CDO
+            -- require BOTH bars valid (not just shield) so a stale/unpopulated HUD instance
+            -- (whose .Percent defaults to 1.0) can't get picked and peg self HP full.
             return e.PlayerShieldBar and e.PlayerShieldBar:IsValid()
+                and e.PlayerHealthBar and e.PlayerHealthBar:IsValid()
         end)
         if ok and valid then hudMeters = e break end
     end
@@ -91,22 +94,37 @@ local function driveSelf()
     local np = selfNameplate
     if not (np and np:IsValid()) then return end
     if not resolveHUD() then return end
-    local ok, shieldP, healthP, staminaP = pcall(function()
-        return hudMeters.PlayerShieldBar.Percent,
-               hudMeters.PlayerHealthBar.Percent,
-               hudMeters.HUD_PlayerStaminaMeters.PlayerStaminaMeter.Percent
+    -- read HEALTH+SHIELD independently from STAMINA. stamina lives on a SEPARATE widget
+    -- (HUD_PlayerStaminaMeters.PlayerStaminaMeter) that can be nil - reading all three in ONE
+    -- pcall meant a nil stamina widget threw and killed the health/shield update too (the
+    -- HP-stuck-full + stamina-blank bug). each sub-widget is guarded on its own now.
+    local okHS, shieldP, healthP = pcall(function()
+        local hb = hudMeters.PlayerHealthBar
+        local sb = hudMeters.PlayerShieldBar
+        local h = (hb and hb:IsValid()) and hb.Percent or nil
+        local s = (sb and sb:IsValid()) and sb.Percent or nil
+        return s, h
     end)
-    if not ok then return end
-    setPct(np, "PlayerHealthBar",          healthP)  -- primary fill
-    setPct(np, "PlayerLastHealthBar",      healthP)  -- damage trail
-    setPct(np, "PlayerHealthBar_Additive", shieldP)  -- shield overlay
-    setPct(np, "characterStaminaFill",     staminaP) -- stamina fill
-    -- raw-reveal the bars too (the meter-visibility toggles proved unreliable solo)
-    showWidget(np, "PlayerHealthBar")
-    showWidget(np, "PlayerLastHealthBar")
-    showWidget(np, "PlayerHealthBar_Additive")
-    showWidget(np, "characterStaminaFill")
-    if not drove then
+    if okHS and healthP then
+        setPct(np, "PlayerHealthBar",     healthP) -- primary fill
+        setPct(np, "PlayerLastHealthBar", healthP) -- damage trail
+        showWidget(np, "PlayerHealthBar")
+        showWidget(np, "PlayerLastHealthBar")
+    end
+    if okHS and shieldP then
+        setPct(np, "PlayerHealthBar_Additive", shieldP) -- shield overlay
+        showWidget(np, "PlayerHealthBar_Additive")
+    end
+    local okS, staminaP = pcall(function()
+        local sm = hudMeters.HUD_PlayerStaminaMeters
+        sm = sm and sm.PlayerStaminaMeter
+        return (sm and sm:IsValid()) and sm.Percent or nil
+    end)
+    if okS and staminaP then
+        setPct(np, "characterStaminaFill", staminaP) -- stamina fill
+        showWidget(np, "characterStaminaFill")
+    end
+    if not drove and healthP then
         drove = true
         print(string.format("[ShowNameplates] self drive OK: hp=%.2f shield=%.2f stam=%.2f\n", healthP or -1, shieldP or -1, staminaP or -1))
     end
@@ -176,6 +194,18 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function()
     hudMeters = nil
     pcall(installHooks)
 end)
+
+-- TEARDOWN GUARD (crash-on-close / return-to-menu): only ClientRestart armed the settle gate,
+-- so on close the HUD change-hooks (-> driveSelf) + ShouldBeVisible ran against tearing-down
+-- widgets. arm settling + drop the cached refs so every callback (all gate on settling()) bails.
+-- sets only Lua state = itself crash-safe.
+local function npTeardown()
+    transitionAt = os.clock()
+    selfNameplate = nil
+    hudMeters = nil
+end
+RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenu", npTeardown)
+RegisterHook("/Script/Engine.PlayerController:ClientGameEnded", npTeardown)
 
 -- mod restarted mid-map: install immediately if the widget class is already loaded
 do

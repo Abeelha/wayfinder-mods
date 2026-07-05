@@ -43,7 +43,6 @@ local CHAR_CLASS_ONLY = "WFPlayerCharacter_Base_C"
 local AIBASE = "/Game/Blueprints/Abilities/AIGeneric/GA_AI_Base.GA_AI_Base_C"
 local RELOAD_GA = "/Game/Blueprints/Player/GAS/GameplayAbilities/RangedWeapon/GA_Player_RangedWeapon_ActiveReload.GA_Player_RangedWeapon_ActiveReload_C"
 local RELOAD_OK_GA = "/Game/Blueprints/Player/GAS/GameplayAbilities/RangedWeapon/GA_Player_RangedWeapon_ActiveReloadSucceeded.GA_Player_RangedWeapon_ActiveReloadSucceeded_C"
-local SPRINT_CLASS = "/Game/Blueprints/Player/GAS/GameplayAbilities/GA_Player_Sprint.GA_Player_Sprint_C"
 local WFLIB = "/Script/Wayfinder.Default__WFAbilitySystemBlueprintLibrary"
 
 local LMB = { KeyName = FName("LeftMouseButton") }
@@ -103,14 +102,6 @@ local function getLib()
     local lib = StaticFindObject(WFLIB)
     libCache = (lib and lib:IsValid()) and lib or nil
     return libCache
-end
-
-local sprintClassCache = nil
-local function getSprintClass()
-    if sprintClassCache and sprintClassCache:IsValid() then return sprintClassCache end
-    local c = StaticFindObject(SPRINT_CLASS)
-    sprintClassCache = (c and c:IsValid()) and c or nil
-    return sprintClassCache
 end
 
 local function getASC(pawn)
@@ -392,7 +383,7 @@ local function doParry(className, delayMs, enemy, attempt)
     attempt = attempt or 1
     ExecuteInGameThread(function()
         local ok, err = pcall(function()
-            if not state.parry or settling() then return end
+            if not state.parry or not ready or settling() then return end
             if reloadInProgress() then return end -- parry/montage-stop would kill the minigame
             local now = os.clock()
             if now - lastParry < PARRY_COOLDOWN then return end
@@ -458,7 +449,7 @@ end
 local meleeCache = {}
 
 local function onEnemyAbility(self)
-    if not state.parry or settling() then return end
+    if not state.parry or not ready or settling() then return end
     local now = os.clock()
     if now - lastScheduled < 0.05 then return end
     local ok, err = pcall(function()
@@ -509,10 +500,9 @@ local function onEnemyAbility(self)
 end
 
 -- ---------------------------------------------------------------- AutoSprint
--- escalating strategies, each verified before moving on:
---   ability: TryActivateAbilityByClass(GA_Player_Sprint) - real sprint
---   tag:     inject Character.State.Generic.Sprinting loose tag
---   speed:   write CharacterMovement.MaxWalkSpeed directly (x1.5)
+-- on-foot sprint = inject the Sprinting gameplay tag; the game's native OnSprintingTagChanged
+-- listener applies the real sprint speed. tag-only, out of combat, crash-safe. mount sprint
+-- (further below) is a separate direct-MaxWalkSpeed boost on the mount actor.
 local MIN_SPEED_SQ = 100 * 100
 local sprintMode = "real"  -- foot: Sprinting-tag injection, tag-only + debounced combat gate
 local preloadTick = 0      -- throttles the per-tick weapon-swap parry preload
@@ -845,6 +835,7 @@ local function onReloadActivated(self)
         pcall(function() currentReload.maxT = ab.MaxReloadTime end)
         pcall(function() currentReload.successClass = ab.ReloadSuccessType end)
         if not state.reload then return end
+        if not ready or settling() then return end -- skip window-forcing during teardown/transition
         forceWindowOpen(ab) -- hook runs on game thread, before any press lands
         scheduleWindowPress(ab, t0)
     end)
@@ -871,6 +862,7 @@ local function onReloadEnded(self)
             ExecuteInGameThread(function()
                 pcall(function()
                     if successThisCycle then return end
+                    if not ready or settling() then return end -- bail if world torn down / transitioning
                     if not successClass or not successClass:IsValid() then return end
                     local pawn = getPawn()
                     local asc = pawn and getASC(pawn)
@@ -998,8 +990,10 @@ local function registerAll()
     tryHook(CHAR .. ":InpActEvt_Attack1_K2Node_InputActionEvent_36", function(self)
         if injecting then return end
         m1Held = true
-        local p = self:get()
-        if p and p:IsValid() then pawnRef = p end -- guard: never cache an invalid pawn
+        pcall(function()
+            local p = self:get()
+            if p and p:IsValid() then pawnRef = p end -- guard: never cache an invalid pawn
+        end)
     end)
     tryHook(CHAR .. ":InpActEvt_Attack1_K2Node_InputActionEvent_37", function(self)
         if injecting then return end
@@ -1009,8 +1003,10 @@ local function registerAll()
     tryHook(CHAR .. ":InpActEvt_Attack2_K2Node_InputActionEvent_40", function(self)
         if injecting then return end
         m2Held = true
-        local p = self:get()
-        if p and p:IsValid() then pawnRef = p end
+        pcall(function()
+            local p = self:get()
+            if p and p:IsValid() then pawnRef = p end
+        end)
     end)
     tryHook(CHAR .. ":InpActEvt_Attack2_K2Node_InputActionEvent_41", function(self)
         if injecting then return end
@@ -1053,7 +1049,6 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, New
             -- (load/transition crash). getPawn() re-validates lazily when actually used.
         end
         libCache = nil
-        sprintClassCache = nil
         metersCache = nil -- HUD widgets are rebuilt on the new level; drop stale ref
         preloadParryAssets() -- ClientRestart hook = guaranteed game thread
         launchOverlay()
@@ -1061,6 +1056,20 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, New
     end)
     if not hookOk then logErrorOnce("clientrestart", tostring(hookErr)) end
 end)
+
+-- TEARDOWN GUARD (fixes crash-on-close / return-to-menu): during world teardown the LoopAsync
+-- bodies keep firing and touch the freed pawn/ASC -> native AV pcall can't catch. these fire at
+-- the START of teardown; flip ready=false + arm the settle gate so every native-touching loop
+-- bails (sprint/chain gate on `ready`, parry work on `settling()`). the callback ONLY sets Lua
+-- flags - zero object access = itself crash-safe. ready re-arms on the next ClientRestart.
+local function onTeardown()
+    ready = false
+    transitionAt = os.clock()
+    pawnRef = nil
+end
+RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenu", onTeardown)
+RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenuWithTextReason", onTeardown)
+RegisterHook("/Script/Engine.PlayerController:ClientGameEnded", onTeardown)
 
 -- ---------------------------------------------------------------- keybinds
 -- debounced: key auto-repeat fires RegisterKeyBind multiple times per press
