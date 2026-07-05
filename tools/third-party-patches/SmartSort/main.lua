@@ -255,31 +255,11 @@ function FlagItems(PlayerInventoryComponent)
     end
 end
 
--- BULK-BURST GUARD: a full-inventory sync (menu open / MP join / reward claim)
--- fires CLIENT_NotifyItemAdded for HUNDREDS of items at once. processing them all
--- synchronously - each matching weapon does RegisterHook + SERVER_TryApplyItemFlags
--- (a server RPC, round-trips to the host in MP) + UnregisterHook - FREEZES the game
--- thread. cap auto-sorts per 1s window; the overflow is sorted by a manual
--- RunSmartSort (F10 console) which the user opts into (the mod warns it may hitch).
-local burstCount, burstStart = 0, 0
-local BURST_CAP = 12
-RegisterHook("/Script/Wayfinder.PlayerInventoryComponent:CLIENT_NotifyItemAdded",
-    function(_, ItemEntry)
-        local now = os.clock()
-        if now - burstStart > 1.0 then burstStart = now; burstCount = 0 end
-        burstCount = burstCount + 1
-        if burstCount > BURST_CAP then
-            if burstCount == BURST_CAP + 1 then
-                print("[SmartSort] bulk item burst - auto-sort paused (run RunSmartSort to sort all)\n")
-            end
-            return
-        end
-        local ok, err = pcall(function()
-            local PlayerInventoryComponent = FindFirstOf("PlayerInventoryComponent");
-            FlagItem(PlayerInventoryComponent, ItemEntry["Handle"])
-        end)
-        if not ok then print(string.format("[SmartSort] auto-sort ERROR: %s\n", tostring(err))) end
-    end)
+-- AUTO-SORT-ON-PICKUP DISABLED (WFQoL): the CLIENT_NotifyItemAdded hook judged each item
+-- ALONE (per-config junk), so it could not tell a low-level pickup that is a UNIQUE (only
+-- copy - must never be junked) from a duplicate, and it junked uniques. all sorting now
+-- goes through the overlay SORT button (sortOwnedItems below), which is dupe-aware: it only
+-- junks DUPLICATE extras (keeping the best) and never touches a unique. hook not registered.
 
 RegisterConsoleCommandHandler("RunSmartSort", function(FullCommand, Parameters, OutputDevice)
     local PlayerInventoryComponent = FindFirstOf("PlayerInventoryComponent");
@@ -394,14 +374,9 @@ local function sortOwnedItems(pic)
                 enqueueFlag(pic, it.entry.Handle, flag); queued = queued + 1
                 if flag == 2 then favN = favN + 1 else junkN = junkN + 1 end
             end
-        else
-            local it = list[1]
-            local flag = ss_ruleFlag(it.entry, it.cat, it.lvl)
-            if flag then
-                enqueueFlag(pic, it.entry.Handle, flag); queued = queued + 1
-                if flag == 2 then favN = favN + 1 else junkN = junkN + 1 end
-            end
         end
+        -- UNIQUE (single copy) -> NEVER touched. always keep at least 1 of every item,
+        -- even if it is lower level than your current gear.
     end
     print(string.format("[SmartSort] SORT: %d items scanned, %d queued (%d fav, %d junk)\n", #items, queued, favN, junkN))
     processQueue()
