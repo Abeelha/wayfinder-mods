@@ -374,9 +374,18 @@ local function sortOwnedItems(pic)
                 enqueueFlag(pic, it.entry.Handle, flag); queued = queued + 1
                 if flag == 2 then favN = favN + 1 else junkN = junkN + 1 end
             end
+        else
+            -- UNIQUE (single copy) -> NEVER junked. always keep >=1 of every item, even if
+            -- lower level than your gear. also CLEAR a stale junk mark left by an earlier
+            -- sort (self-heal on re-SORT); favorites (2) and already-neutral (0) are left
+            -- alone. flag 0 = no flags.
+            local it = list[1]
+            local ff = nil
+            pcall(function() ff = it.entry.Spec.ItemFlags end)
+            if ff == 1 or ff == 4 then
+                enqueueFlag(pic, it.entry.Handle, 0); queued = queued + 1
+            end
         end
-        -- UNIQUE (single copy) -> NEVER touched. always keep at least 1 of every item,
-        -- even if it is lower level than your current gear.
     end
     print(string.format("[SmartSort] SORT: %d items scanned, %d queued (%d fav, %d junk)\n", #items, queued, favN, junkN))
     processQueue()
