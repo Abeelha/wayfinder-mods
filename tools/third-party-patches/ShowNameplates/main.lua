@@ -131,11 +131,19 @@ local function onRestart(pawn)
     -- co-op downs swap the pawn to BP_Spectator_Pawn_C; binding the self-nameplate
     -- to a spectator/edit pawn shows wrong health ("breaks sometimes"). only track
     -- the real player character - keep the last real one through a down/respawn.
-    local ok, cn = pcall(function() return pawn:GetClass():GetFName():ToString() end)
-    if not (ok and cn == "WFPlayerCharacter_Base_C") then return end
-    currentPlayer   = pawn
-    playerNameplate = nil
-    hudMeters       = nil
+    -- DEFER the class read: reading GetClass() on the RAW ClientRestart pawn hits a
+    -- still-constructing pawn whose class ptr is null -> native 0x10 access violation
+    -- that pcall CANNOT catch (crash on world load). let it settle, then re-validate.
+    ExecuteWithDelay(300, function()
+        local ok, cn = pcall(function()
+            if not (pawn and pawn:IsValid()) then return nil end
+            return pawn:GetClass():GetFName():ToString()
+        end)
+        if not (ok and cn == "WFPlayerCharacter_Base_C") then return end
+        currentPlayer   = pawn
+        playerNameplate = nil
+        hudMeters       = nil
+    end)
 end
 
 RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, NewPawn)

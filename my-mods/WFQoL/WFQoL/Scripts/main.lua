@@ -1103,7 +1103,9 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, New
         local ok, p = pcall(function() return NewPawn:get() end)
         if ok and p and p:IsValid() then
             pawnRef = p -- cache only a VALID pawn; else getPawn re-finds the local one
-            pcall(function() log("pawn: %s", p:GetClass():GetFName():ToString()) end)
+            -- do NOT read p:GetClass() here: the raw ClientRestart pawn can still be
+            -- mid-construction with a null class ptr -> native 0x10 AV pcall can't catch
+            -- (load/transition crash). getPawn() re-validates lazily when actually used.
         end
         libCache = nil
         sprintClassCache = nil
