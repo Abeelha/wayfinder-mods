@@ -514,7 +514,7 @@ end
 --   tag:     inject Character.State.Generic.Sprinting loose tag
 --   speed:   write CharacterMovement.MaxWalkSpeed directly (x1.5)
 local MIN_SPEED_SQ = 100 * 100
-local sprintMode = "real"  -- foot: game's own WFLocomotionComponent BeginSprint/EndSprint
+local sprintMode = "speed" -- foot: crash-safe MaxWalkSpeed cap (Sprinting-tag injection crashed)
 local preloadTick = 0      -- throttles the per-tick weapon-swap parry preload
 local lastCombat = nil     -- raw InCombat tag (drives sprint gate + overlay, updated instantly)
 local loggedCombat = nil   -- last LOGGED combat state (debounced - tag flaps rapidly near enemies)
@@ -577,20 +577,25 @@ local function stopMountBoost()
     end
 end
 
--- ON-FOOT sprint = the game's OWN sprint (WFLocomotionComponent:BeginSprint/EndSprint):
--- real anim/stamina/speed, no MaxWalkSpeed hacks. the component lives at
--- pawn.LocomotionComponent (verified in the object dump).
-local function getLoco(pawn)
-    local ok, c = pcall(function() return pawn.LocomotionComponent end)
-    if ok and c and c:IsValid() then return c end
-    return nil
+-- ON-FOOT sprint = direct MaxWalkSpeed cap. CRASH-SAFE: a plain float write on the validated
+-- movement component, NO native gameplay-tag / locomotion-listener driving. the Sprinting-tag
+-- injection DID work (log: active=true) but toggling it drives the native OnSprintingTagChanged
+-- listener, and thrashing that on rapid combat flip-flops is an uncatchable native AV - it
+-- crashed the game mid-combat (crash_2026_07_05_22_05_37). reverted to the speed cap (proven
+-- no-crash). baseline captured ONCE per pawn address, restored on combat / sprint-off.
+local footBaselines = {}
+local footBoostRef = nil
+local footBoostAddr = nil
+local footLogged = false
+local function stopFootBoost()
+    if footBoostRef then
+        local ref = footBoostRef
+        local base = footBoostAddr and footBaselines[footBoostAddr]
+        if base then setMaxWalk(ref, base) end
+        footBoostRef = nil
+        footBoostAddr = nil
+    end
 end
-local function isSprinting(loco)
-    local ok, v = pcall(function() return loco:IsSprintingLocomotionStateActive() end)
-    return ok and v or false
-end
-
-local locoLogged = false -- one-shot: did on-foot sprint resolve the loco + fire BeginSprint?
 
 -- returns mount actor (or nil). IsMounted() native first, class-name fallback.
 local function getMount(pawn)
@@ -692,31 +697,28 @@ LoopAsync(300, function()
             end
             stopMountBoost() -- on foot (or just dismounted)
 
-            -- ON FOOT: the game's OWN sprint. BeginSprint the moment you're moving out of
-            -- combat, EndSprint otherwise. real anim/stamina/speed - NO MaxWalkSpeed writes.
-            -- guarded by IsSprintingLocomotionStateActive so Begin/End fire ONLY on a state
-            -- CHANGE = near-zero work per tick (no spam, no fps hit). velocity gate = you must
-            -- actually be moving (press W) to sprint.
-            -- ON FOOT: drive sprint by INJECTING the Sprinting gameplay tag - the native
-            -- OnSprintingTagChanged listener on WFLocomotionComponent applies the sprint speed
-            -- (the verified working lever). BeginSprint() alone was inert (diag: active=false)
-            -- because the locomotion state machine keys off the TAG, not the call - so we add the
-            -- tag THEN BeginSprint. add when moving out of combat, remove otherwise; state-change
-            -- guarded by ascHasTag = near-zero per-tick work.
-            local loco = getLoco(pawn)
-            local wantSprint = state.sprint and not lastCombat and velSq(pawn) >= MIN_SPEED_SQ
-            local hasTag = ascHasTag(asc, SPRINTING_TAG)
-            if wantSprint and not hasTag then
-                pcall(function() asc:AddUniqueGameplayTag(SPRINTING_TAG) end)
-                if loco then pcall(function() loco:BeginSprint() end) end
-                if not locoLogged then
-                    locoLogged = true
-                    log("sprint: foot tag+Begin - tag=%s active=%s",
-                        tostring(ascHasTag(asc, SPRINTING_TAG)), tostring(loco and isSprinting(loco)))
-                end
-            elseif hasTag and not wantSprint then
-                pcall(function() asc:RemoveGameplayTag(SPRINTING_TAG) end)
-                if loco then pcall(function() loco:EndSprint() end) end
+            -- ON FOOT: hold the sprint speed cap (crash-safe float write; no native listeners).
+            -- out of combat only. the cap is harmless at standstill (velocity 0) so pressing W =
+            -- insta-sprint. re-assert only when the game drops it below target (few writes, no spam).
+            local footAddr = addrOf(pawn)
+            if footBoostAddr and footBoostAddr ~= footAddr then stopFootBoost() end
+            if not state.sprint or lastCombat then
+                stopFootBoost()
+                return
+            end
+            local fbase = footAddr and footBaselines[footAddr]
+            if not fbase then
+                fbase = maxWalk(pawn)
+                if not fbase then return end
+                if footAddr then footBaselines[footAddr] = fbase end
+                if not footLogged then footLogged = true; log("sprint: foot cap %.0f -> %.0f", fbase, fbase * 1.5) end
+            end
+            footBoostRef = pawn
+            footBoostAddr = footAddr
+            local ftarget = fbase * 1.5
+            local fcur = maxWalk(pawn)
+            if fcur and fcur < ftarget - 1 then
+                setMaxWalk(pawn, ftarget)
             end
         end)
         if not ok then logErrorOnce("sprint", err) end

@@ -50,6 +50,7 @@ end
 
 local svbLogged = false -- one-shot diag: player ShouldBeVisible fired
 local drove = false     -- one-shot diag: driveSelf succeeded (capture + HUD resolve OK)
+local captureMissLogged = false -- one-shot diag: self-capture ran but addr didn't match
 
 -- safe pointer read (address value only, no object-internal deref -> safe on any owner)
 local function addrOf(o)
@@ -140,19 +141,28 @@ local function installHooks()
             -- capture the LOCAL nameplate once
             if not (selfNameplate and selfNameplate:IsValid()) then
                 local owner = np.AttachedOwnerActor
-                if owner and owner:IsValid() then
-                    local lp = localPawn()
-                    if lp and addrOf(owner) == addrOf(lp) then
-                        selfNameplate = np
-                        print("[ShowNameplates] self nameplate captured\n")
-                        driveSelf() -- populate immediately on capture
-                    end
+                -- LOCAL player's pawn via UMG's own GetOwningPlayerPawn (the UI is owned by the
+                -- local player) - NO require("UEHelpers") dependency, which was FAILING here so
+                -- the address never matched and self was never captured -> stuck-full HP / no
+                -- stamina. fall back to localPawn() if the getter returns nil.
+                local lp = nil
+                pcall(function() lp = np:GetOwningPlayerPawn() end)
+                if not (lp and lp:IsValid()) then lp = localPawn() end
+                if owner and owner:IsValid() and lp and lp:IsValid() and addrOf(owner) == addrOf(lp) then
+                    selfNameplate = np
+                    print("[ShowNameplates] self nameplate captured\n")
+                    driveSelf() -- populate immediately on capture
+                elseif not captureMissLogged then
+                    captureMissLogged = true
+                    print(string.format("[ShowNameplates] capture miss: owner=%s lp=%s\n",
+                        tostring(owner and addrOf(owner)), tostring(lp and addrOf(lp))))
                 end
             end
             -- STAMINA only on the LOCAL player's nameplate (allies get health only)
             if selfNameplate and selfNameplate:IsValid() and addrOf(np) == addrOf(selfNameplate) then
                 np:SetStaminaMeterVisibility(true)
                 showWidget(np, "characterStaminaFill")
+                driveSelf() -- refresh hp+stamina each visibility eval (HUD change-hooks may not fire)
             end
         end)
     end)
