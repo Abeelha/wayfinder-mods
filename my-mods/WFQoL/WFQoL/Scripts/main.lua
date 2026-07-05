@@ -14,6 +14,11 @@ local state = {
     sprint = true,
     reload = true,
     overlay = true,
+    dodge = true,    -- AutoDodge: dodge when a hit can't be parried (low stamina / ranged-AOE)
+    homing = true,   -- Homing bullets: steer OUR projectiles into the soft-lock target
+    heal = false,    -- AutoHeal: auto-use a consumable under HP threshold (spends potions - OFF)
+    face = false,    -- Soft auto-face: yaw toward target while attacking (intrusive - OFF)
+    loot = false,    -- Safe loot: collect nearby pickups via OnAwarded (experimental - OFF)
 }
 
 local function log(fmt, ...) print(string.format("[WFQoL] " .. fmt .. "\n", ...)) end
@@ -194,6 +199,19 @@ local function isMeleeAttack(ability)
     return ok and hasAttack and hasMelee
 end
 
+-- any attack (melee OR ranged/AOE). melee -> parryable; attack-but-not-melee -> only
+-- dodgeable. used to route AutoParry vs AutoDodge.
+local function isAttackAbility(ability)
+    local hasAttack = false
+    pcall(function()
+        local tags = ability.AbilityTags.GameplayTags
+        for i = 1, #tags do
+            if tags[i].TagName:ToString() == "Ability.Characteristic.Attack" then hasAttack = true end
+        end
+    end)
+    return hasAttack
+end
+
 local function distTo(a, b)
     local pa = a:K2_GetActorLocation()
     local pb = b:K2_GetActorLocation()
@@ -338,6 +356,77 @@ local function tryActivateParry(asc)
     return false
 end
 
+-- ---------------------------------------------------------------- AutoDodge + targeting
+-- session stat counters (shown on the overlay) + the current incoming-attack telegraph
+local stat = { parry = 0, parryFail = 0, dodge = 0, heal = 0, seen = 0 }
+local incoming = { name = "", kind = "", ts = 0 }
+
+-- WFTargetingComponent holds the soft-lock / magnetized target (what the player is
+-- aiming near). source for homing projectiles + the soft auto-face. fully guarded: if
+-- anything is missing the callers just no-op (no target = feature idles, never crashes).
+local function getSoftTarget(pawn)
+    local ok, tgt = pcall(function()
+        local tc = nil
+        pcall(function() tc = pawn.WFTargetingComponent end)
+        if not (tc and tc:IsValid()) then pcall(function() tc = pawn:GetWFTargetingComponent() end) end
+        if not (tc and tc:IsValid()) then return nil end
+        local t = nil
+        pcall(function() t = tc.m_MagnetizedAimTarget end)
+        if t and t:IsValid() and isReal(t) then return t end
+        return nil
+    end)
+    return ok and tgt or nil
+end
+
+-- health % via the same HUD meter widget staminaPct() uses (metersCache shared)
+local function healthPct()
+    local ok, pct = pcall(function()
+        if not (metersCache and metersCache:IsValid()) then return nil end
+        return metersCache.PlayerHealthBar.Percent
+    end)
+    return ok and pct or nil
+end
+
+-- dodge is triggered by GA_Player_PrepDodge_C (input tag Input.Combat.Dodge); it reads
+-- movement input for direction and fires the weapon-specific dodge. activate by CLASS
+-- (survives keybind rebinds) exactly like parry - verified in the ability dump.
+local DODGE_TAG = { TagName = FName("Input.Combat.Dodge") }
+local lastDodgeClass = nil
+local lastDodge = 0.0
+local DODGE_COOLDOWN = 0.35
+
+local function tryDodge(asc)
+    if not asc then return false end
+    local ab = asc:GetAbilityFromInputTag(DODGE_TAG)
+    if ab and ab:IsValid() then pcall(function() lastDodgeClass = ab:GetClass() end) end
+    local cls = (ab and ab:IsValid() and ab:GetClass()) or lastDodgeClass
+    if not (cls and cls:IsValid()) then return false end
+    local ok, fired = pcall(function() return asc:TryActivateAbilityByClass(cls, true) end)
+    return ok and fired and true or false
+end
+
+-- survival fallback: when a hit is incoming but parry can't/shouldn't fire (low stamina,
+-- or a non-melee/AOE attack), dodge instead. timed off the same hit-time as the parry.
+local function doDodge(className, enemy, why)
+    ExecuteInGameThread(function()
+        pcall(function()
+            if not state.dodge or settling() then return end
+            if reloadInProgress() then return end
+            local now = os.clock()
+            if now - lastDodge < DODGE_COOLDOWN then return end
+            local pawn = getPawn(); if not pawn then return end
+            if enemy and not willConnect(enemy, pawn) then return end
+            local asc = getASC(pawn); if not asc then return end
+            if tryDodge(asc) then
+                lastDodge = now
+                stat.dodge = stat.dodge + 1
+                lastParryInfo = "DODGE " .. tostring(className):gsub("^GA_", ""):gsub("_C$", "")
+                log("dodge vs %s (%s)", tostring(className), why or "")
+            end
+        end)
+    end)
+end
+
 -- forcing ladder: plain activation -> cancel current swing montage + retry ->
 -- two more delayed rounds -> give up loudly
 local function doParry(className, delayMs, enemy, attempt)
@@ -365,8 +454,9 @@ local function doParry(className, delayMs, enemy, attempt)
             if sp and sp < STAMINA_RESERVE then
                 if now - lastStaminaSkipLog > 5 then
                     lastStaminaSkipLog = now
-                    log("parry skipped: stamina %.0f%% below %.0f%% reserve", sp * 100, STAMINA_RESERVE * 100)
+                    log("parry skipped: stamina %.0f%% below %.0f%% reserve -> dodge fallback", sp * 100, STAMINA_RESERVE * 100)
                 end
+                if state.dodge then doDodge(className, enemy, "low stamina") end
                 return
             end
 
@@ -377,6 +467,7 @@ local function doParry(className, delayMs, enemy, attempt)
             if r == "active" then return end -- already blocking/parrying, nothing to force
             if r == "ok" then
                 lastParry = now
+                stat.parry = stat.parry + 1
                 lastParryInfo = string.format("%s @%dms", className:gsub("^GA_", ""):gsub("_C$", ""), delayMs)
                 log("parry vs %s (delay %dms)", className, delayMs)
                 return
@@ -396,6 +487,9 @@ local function doParry(className, delayMs, enemy, attempt)
             if attempt < 3 then
                 ExecuteWithDelay(80, function() doParry(className, delayMs, enemy, attempt + 1) end)
             else
+                stat.parryFail = stat.parryFail + 1
+                -- parry couldn't force through in time: dodge as a last resort
+                if state.dodge then doDodge(className, enemy, "parry failed") end
                 log("parry FAILED vs %s after %d attempts", className, attempt)
             end
         end)
@@ -422,14 +516,18 @@ local function onEnemyAbility(self)
         -- we must hook its ability base class too for parry to work vs it.
         if not meleeCache["_seen_" .. className] then
             meleeCache["_seen_" .. className] = true
+            stat.seen = stat.seen + 1
             log("parry: enemy GA seen %s", className)
         end
         local verdict = meleeCache[className]
         if verdict == nil then
-            verdict = isMeleeAttack(ab)
+            verdict = isMeleeAttack(ab) and "parry" or (isAttackAbility(ab) and "attack" or false)
             meleeCache[className] = verdict
         end
         if not verdict then return end
+        -- "parry" = melee we can block; "attack" = ranged/AOE we can only dodge out of
+        local kind = (verdict == "parry") and "parry" or "dodge"
+        if kind == "dodge" and not state.dodge then return end
         local enemy = ab:GetAvatarActorFromActorInfo()
         local pawn = getPawn()
         if not (enemy and enemy:IsValid() and pawn) then return end
@@ -446,11 +544,12 @@ local function onEnemyAbility(self)
         end
         local delayMs = math.floor(math.max(hitTime - LEAD, 0) * 1000)
         lastScheduled = now
-        if delayMs < 20 then
-            doParry(className, delayMs, enemy)
-        else
-            ExecuteWithDelay(delayMs, function() doParry(className, delayMs, enemy) end)
+        incoming = { name = className:gsub("^GA_", ""):gsub("_C$", ""), kind = kind, ts = os.time() }
+        local function fire()
+            if kind == "parry" then doParry(className, delayMs, enemy)
+            else doDodge(className, enemy, "ranged/AOE") end
         end
+        if delayMs < 20 then fire() else ExecuteWithDelay(delayMs, fire) end
     end)
     if not ok then logErrorOnce("parry-schedule", err) end
 end
@@ -884,6 +983,147 @@ local function onReloadEnded(self)
     if not ok then logErrorOnce("reload-end", "handler failed") end
 end
 
+-- ---------------------------------------------------------------- Homing bullets
+-- every player projectile derives from MayhemBaseProjectile, so one NotifyOnNewObject
+-- on the base catches every shot (incl child classes). filter to OUR shots
+-- (GetInstigator == our pawn) and steer them at the soft-lock target via the standard
+-- UE homing fields on the movement component (verified present on the airship movement
+-- comp: bIsHomingProjectile / HomingAccelerationMagnitude), plus native SetHomingTarget
+-- as primary (pcall'd - it's header-only, may not be BP-exposed). ExecuteWithDelay(30)
+-- lets spawn-time props initialize before we touch them. no target = shot flies normally.
+local HOMING_ACCEL = 12000.0
+pcall(function()
+    NotifyOnNewObject("/Script/Wayfinder.MayhemBaseProjectile", function(proj)
+        if not state.homing then return end
+        ExecuteWithDelay(30, function()
+            ExecuteInGameThread(function()
+                pcall(function()
+                    if not state.homing then return end
+                    if not (proj and proj:IsValid()) then return end
+                    local pawn = getPawn(); if not pawn then return end
+                    local inst = nil
+                    pcall(function() inst = proj:GetInstigator() end)
+                    if not (inst and inst:IsValid()) then return end
+                    if addrOf(inst) ~= addrOf(pawn) then return end -- only home OUR shots
+                    local target = getSoftTarget(pawn); if not target then return end
+                    pcall(function() proj:SetHomingTarget(target) end)
+                    local mc = nil
+                    pcall(function() mc = proj.ProjectileMovementComponent end)
+                    if not (mc and mc:IsValid()) then pcall(function() mc = proj.MovementComponent end) end
+                    if mc and mc:IsValid() then
+                        pcall(function() mc.bIsHomingProjectile = true end)
+                        pcall(function() mc.HomingAccelerationMagnitude = HOMING_ACCEL end)
+                        pcall(function()
+                            local rc = target.RootComponent
+                            if rc and rc:IsValid() then mc.HomingTargetComponent = rc end
+                        end)
+                    end
+                end)
+            end)
+        end)
+    end)
+    log("homing: projectile notify registered")
+end)
+
+-- ---------------------------------------------------------------- AutoHeal (default OFF)
+-- GA_ConsumeItem_Base_C = the potion/flask consumable ability. auto-use it when HP drops
+-- below threshold. OFF by default (spends a limited resource); gated by the game's own
+-- use-item cooldown plus an 8s self-throttle so it can't burn the whole stock at once.
+local HEAL_THRESHOLD = 0.35
+local CONSUME_CLASS_PATH = "/Game/Blueprints/GAS/GameplayAbilities/GA_ConsumeItem_Base.GA_ConsumeItem_Base_C"
+local consumeClassCache = nil
+local lastHeal = 0.0
+local function getConsumeClass()
+    if consumeClassCache and consumeClassCache:IsValid() then return consumeClassCache end
+    local c = StaticFindObject(CONSUME_CLASS_PATH)
+    consumeClassCache = (c and c:IsValid()) and c or nil
+    return consumeClassCache
+end
+LoopAsync(500, function()
+    if not (state.heal and ready) or settling() then return false end
+    ExecuteInGameThread(function()
+        pcall(function()
+            if reloadInProgress() then return end
+            local now = os.clock()
+            if now - lastHeal < 8.0 then return end
+            staminaPct() -- populates the shared metersCache
+            local hp = healthPct()
+            if not hp or hp >= HEAL_THRESHOLD then return end
+            local pawn = getPawn(); if not pawn then return end
+            local asc = getASC(pawn); if not asc then return end
+            local cls = getConsumeClass(); if not cls then return end
+            local ok, fired = pcall(function() return asc:TryActivateAbilityByClass(cls, true) end)
+            if ok and fired then
+                lastHeal = now
+                stat.heal = stat.heal + 1
+                log("heal: HP %.0f%% < %.0f%% -> used consumable", hp * 100, HEAL_THRESHOLD * 100)
+            end
+        end)
+    end)
+    return false
+end)
+
+-- ---------------------------------------------------------------- Soft auto-face (default OFF)
+-- gently yaw the camera/controller toward the soft-lock target while attacking so melee
+-- swings connect. yaw-only, small fraction of the angle per tick (NOT a snap) to avoid
+-- the disorienting full-aimbot feel the user rejected. OFF by default.
+local FACE_STEP = 0.35
+LoopAsync(80, function()
+    if not (state.face and m1Held and ready) or settling() then return false end
+    ExecuteInGameThread(function()
+        pcall(function()
+            local pawn = getPawn(); if not pawn then return end
+            local target = getSoftTarget(pawn); if not target then return end
+            local pc = nil
+            pcall(function() pc = pawn:GetController() end)
+            if not (pc and pc:IsValid()) then return end
+            local pp = pawn:K2_GetActorLocation()
+            local tp = target:K2_GetActorLocation()
+            local desiredYaw = math.deg(math.atan(tp.Y - pp.Y, tp.X - pp.X))
+            local cr = pc:GetControlRotation()
+            local d = ((desiredYaw - cr.Yaw + 180) % 360) - 180
+            pc:SetControlRotation({ Pitch = cr.Pitch, Yaw = cr.Yaw + d * FACE_STEP, Roll = cr.Roll })
+        end)
+    end)
+    return false
+end)
+
+-- ---------------------------------------------------------------- Safe loot (default OFF, experimental)
+-- the OLD AutoLoot crashed teleporting pooled/CDO pickups (K2_SetActorLocation). this
+-- calls the game's OWN collect path instead - WFPickup:OnAwarded(playerChar) - which is
+-- what the game runs when you walk over an item. still experimental: OFF by default,
+-- isReal-gated (skips CDO), distance-capped, and address-deduped so a pickup can't be
+-- re-awarded every tick (dupe/crash guard).
+local lastLoot = 0.0
+local lootedAddrs = {}
+LoopAsync(600, function()
+    if not (state.loot and ready) or settling() then return false end
+    ExecuteInGameThread(function()
+        pcall(function()
+            local now = os.clock()
+            if now - lastLoot < 0.4 then return end
+            local pawn = getPawn(); if not pawn then return end
+            local pp = pawn:K2_GetActorLocation()
+            for _, pk in pairs(FindAllOf("BP_Pickup_C") or {}) do
+                if isReal(pk) and pk:IsValid() then
+                    local a = addrOf(pk)
+                    if a and not lootedAddrs[a] then
+                        pcall(function()
+                            local lp = pk:K2_GetActorLocation()
+                            local dx, dy, dz = lp.X - pp.X, lp.Y - pp.Y, lp.Z - pp.Z
+                            if (dx * dx + dy * dy + dz * dz) > (1200 * 1200) then return end
+                            lootedAddrs[a] = true
+                            pk:OnAwarded(pawn)
+                            lastLoot = now
+                        end)
+                    end
+                end
+            end
+        end)
+    end)
+    return false
+end)
+
 -- ---------------------------------------------------------------- overlay state file
 -- consumed by the external overlay app (tools/overlay/WFQoL-Overlay.ps1).
 -- pure Lua io: safe to run any time, no engine access.
@@ -895,10 +1135,14 @@ local function writeState()
         local f = io.open(STATE_FILE, "w") or io.open(STATE_FILE_ABS, "w")
         if not f then error("cannot open " .. STATE_FILE) end
         f:write(string.format(
-            '{"chain":%s,"parry":%s,"sprint":%s,"reload":%s,"overlay":%s,"sprintMode":"%s","combat":%s,"lastParry":"%s","ts":%d}',
+            '{"chain":%s,"parry":%s,"sprint":%s,"reload":%s,"overlay":%s,"dodge":%s,"homing":%s,"heal":%s,"face":%s,"loot":%s,"sprintMode":"%s","combat":%s,"lastParry":"%s","incoming":"%s","incomingKind":"%s","incomingTs":%d,"statParry":%d,"statParryFail":%d,"statDodge":%d,"statHeal":%d,"statSeen":%d,"ts":%d}',
             tostring(state.chain), tostring(state.parry), tostring(state.sprint),
-            tostring(state.reload), tostring(state.overlay), sprintMode,
-            tostring(lastCombat == true), lastParryInfo, os.time()))
+            tostring(state.reload), tostring(state.overlay),
+            tostring(state.dodge), tostring(state.homing), tostring(state.heal),
+            tostring(state.face), tostring(state.loot), sprintMode,
+            tostring(lastCombat == true), lastParryInfo,
+            incoming.name, incoming.kind, incoming.ts,
+            stat.parry, stat.parryFail, stat.dodge, stat.heal, stat.seen, os.time()))
         f:close()
     end)
     if not ok then logErrorOnce("statefile", err) end
@@ -1106,4 +1350,5 @@ RegisterKeyBind(Key.F5, function()
     end)
 end)
 
-log("loaded - F6 sprint / F7 chain / F8 parry / F9 reload / overlay via tools/overlay")
+log("loaded - F6 sprint / F7 chain / F8 parry / F9 reload / INS overlay")
+log("new: AutoDodge + Homing ON; AutoHeal/Face/Loot OFF - toggle any via overlay click")

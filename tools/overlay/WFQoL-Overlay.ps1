@@ -50,7 +50,7 @@ $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="WFQoL" WindowStyle="None" Background="#0F1116" Topmost="True"
-        ShowActivated="False" ShowInTaskbar="False" Width="230" Height="236"
+        ShowActivated="False" ShowInTaskbar="False" Width="230" Height="360"
         MinWidth="150" MinHeight="120" ResizeMode="CanResize"
         UseLayoutRounding="True" SnapsToDevicePixels="True">
   <Border BorderBrush="#2C313C" BorderThickness="1">
@@ -67,10 +67,15 @@ $xaml = @"
             <TextBlock x:Name="CloseBtn" Text="x" FontFamily="$FONT" FontSize="14" FontWeight="Bold" Foreground="#96A0B4" Cursor="Hand"/>
           </StackPanel>
         </Grid>
+        <Border x:Name="TelegraphBar" DockPanel.Dock="Top" Background="#1B1E26" Height="20" Visibility="Collapsed">
+          <TextBlock x:Name="TelegraphText" Text="" FontFamily="$FONT" FontSize="11" FontWeight="Bold" Foreground="#FFC24B" VerticalAlignment="Center" Margin="8,0,0,0"/>
+        </Border>
         <Grid DockPanel.Dock="Bottom" Background="#171A21" Height="19">
           <TextBlock x:Name="FooterText" Text="" FontFamily="$FONT" FontSize="10" Foreground="#6E778C" VerticalAlignment="Center" Margin="7,0,0,0" TextTrimming="CharacterEllipsis"/>
         </Grid>
-        <StackPanel x:Name="Rows" Margin="0,3,0,3"/>
+        <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+          <StackPanel x:Name="Rows" Margin="0,3,0,3"/>
+        </ScrollViewer>
       </DockPanel>
       <Grid HorizontalAlignment="Right" VerticalAlignment="Bottom" Width="15" Height="15">
         <Polygon Points="15,0 15,15 0,15" Fill="#3B4252"/>
@@ -91,6 +96,8 @@ $lockSquare = $window.FindName("LockSquare")
 $closeBtn = $window.FindName("CloseBtn")
 $header = $window.FindName("Header")
 $resizeGrip = $window.FindName("ResizeGrip")
+$telegraphBar = $window.FindName("TelegraphBar")
+$telegraphText = $window.FindName("TelegraphText")
 
 # ---- command channel: row click -> overlay-cmd.json -> mod toggles the mod ----
 $script:cmdSeq = 0
@@ -101,10 +108,15 @@ function Send-Toggle($feature) {
 
 # ---- rows: one clickable button per mod ----
 $features = @(
-    @{ Name = "SPRINT"; Key = "F6"; Prop = "sprint" },
-    @{ Name = "CHAIN";  Key = "F7"; Prop = "chain" },
-    @{ Name = "PARRY";  Key = "F8"; Prop = "parry" },
-    @{ Name = "RELOAD"; Key = "F9"; Prop = "reload" }
+    @{ Name = "SPRINT"; Key = "F6";  Prop = "sprint" },
+    @{ Name = "CHAIN";  Key = "F7";  Prop = "chain" },
+    @{ Name = "PARRY";  Key = "F8";  Prop = "parry" },
+    @{ Name = "RELOAD"; Key = "F9";  Prop = "reload" },
+    @{ Name = "DODGE";  Key = "clk"; Prop = "dodge" },
+    @{ Name = "HOMING"; Key = "clk"; Prop = "homing" },
+    @{ Name = "HEAL";   Key = "clk"; Prop = "heal" },
+    @{ Name = "FACE";   Key = "clk"; Prop = "face" },
+    @{ Name = "LOOT";   Key = "clk"; Prop = "loot" }
 )
 $script:rowMap = @{}
 foreach ($f in $features) {
@@ -225,10 +237,22 @@ $timer.Add_Tick({
                 Set-Row "chain" $s.chain
                 Set-Row "parry" $s.parry
                 Set-Row "reload" $s.reload
+                Set-Row "dodge" $s.dodge
+                Set-Row "homing" $s.homing
+                Set-Row "heal" $s.heal
+                Set-Row "face" $s.face
+                Set-Row "loot" $s.loot
                 $combatDot.Fill = if ($s.combat) { "#FF5A5A" } else { "#5CE08A" }
+                # incoming-attack telegraph (parry = amber, dodge = blue); shows ~2s
+                if ($s.incoming -and (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$s.incomingTs) -lt 2)) {
+                    if ("$($s.incomingKind)" -eq "dodge") { $telegraphText.Foreground = "#66C7FF"; $telegraphText.Text = "DODGE  $($s.incoming)" }
+                    else { $telegraphText.Foreground = "#FFC24B"; $telegraphText.Text = "PARRY  $($s.incoming)" }
+                    $telegraphBar.Visibility = "Visible"
+                } else {
+                    $telegraphBar.Visibility = "Collapsed"
+                }
                 $mode = "$($s.sprintMode)"
-                $lp = if ($s.lastParry) { "  parry:$($s.lastParry)" } else { "" }
-                $footerText.Text = "mount/foot:$mode$lp"
+                $footerText.Text = "P$($s.statParry) D$($s.statDodge) H$($s.statHeal) | $mode"
             }
         } catch { $stale = $true }
     }
