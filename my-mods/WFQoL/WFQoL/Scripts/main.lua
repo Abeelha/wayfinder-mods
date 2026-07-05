@@ -514,7 +514,7 @@ end
 --   tag:     inject Character.State.Generic.Sprinting loose tag
 --   speed:   write CharacterMovement.MaxWalkSpeed directly (x1.5)
 local MIN_SPEED_SQ = 100 * 100
-local sprintMode = "real"  -- static now (only the real sprint ability); kept for overlay/diag
+local sprintMode = "speed" -- foot: direct MaxWalkSpeed cap (real ability is inert); mount: same
 local preloadTick = 0      -- throttles the per-tick weapon-swap parry preload
 local lastCombat = nil     -- raw InCombat tag (drives sprint gate + overlay, updated instantly)
 local loggedCombat = nil   -- last LOGGED combat state (debounced - tag flaps rapidly near enemies)
@@ -574,6 +574,23 @@ local function stopMountBoost()
         if base then setMaxWalk(ref, base) end
         mountBoostRef = nil
         mountBoostAddr = nil
+    end
+end
+
+-- ON-FOOT sprint uses the SAME proven direct-MaxWalkSpeed cap as the mount. the real
+-- GA_Player_Sprint is input-HELD: activating it by class fires + ends instantly = inert on
+-- foot (log confirmed zero on-foot sprint). baseline captured ONCE per pawn address,
+-- restored on combat / sprint-off.
+local footBaselines = {}
+local footBoostRef = nil
+local footBoostAddr = nil
+local function stopFootBoost()
+    if footBoostRef then
+        local ref = footBoostRef
+        local base = footBoostAddr and footBaselines[footBoostAddr]
+        if base then setMaxWalk(ref, base) end
+        footBoostRef = nil
+        footBoostAddr = nil
     end
 end
 
@@ -677,15 +694,31 @@ LoopAsync(300, function()
             end
             stopMountBoost() -- on foot (or just dismounted)
 
-            -- ON FOOT: only the REAL sprint. the moment you're moving (W), activate
-            -- GA_Player_Sprint (the ability bound to Input.Sprint) - the game runs its real
-            -- sprint (anim / stamina / state). re-activating each tick keeps it going while
-            -- moving; TryActivate is a cheap no-op when it's already active. NO fake speed
-            -- hacks or fallbacks - if the ability is inert in some content it just does
-            -- nothing, instead of the old direct-MaxWalkSpeed ping-pong that spammed + tanked fps.
-            if state.sprint and velSq(pawn) >= MIN_SPEED_SQ then
-                local sprintClass = getSprintClass()
-                if sprintClass then asc:TryActivateAbilityByClass(sprintClass, true) end
+            -- ON FOOT: hold the sprint speed cap directly, the SAME way the mount branch does
+            -- (which works + never spammed). GA_Player_Sprint activated by class is inert here
+            -- (input-held ability ends instantly). the cap is harmless at standstill (velocity
+            -- 0), so the moment you press W you're already at sprint speed = insta-sprint. out
+            -- of combat only; re-assert ONLY when the game drops it below target (no per-tick
+            -- write = no spam); ONE-shot baseline log.
+            local footAddr = addrOf(pawn)
+            if footBoostAddr and footBoostAddr ~= footAddr then stopFootBoost() end
+            if not state.sprint or lastCombat then
+                stopFootBoost()
+                return
+            end
+            local fbase = footAddr and footBaselines[footAddr]
+            if not fbase then
+                fbase = maxWalk(pawn)
+                if not fbase then return end
+                if footAddr then footBaselines[footAddr] = fbase end
+                log("sprint: foot baseline %.0f, boosting to %.0f", fbase, fbase * 1.5)
+            end
+            footBoostRef = pawn
+            footBoostAddr = footAddr
+            local ftarget = fbase * 1.5
+            local fcur = maxWalk(pawn)
+            if fcur and fcur < ftarget - 1 then
+                setMaxWalk(pawn, ftarget)
             end
         end)
         if not ok then logErrorOnce("sprint", err) end
