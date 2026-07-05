@@ -590,6 +590,8 @@ local function isSprinting(loco)
     return ok and v or false
 end
 
+local locoLogged = false -- one-shot: did on-foot sprint resolve the loco + fire BeginSprint?
+
 -- returns mount actor (or nil). IsMounted() native first, class-name fallback.
 local function getMount(pawn)
     local parent = attachParent(pawn)
@@ -701,9 +703,16 @@ LoopAsync(300, function()
                 local active = isSprinting(loco)
                 if wantSprint and not active then
                     pcall(function() loco:BeginSprint() end)
+                    if not locoLogged then
+                        locoLogged = true
+                        log("sprint: foot BeginSprint - active now=%s", tostring(isSprinting(loco)))
+                    end
                 elseif active and not wantSprint then
                     pcall(function() loco:EndSprint() end)
                 end
+            elseif not locoLogged then
+                locoLogged = true
+                log("sprint: foot NO LocomotionComponent on pawn")
             end
         end)
         if not ok then logErrorOnce("sprint", err) end

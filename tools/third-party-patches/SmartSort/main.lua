@@ -358,6 +358,23 @@ end
 --     not hoarded - the single best of each item is kept, the extras marked). the highest
 --     rarity/most-upgraded copy is always the keeper, so the good one is never marked.
 -- favorites are left entirely to the player (never auto-applied). flag 0 = no flags.
+-- pick the REAL populated inventory. FindFirstOf can return the CDO (Default__) or a
+-- preview-character inventory - both have 0 items (seen returning "0 items" mid-session).
+-- scan all instances, skip the CDO, pick the one whose GetItemsByTag returns the MOST items.
+local function findInventory()
+    local best, bestN = nil, -1
+    for _, c in ipairs(FindAllOf("PlayerInventoryComponent") or {}) do
+        local ok, n = pcall(function()
+            if not c:IsValid() then return -1 end
+            if c:GetFName():ToString():sub(1, 9) == "Default__" then return -1 end
+            return #c:GetItemsByTag({ GameplayTags = {}, ParentTags = {} })
+        end)
+        if ok and n and n > bestN then bestN = n; best = c end
+    end
+    if best and bestN > 0 then return best, bestN end
+    return nil, 0
+end
+
 local function sortOwnedItems(pic)
     local items = pic:GetItemsByTag({ GameplayTags = {}, ParentTags = {} })
     local groups = {}
@@ -433,9 +450,9 @@ LoopAsync(500, function()
         if seq ~= lastSortSeq then
             lastSortSeq = seq
             print("[SmartSort] overlay SORT clicked - sorting owned items...\n")
-            local pic = FindFirstOf("PlayerInventoryComponent")
-            if pic and pic:IsValid() then pcall(function() sortOwnedItems(pic) end)
-            else print("[SmartSort] SORT: no inventory component yet\n") end
+            local pic, n = findInventory()
+            if pic then pcall(function() sortOwnedItems(pic) end)
+            else print("[SmartSort] SORT: no populated inventory found (0 items) - open inventory then retry\n") end
         end
     end)
     return false
