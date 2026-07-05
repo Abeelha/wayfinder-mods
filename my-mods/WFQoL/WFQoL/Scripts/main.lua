@@ -1037,15 +1037,8 @@ local function onProjectileLaunch(self)
     homedProj[a] = now
     ExecuteWithDelay(30, function() ExecuteInGameThread(function() applyHoming(proj) end) end)
 end
--- try the known per-launch hook points (pcall'd - whichever exist register; the others
--- no-op). dedup means multiple firing for one shot is harmless.
-for _, fn in ipairs({ "ReceiveBeginPlay", "ComputeInitialSpeed", "FindTargetActor" }) do
-    pcall(function()
-        if RegisterHook(PROJ_BASE .. ":" .. fn, onProjectileLaunch) then
-            log("homing: hooked projectile %s (pooled, deduped)", fn)
-        end
-    end)
-end
+-- the projectile hooks are registered in registerAll() (called on ClientRestart) so the
+-- projectile BP class is actually loaded first - registering here at mod-init fails.
 
 -- ---------------------------------------------------------------- AutoHeal (default OFF)
 -- GA_ConsumeItem_Base_C = the potion/flask consumable ability. auto-use it when HP drops
@@ -1235,6 +1228,7 @@ end)
 -- ---------------------------------------------------------------- hooks
 local pending = {}
 local registered = {}
+local homingHooked = false
 
 -- launch the external overlay when the game starts (once). the overlay
 -- self-exits when our heartbeat goes stale, so it lives and dies with the
@@ -1281,6 +1275,20 @@ local function registerAll()
     tryHook("/Game/Blueprints/GameplayCueNotifies/Ability/2HR/GCNA_2HR_ActiveReload_Fail.GCNA_2HR_ActiveReload_Fail_C:K2_HandleGameplayCue", function()
         log("reload: FAIL cue (should be impossible - report this)")
     end)
+    -- homing: projectile pool per-launch hooks. registered here (not via tryHook) because
+    -- some candidate fns don't exist -> tryHook would retry them in `pending` forever.
+    -- guarded by homingHooked so once one takes we stop. runs on ClientRestart when the
+    -- projectile BP is loaded (fails silently at mod-init before the world exists).
+    if not homingHooked then
+        for _, fn in ipairs({ "ReceiveBeginPlay", "ComputeInitialSpeed", "FindTargetActor" }) do
+            pcall(function()
+                if RegisterHook(PROJ_BASE .. ":" .. fn, onProjectileLaunch) then
+                    homingHooked = true
+                    log("homing: hooked projectile %s (pooled, deduped)", fn)
+                end
+            end)
+        end
+    end
 end
 
 registerAll()
