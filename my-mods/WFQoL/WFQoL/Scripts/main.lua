@@ -322,31 +322,22 @@ local function willConnect(enemy, pawn)
     return ok and res
 end
 
--- returns "ok" (activated), "active" (block/parry already running - success),
--- or false (rejected)
--- block ability is activated by CLASS, so caching the class makes parry survive an
--- in-game keybind rebind (which can leave GetAbilityFromInputTag(Input.Combat.Block)
--- returning nil even though the ability is still granted).
-local lastBlockClass = nil
-local blockNilLogged = false
+-- returns "ok" (activated), "active" (already blocking - success), "noblock" (this weapon
+-- has NO block/parry ability - caller must NOT force), or false (has block but rejected
+-- this instant - safe to force via montage-stop).
+-- REQUIRES a live block ability from the input tag. a weapon with no parry returns nil
+-- here, so we skip entirely instead of force-cancelling the player's OWN actions - the old
+-- stale-cached-class fallback kept forcing a parry on no-parry weapons (montage-stop mid
+-- action) = the "janky, cancels what i'm doing" bug the user hit.
 local function tryActivateParry(asc)
     local blockAbility = asc:GetAbilityFromInputTag(BLOCK_TAG)
-    if blockAbility and blockAbility:IsValid() then
-        preloadAbilityGraph(blockAbility)
-        pcall(function() lastBlockClass = blockAbility:GetClass() end)
-        blockNilLogged = false
-    elseif not blockNilLogged then
-        blockNilLogged = true
-        log("parry: Input.Combat.Block tag has no ability (keybind changed?) - falling back to last-known class")
-    end
-    local cls = (blockAbility and blockAbility:IsValid() and blockAbility:GetClass()) or lastBlockClass
-    if not (cls and cls:IsValid()) then return false end
-    if blockAbility and blockAbility:IsValid() then
-        local isActive = false
-        pcall(function() isActive = blockAbility:IsActive() end)
-        if isActive then return "active" end
-    end
-    if asc:TryActivateAbilityByClass(cls, true) then return "ok" end
+    if not (blockAbility and blockAbility:IsValid()) then return "noblock" end
+    preloadAbilityGraph(blockAbility)
+    local isActive = false
+    pcall(function() isActive = blockAbility:IsActive() end)
+    if isActive then return "active" end
+    local cls = blockAbility:GetClass()
+    if cls and cls:IsValid() and asc:TryActivateAbilityByClass(cls, true) then return "ok" end
     return false
 end
 
@@ -418,6 +409,7 @@ local function doParry(className, delayMs, enemy, attempt)
             if not asc then return end
 
             local r = tryActivateParry(asc)
+            if r == "noblock" then return end -- weapon has no parry: do NOTHING (no force = no action-cancel jank)
             if r == "active" then return end -- already blocking/parrying, nothing to force
             if r == "ok" then
                 lastParry = now
@@ -694,7 +686,9 @@ LoopAsync(300, function()
             end
             stopMountBoost() -- just dismounted
 
-            local shouldSprint = state.sprint and not inCombat and velSq(pawn) >= MIN_SPEED_SQ
+            -- ALWAYS auto-run when moving, in OR out of combat (user accepts the stamina
+            -- drain). was gated by `not inCombat`; that gate is gone now.
+            local shouldSprint = state.sprint and velSq(pawn) >= MIN_SPEED_SQ
             if not shouldSprint then
                 stopSprintAssist(pawn, asc)
                 return
