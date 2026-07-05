@@ -514,7 +514,7 @@ end
 --   tag:     inject Character.State.Generic.Sprinting loose tag
 --   speed:   write CharacterMovement.MaxWalkSpeed directly (x1.5)
 local MIN_SPEED_SQ = 100 * 100
-local sprintMode = "speed" -- foot: crash-safe MaxWalkSpeed cap (Sprinting-tag injection crashed)
+local sprintMode = "real"  -- foot: Sprinting-tag injection, tag-only + debounced combat gate
 local preloadTick = 0      -- throttles the per-tick weapon-swap parry preload
 local lastCombat = nil     -- raw InCombat tag (drives sprint gate + overlay, updated instantly)
 local loggedCombat = nil   -- last LOGGED combat state (debounced - tag flaps rapidly near enemies)
@@ -577,25 +577,13 @@ local function stopMountBoost()
     end
 end
 
--- ON-FOOT sprint = direct MaxWalkSpeed cap. CRASH-SAFE: a plain float write on the validated
--- movement component, NO native gameplay-tag / locomotion-listener driving. the Sprinting-tag
--- injection DID work (log: active=true) but toggling it drives the native OnSprintingTagChanged
--- listener, and thrashing that on rapid combat flip-flops is an uncatchable native AV - it
--- crashed the game mid-combat (crash_2026_07_05_22_05_37). reverted to the speed cap (proven
--- no-crash). baseline captured ONCE per pawn address, restored on combat / sprint-off.
-local footBaselines = {}
-local footBoostRef = nil
-local footBoostAddr = nil
+-- ON-FOOT sprint = inject the Sprinting gameplay tag (the game's native OnSprintingTagChanged
+-- listener then applies the REAL sprint speed - the only lever that gave real sprint,
+-- log-verified active=true). tag-ONLY: the mid-combat crash (crash_2026_07_05_22_05_37) came
+-- from the direct loco:BeginSprint/EndSprint locomotion pokes, NOT the tag (it ran hundreds of
+-- times fine); and we gate on the DEBOUNCED combat state so a flapping InCombat tag can't
+-- rapid-toggle the tag.
 local footLogged = false
-local function stopFootBoost()
-    if footBoostRef then
-        local ref = footBoostRef
-        local base = footBoostAddr and footBaselines[footBoostAddr]
-        if base then setMaxWalk(ref, base) end
-        footBoostRef = nil
-        footBoostAddr = nil
-    end
-end
 
 -- returns mount actor (or nil). IsMounted() native first, class-name fallback.
 local function getMount(pawn)
@@ -697,28 +685,17 @@ LoopAsync(300, function()
             end
             stopMountBoost() -- on foot (or just dismounted)
 
-            -- ON FOOT: hold the sprint speed cap (crash-safe float write; no native listeners).
-            -- out of combat only. the cap is harmless at standstill (velocity 0) so pressing W =
-            -- insta-sprint. re-assert only when the game drops it below target (few writes, no spam).
-            local footAddr = addrOf(pawn)
-            if footBoostAddr and footBoostAddr ~= footAddr then stopFootBoost() end
-            if not state.sprint or lastCombat then
-                stopFootBoost()
-                return
-            end
-            local fbase = footAddr and footBaselines[footAddr]
-            if not fbase then
-                fbase = maxWalk(pawn)
-                if not fbase then return end
-                if footAddr then footBaselines[footAddr] = fbase end
-                if not footLogged then footLogged = true; log("sprint: foot cap %.0f -> %.0f", fbase, fbase * 1.5) end
-            end
-            footBoostRef = pawn
-            footBoostAddr = footAddr
-            local ftarget = fbase * 1.5
-            local fcur = maxWalk(pawn)
-            if fcur and fcur < ftarget - 1 then
-                setMaxWalk(pawn, ftarget)
+            -- ON FOOT: inject the Sprinting gameplay tag = real game-native sprint speed. tag-ONLY
+            -- (no BeginSprint/EndSprint - those were the crash). gated on the DEBOUNCED combat
+            -- state (loggedCombat, settled >=0.75s) so a flapping InCombat tag can't rapid-toggle
+            -- the tag. add when moving out of combat, remove otherwise; state-change guarded.
+            local wantSprint = state.sprint and (loggedCombat ~= true) and velSq(pawn) >= MIN_SPEED_SQ
+            local hasTag = ascHasTag(asc, SPRINTING_TAG)
+            if wantSprint and not hasTag then
+                pcall(function() asc:AddUniqueGameplayTag(SPRINTING_TAG) end)
+                if not footLogged then footLogged = true; log("sprint: foot Sprinting tag ON (real sprint)") end
+            elseif hasTag and not wantSprint then
+                pcall(function() asc:RemoveGameplayTag(SPRINTING_TAG) end)
             end
         end)
         if not ok then logErrorOnce("sprint", err) end

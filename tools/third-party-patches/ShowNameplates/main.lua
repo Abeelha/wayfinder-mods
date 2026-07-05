@@ -97,8 +97,6 @@ local function driveSelf()
                hudMeters.HUD_PlayerStaminaMeters.PlayerStaminaMeter.Percent
     end)
     if not ok then return end
-    pcall(function() np:SetHealthMeterVisibility(true) end)
-    pcall(function() np:SetStaminaMeterVisibility(true) end)
     setPct(np, "PlayerHealthBar",          healthP)  -- primary fill
     setPct(np, "PlayerLastHealthBar",      healthP)  -- damage trail
     setPct(np, "PlayerHealthBar_Additive", shieldP)  -- shield overlay
@@ -134,7 +132,10 @@ local function installHooks()
             local np = self:get()
             if not (np and np:IsValid()) then return end
             if not svbLogged then svbLogged = true; print("[ShowNameplates] player ShouldBeVisible firing\n") end
-            np:SetHealthMeterVisibility(true) -- HEALTH for self AND allies
+            -- NB: SetHealthMeterVisibility/SetStaminaMeterVisibility do NOT exist on this widget
+            -- (verified: 0 in the object dump) - calling them THREW and aborted this whole
+            -- callback before the capture ran (why self was never captured -> stuck-full HP).
+            -- raw showWidget (SetVisibility 0) is the real reveal.
             showWidget(np, "PlayerHealthBar")
             showWidget(np, "PlayerLastHealthBar")
             showWidget(np, "PlayerHealthBar_Additive")
@@ -160,7 +161,6 @@ local function installHooks()
             end
             -- STAMINA only on the LOCAL player's nameplate (allies get health only)
             if selfNameplate and selfNameplate:IsValid() and addrOf(np) == addrOf(selfNameplate) then
-                np:SetStaminaMeterVisibility(true)
                 showWidget(np, "characterStaminaFill")
                 driveSelf() -- refresh hp+stamina each visibility eval (HUD change-hooks may not fire)
             end
