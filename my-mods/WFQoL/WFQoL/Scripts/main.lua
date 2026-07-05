@@ -329,8 +329,49 @@ end
 -- here, so we skip entirely instead of force-cancelling the player's OWN actions - the old
 -- stale-cached-class fallback kept forcing a parry on no-parry weapons (montage-stop mid
 -- action) = the "janky, cancels what i'm doing" bug the user hit.
+-- find the equipped weapon's block/parry ability by scanning GRANTED abilities on the ASC.
+-- tag-INDEPENDENT: survives a parry-key rebind (GetAbilityFromInputTag goes nil then) AND
+-- finds nothing on a no-block weapon. fully guarded - if the native struct walk fails it
+-- returns nil (parry just stands down, never crashes).
+local function findGrantedBlockAbility(asc)
+    local found = nil
+    pcall(function()
+        local items = asc.ActivatableAbilities.Items
+        if not items then return end
+        for i = 1, #items do
+            local ab = items[i].Ability
+            if ab and ab:IsValid() then
+                local nm = ab:GetClass():GetFName():ToString()
+                -- player block (GA_Player_Block_<WPN>) or parry (..._Parry); skip Block_Broken
+                if (nm:find("^GA_Player_Block_") and not nm:find("Broken")) or nm:find("_Parry") then
+                    found = ab
+                    return
+                end
+            end
+        end
+    end)
+    return found
+end
+
+-- current weapon's block ability: input tag first (fast; nil after a key rebind), then the
+-- tag-independent granted-abilities scan. nil = weapon genuinely has no parry.
+local blockSrcLogged = nil
+local function currentBlockAbility(asc)
+    local ab = asc:GetAbilityFromInputTag(BLOCK_TAG)
+    if ab and ab:IsValid() then blockSrcLogged = "tag"; return ab end
+    ab = findGrantedBlockAbility(asc)
+    if ab and blockSrcLogged ~= "enum" then
+        blockSrcLogged = "enum"
+        pcall(function() log("parry: block found via granted-ability scan (%s) - parry key rebound?", ab:GetClass():GetFName():ToString()) end)
+    end
+    return ab
+end
+
+-- returns "ok"/"active"/"noblock"/false. block resolved weapon-accurately + rebind-safe.
+-- "noblock" = no parry on this weapon -> doParry bails BEFORE the montage-stop force ladder
+-- (= no cancelling the player's own actions on a no-parry weapon).
 local function tryActivateParry(asc)
-    local blockAbility = asc:GetAbilityFromInputTag(BLOCK_TAG)
+    local blockAbility = currentBlockAbility(asc)
     if not (blockAbility and blockAbility:IsValid()) then return "noblock" end
     preloadAbilityGraph(blockAbility)
     local isActive = false
