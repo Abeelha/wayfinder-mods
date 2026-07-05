@@ -18,7 +18,6 @@ local state = {
     homing = true,   -- Homing bullets: steer OUR projectiles into the soft-lock target
     heal = false,    -- AutoHeal: auto-use a consumable under HP threshold (spends potions - OFF)
     face = false,    -- Soft auto-face: yaw toward target while attacking (intrusive - OFF)
-    loot = false,    -- Safe loot: collect nearby pickups via OnAwarded (experimental - OFF)
 }
 
 local function log(fmt, ...) print(string.format("[WFQoL] " .. fmt .. "\n", ...)) end
@@ -365,6 +364,7 @@ local incoming = { name = "", kind = "", ts = 0 }
 -- aiming near). source for homing projectiles + the soft auto-face. fully guarded: if
 -- anything is missing the callers just no-op (no target = feature idles, never crashes).
 local function getSoftTarget(pawn)
+    if settling() then return nil end -- never touch targeting during a transition (teardown AV)
     local ok, tgt = pcall(function()
         -- verified-in-game: component is pawn.TargetingComponent (UWFTargetingComponent).
         local tc = nil
@@ -1005,7 +1005,7 @@ local HOMING_ACCEL = 12000.0
 local homedProj = {} -- addr -> os.clock() of last home (pool reuses addresses)
 local function applyHoming(proj)
     pcall(function()
-        if not state.homing then return end
+        if not state.homing or settling() then return end -- skip during teardown (AV)
         if not (proj and proj:IsValid()) then return end
         local pawn = getPawn(); if not pawn then return end
         local inst = nil
@@ -1028,7 +1028,7 @@ local function applyHoming(proj)
     end)
 end
 local function onProjectileLaunch(self)
-    if not state.homing then return end
+    if not state.homing or settling() then return end -- skip projectile spawns during teardown
     local proj = self:get()
     local a = addrOf(proj)
     if not a then return end
@@ -1103,42 +1103,6 @@ LoopAsync(80, function()
     return false
 end)
 
--- ---------------------------------------------------------------- Safe loot (default OFF, experimental)
--- the OLD AutoLoot crashed teleporting pooled/CDO pickups (K2_SetActorLocation). this
--- calls the game's OWN collect path instead - WFPickup:OnAwarded(playerChar) - which is
--- what the game runs when you walk over an item. still experimental: OFF by default,
--- isReal-gated (skips CDO), distance-capped, and address-deduped so a pickup can't be
--- re-awarded every tick (dupe/crash guard).
-local lastLoot = 0.0
-local lootedAddrs = {}
-LoopAsync(600, function()
-    if not (state.loot and ready) or settling() then return false end
-    ExecuteInGameThread(function()
-        pcall(function()
-            local now = os.clock()
-            if now - lastLoot < 0.4 then return end
-            local pawn = getPawn(); if not pawn then return end
-            local pp = pawn:K2_GetActorLocation()
-            for _, pk in pairs(FindAllOf("BP_Pickup_C") or {}) do
-                if isReal(pk) and pk:IsValid() then
-                    local a = addrOf(pk)
-                    if a and not lootedAddrs[a] then
-                        pcall(function()
-                            local lp = pk:K2_GetActorLocation()
-                            local dx, dy, dz = lp.X - pp.X, lp.Y - pp.Y, lp.Z - pp.Z
-                            if (dx * dx + dy * dy + dz * dz) > (1200 * 1200) then return end
-                            lootedAddrs[a] = true
-                            pk:OnAwarded(pawn)
-                            lastLoot = now
-                        end)
-                    end
-                end
-            end
-        end)
-    end)
-    return false
-end)
-
 -- ---------------------------------------------------------------- overlay state file
 -- consumed by the external overlay app (tools/overlay/WFQoL-Overlay.ps1).
 -- pure Lua io: safe to run any time, no engine access.
@@ -1150,11 +1114,11 @@ local function writeState()
         local f = io.open(STATE_FILE, "w") or io.open(STATE_FILE_ABS, "w")
         if not f then error("cannot open " .. STATE_FILE) end
         f:write(string.format(
-            '{"chain":%s,"parry":%s,"sprint":%s,"reload":%s,"overlay":%s,"dodge":%s,"homing":%s,"heal":%s,"face":%s,"loot":%s,"sprintMode":"%s","combat":%s,"lastParry":"%s","incoming":"%s","incomingKind":"%s","incomingTs":%d,"statParry":%d,"statParryFail":%d,"statDodge":%d,"statHeal":%d,"statSeen":%d,"ts":%d}',
+            '{"chain":%s,"parry":%s,"sprint":%s,"reload":%s,"overlay":%s,"dodge":%s,"homing":%s,"heal":%s,"face":%s,"sprintMode":"%s","combat":%s,"lastParry":"%s","incoming":"%s","incomingKind":"%s","incomingTs":%d,"statParry":%d,"statParryFail":%d,"statDodge":%d,"statHeal":%d,"statSeen":%d,"ts":%d}',
             tostring(state.chain), tostring(state.parry), tostring(state.sprint),
             tostring(state.reload), tostring(state.overlay),
             tostring(state.dodge), tostring(state.homing), tostring(state.heal),
-            tostring(state.face), tostring(state.loot), sprintMode,
+            tostring(state.face), sprintMode,
             tostring(lastCombat == true), lastParryInfo,
             incoming.name, incoming.kind, incoming.ts,
             stat.parry, stat.parryFail, stat.dodge, stat.heal, stat.seen, os.time()))
@@ -1381,4 +1345,4 @@ RegisterKeyBind(Key.F5, function()
 end)
 
 log("loaded - F6 sprint / F7 chain / F8 parry / F9 reload / INS overlay")
-log("new: AutoDodge + Homing ON; AutoHeal/Face/Loot OFF - toggle any via overlay click")
+log("new: AutoDodge + Homing ON; AutoHeal/Face OFF - toggle via overlay click")

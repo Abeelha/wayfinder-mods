@@ -115,8 +115,7 @@ $features = @(
     @{ Name = "DODGE";  Key = "clk"; Prop = "dodge" },
     @{ Name = "HOMING"; Key = "clk"; Prop = "homing" },
     @{ Name = "HEAL";   Key = "clk"; Prop = "heal" },
-    @{ Name = "FACE";   Key = "clk"; Prop = "face" },
-    @{ Name = "LOOT";   Key = "clk"; Prop = "loot" }
+    @{ Name = "FACE";   Key = "clk"; Prop = "face" }
 )
 $script:rowMap = @{}
 foreach ($f in $features) {
@@ -241,7 +240,6 @@ $timer.Add_Tick({
                 Set-Row "homing" $s.homing
                 Set-Row "heal" $s.heal
                 Set-Row "face" $s.face
-                Set-Row "loot" $s.loot
                 $combatDot.Fill = if ($s.combat) { "#FF5A5A" } else { "#5CE08A" }
                 # incoming-attack telegraph (parry = amber, dodge = blue); shows ~2s
                 if ($s.incoming -and (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$s.incomingTs) -lt 2)) {
