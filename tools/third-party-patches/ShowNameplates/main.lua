@@ -227,19 +227,24 @@ end
 -- still drops caches the moment they go invalid.
 local npLastPawnAddr = nil
 LoopAsync(300, function()
-    pcall(function()
-        local p = localPawn()
-        local pa = p and addrOf(p) or nil
-        local staleRef = (selfNameplate and not selfNameplate:IsValid())
-                      or (hudMeters and not hudMeters:IsValid())
-        if pa ~= npLastPawnAddr or staleRef then
-            npLastPawnAddr = pa
-            transitionAt = os.clock()
-            selfNameplate = nil
-            hudMeters = nil
-            captureMissLogged = false
-            svbLogged = false
-        end
+    -- GAME-THREAD WRAP: reading pawn/widget UObjects off the async loop thread can race the
+    -- game thread mid-transition (torn read -> AV). all native reads go through
+    -- ExecuteInGameThread, same as the WFQoL loops. the poll itself only sets Lua state.
+    ExecuteInGameThread(function()
+        pcall(function()
+            local p = localPawn()
+            local pa = p and addrOf(p) or nil
+            local staleRef = (selfNameplate and not selfNameplate:IsValid())
+                          or (hudMeters and not hudMeters:IsValid())
+            if pa ~= npLastPawnAddr or staleRef then
+                npLastPawnAddr = pa
+                transitionAt = os.clock()
+                selfNameplate = nil
+                hudMeters = nil
+                captureMissLogged = false
+                svbLogged = false
+            end
+        end)
     end)
     return false
 end)
