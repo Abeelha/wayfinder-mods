@@ -50,6 +50,7 @@ end
 
 local svbLogged = false -- one-shot diag: player ShouldBeVisible fired
 local drove = false     -- one-shot diag: driveSelf succeeded (capture + HUD resolve OK)
+local lastDrivenHp, lastDrivenStam = nil, nil -- diag: track driven values to see if they move
 local captureMissLogged = false -- one-shot diag: self-capture ran but addr didn't match
 
 -- safe pointer read (address value only, no object-internal deref -> safe on any owner)
@@ -124,9 +125,12 @@ local function driveSelf()
         setPct(np, "characterStaminaFill", staminaP) -- stamina fill
         showWidget(np, "characterStaminaFill")
     end
-    if not drove and healthP then
-        drove = true
-        print(string.format("[ShowNameplates] self drive OK: hp=%.2f shield=%.2f stam=%.2f\n", healthP or -1, shieldP or -1, staminaP or -1))
+    -- diag: log whenever the driven hp/stam CHANGES (>2%) so we can see if the value TRACKS
+    -- vs is stuck-full (the MP-host bug). change-throttled, not spammy.
+    if healthP and (math.abs(healthP - (lastDrivenHp or -1)) > 0.02
+                 or math.abs((staminaP or 0) - (lastDrivenStam or -1)) > 0.02) then
+        lastDrivenHp = healthP; lastDrivenStam = staminaP or 0
+        print(string.format("[ShowNameplates] drive: hp=%.2f shield=%.2f stam=%.2f\n", healthP or -1, shieldP or -1, staminaP or -1))
     end
 end
 

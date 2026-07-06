@@ -423,17 +423,10 @@ local function doParry(className, delayMs, enemy, attempt)
                 return
             end
 
-            -- mid-swing: cancel the player's current montage and force it through
-            pcall(function() asc:ServerCurrentMontageStop(0.15) end)
-            r = tryActivateParry(asc)
-            if r == "active" then return end
-            if r == "ok" then
-                lastParry = now
-                lastParryInfo = string.format("%s @%dms forced", className:gsub("^GA_", ""):gsub("_C$", ""), delayMs)
-                log("parry FORCED (cancelled swing) vs %s", className)
-                return
-            end
-
+            -- rejected this instant (you're mid-action). retry WITHOUT force - we NEVER
+            -- montage-stop the player anymore: ServerCurrentMontageStop cancelled your casts
+            -- and actions (worst on caster / no-parry weapons like the Breaker). if the parry
+            -- window closes it just doesn't land, which beats interrupting what you're doing.
             if attempt < 3 then
                 ExecuteWithDelay(80, function() doParry(className, delayMs, enemy, attempt + 1) end)
             else
@@ -574,6 +567,7 @@ end
 -- times fine); and we gate on the DEBOUNCED combat state so a flapping InCombat tag can't
 -- rapid-toggle the tag.
 local footLogged = false
+local sprintTagByUs = false -- true only while WE hold the sprint tag; never strip a manual sprint
 
 -- returns mount actor (or nil). IsMounted() native first, class-name fallback.
 local function getMount(pawn)
@@ -680,12 +674,19 @@ LoopAsync(300, function()
             -- state (loggedCombat, settled >=0.75s) so a flapping InCombat tag can't rapid-toggle
             -- the tag. add when moving out of combat, remove otherwise; state-change guarded.
             local wantSprint = state.sprint and (loggedCombat ~= true) and velSq(pawn) >= MIN_SPEED_SQ
-            local hasTag = ascHasTag(asc, SPRINTING_TAG)
-            if wantSprint and not hasTag then
-                pcall(function() asc:AddUniqueGameplayTag(SPRINTING_TAG) end)
-                if not footLogged then footLogged = true; log("sprint: foot Sprinting tag ON (real sprint)") end
-            elseif hasTag and not wantSprint then
+            if wantSprint then
+                -- add ONLY if nobody set it yet. if you're already sprinting (you pressed it),
+                -- leave it be - don't claim your tag.
+                if not ascHasTag(asc, SPRINTING_TAG) then
+                    pcall(function() asc:AddUniqueGameplayTag(SPRINTING_TAG) end)
+                    sprintTagByUs = true
+                    if not footLogged then footLogged = true; log("sprint: foot Sprinting tag ON (real sprint)") end
+                end
+            elseif sprintTagByUs then
+                -- remove ONLY a tag WE added - never strip your MANUAL sprint (doing so stopped
+                -- your sprint AND blocked you from pressing sprint yourself).
                 pcall(function() asc:RemoveGameplayTag(SPRINTING_TAG) end)
+                sprintTagByUs = false
             end
         end)
         if not ok then logErrorOnce("sprint", err) end
@@ -1069,6 +1070,7 @@ local function onTeardown()
     ready = false
     transitionAt = os.clock()
     pawnRef = nil
+    sprintTagByUs = false
 end
 RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenu", onTeardown)
 RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenuWithTextReason", onTeardown)
