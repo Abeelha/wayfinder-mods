@@ -478,10 +478,18 @@ LoopAsync(500, function()
         if lastSortSeq == nil then lastSortSeq = seq; return end -- ignore the stale seq at load
         if seq ~= lastSortSeq then
             lastSortSeq = seq
+            if flagRunning then print("[SmartSort] sort already running - click ignored\n"); return end
             print("[SmartSort] overlay SORT clicked - sorting owned items...\n")
-            local pic, n = findInventory()
-            if pic then pcall(function() sortOwnedItems(pic) end)
-            else print("[SmartSort] SORT: no populated inventory found (0 items) - open inventory then retry\n") end
+            -- object work (FindAllOf + per-item Spec reads + queue drain) MUST run on the GAME
+            -- thread; doing it in this async LoopAsync body races the game thread / object-array
+            -- lock (torn read / stall). mirror the ShowNameplates ExecuteInGameThread pattern.
+            ExecuteInGameThread(function()
+                pcall(function()
+                    local pic, n = findInventory()
+                    if pic then sortOwnedItems(pic)
+                    else print("[SmartSort] SORT: no populated inventory found (0 items) - open inventory then retry\n") end
+                end)
+            end)
         end
     end)
     return false

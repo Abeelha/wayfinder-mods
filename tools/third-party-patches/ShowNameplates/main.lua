@@ -71,9 +71,17 @@ end
 
 -- (re)find the LOCAL HUD meters widget; cached until it goes invalid (level change). the
 -- FindAllOf is bounded (runs only when the cache is stale, NOT per frame).
+local lastHudScan = 0.0   -- throttle the resolveHUD 135k-object scan (game-thread, per-frame reachable)
+local lastVisDrive = 0.0  -- throttle driveSelf() calls from the per-frame ShouldBeVisible eval
 local function resolveHUD()
     if hudMeters and hudMeters:IsValid() then return true end
     hudMeters = nil
+    -- THROTTLE the 135k-object scan: resolveHUD is reachable from the per-frame ShouldBeVisible
+    -- eval, so when the HUD can't resolve (the both-bars gate below fails during a transition) an
+    -- unthrottled FindAllOf every frame ON THE GAME THREAD = hard freeze. cap to ~2x/sec; between
+    -- scans report "unresolved" so the caller just skips driving this frame.
+    if (os.clock() - lastHudScan) < 0.5 then return false end
+    lastHudScan = os.clock()
     for _, e in pairs(FindAllOf("HUD_PlayerMeters_C") or {}) do
         local ok, valid = pcall(function()
             if e:GetFName():ToString():sub(1, 9) == "Default__" then return false end -- skip CDO
@@ -184,7 +192,9 @@ local function installHooks()
             -- STAMINA only on the LOCAL player's nameplate (allies get health only)
             if selfNameplate and selfNameplate:IsValid() and addrOf(np) == addrOf(selfNameplate) then
                 showWidget(np, "characterStaminaFill")
-                driveSelf() -- refresh hp+stamina each visibility eval (HUD change-hooks may not fire)
+                -- ShouldBeVisible fires EVERY frame; throttle the refresh to ~10x/sec so an
+                -- unresolved HUD can't drive a per-frame resolveHUD scan (freeze guard).
+                if (os.clock() - lastVisDrive) > 0.1 then lastVisDrive = os.clock(); driveSelf() end
             end
         end)
     end)

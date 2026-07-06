@@ -71,13 +71,44 @@ local function settling() return (os.clock() - transitionAt) < SETTLE_SECS end
 -- for -> arm the settle gate the same way.
 local lastPawnAddr = nil
 
+-- O(1) local pawn: the local PlayerController's Pawn - authoritative, avoids the 135k-object
+-- FindAllOf scan in the hot path (the rail calls getPawn every tick), and can't accidentally
+-- grab a REMOTE player's pawn in MP. the PlayerController persists across pawn swaps (it
+-- repossesses the new pawn); IsValid re-fetches it after a teardown.
+local pcCache = nil
+local function localPC()
+    if pcCache and pcCache:IsValid() then return pcCache end
+    pcCache = nil
+    pcall(function()
+        local pc = require("UEHelpers"):GetPlayerController()
+        if pc and pc:IsValid() then pcCache = pc end
+    end)
+    return pcCache
+end
+
+local lastPawnScan = 0.0 -- throttle getPawn's FindAllOf fallback (game-thread scan during loads)
 local function getPawn()
     if pawnRef and pawnRef:IsValid() then return pawnRef end
     pawnRef = nil
+    -- primary O(1) route: the local PlayerController's Pawn (no object scan, MP-correct)
+    local pc = localPC()
+    if pc then
+        pcall(function()
+            local p = pc.Pawn
+            if p and p:IsValid() and isReal(p) then pawnRef = p end
+        end)
+    end
+    if pawnRef then return pawnRef end
+    -- throttle the FALLBACK object scan: when the PC route fails (during a load/stream the pawn is
+    -- unfindable for a while), FindAllOf(135k) every 300ms tick on the game thread is a perma-load
+    -- amplifier. cap to ~1x/2s. (the O(1) PC route above is unthrottled, so a valid pawn is still
+    -- picked up the instant it appears.)
+    if (os.clock() - lastPawnScan) < 2.0 then return nil end
+    lastPawnScan = os.clock()
+    -- FALLBACK object scan (only if the PC route failed). MULTIPLAYER: FindAllOf returns
+    -- REMOTE players' characters too (null components client-side -> native crash if driven);
+    -- prefer the LOCALLY-controlled pawn, fall back to first real (single-player).
     pcall(function()
-        -- MULTIPLAYER: FindAllOf now returns REMOTE players' characters too (their
-        -- components are null client-side -> native crash if we drive one). prefer
-        -- the LOCALLY-controlled pawn; fall back to first real (single-player).
         local first = nil
         for _, p in pairs(FindAllOf(CHAR_CLASS_ONLY) or {}) do
             if isReal(p) then
@@ -570,6 +601,9 @@ local function onEnemyAbility(self)
     if (not state.parry and not onSnS) or not ready or settling() then return end
     local now = os.clock()
     if now - lastScheduled < 0.05 then return end
+    lastScheduled = now -- bound ALL downstream work (AutoBlock + parry). the old spot was after
+                        -- the parry bail, so with parry OFF + SnS ON the AutoBlock/scheduleCounter
+                        -- path ran unthrottled per enemy ability (swarm = game-thread callback burst).
     local ok, err = pcall(function()
         local ab = self:get()
         -- MULTIPLAYER: this hook fires for replicated/remote enemy abilities too;
@@ -627,7 +661,6 @@ local function onEnemyAbility(self)
             hitTime = DEFAULT_HIT
         end
         local delayMs = math.floor(math.max(hitTime - LEAD, 0) * 1000)
-        lastScheduled = now
         incoming = { name = className:gsub("^GA_", ""):gsub("_C$", ""), kind = "parry", ts = os.time() }
         if delayMs < 20 then
             doParry(className, delayMs, enemy)
@@ -923,20 +956,32 @@ local function pressReload(ab, elapsed) -- game thread only
     if not ok then logErrorOnce("reload-press", "OnTriggered_99CA call failed") end
 end
 
+local reloadAttrCache = nil
 local function forceWindowOpen(ab)
     pcall(function() ab.Tolerance = 1000.0 end)
     pcall(function() ab.EarlyPressForgivenessPercent = 0.0 end)
-    -- whichever operand the check reads, cover it: widen the attribute window too
-    pcall(function()
-        for _, s in pairs(FindAllOf("WFRangedWeaponAttributeSet") or {}) do
-            if isReal(s) then
-                pcall(function()
-                    s.ActiveReloadBounds.CurrentValue = 200.0
-                    s.ActiveReloadBounds.BaseValue = 200.0
-                end)
+    -- whichever operand the check reads, cover it: widen the attribute window too. CACHE the
+    -- attribute-set ref so we don't FindAllOf(135k) on EVERY reload activation (that scan under a
+    -- rapid re-activation was a freeze amplifier); re-scan only when the cached ref goes invalid.
+    if reloadAttrCache and reloadAttrCache:IsValid() then
+        pcall(function()
+            reloadAttrCache.ActiveReloadBounds.CurrentValue = 200.0
+            reloadAttrCache.ActiveReloadBounds.BaseValue = 200.0
+        end)
+    else
+        reloadAttrCache = nil
+        pcall(function()
+            for _, s in pairs(FindAllOf("WFRangedWeaponAttributeSet") or {}) do
+                if isReal(s) then
+                    pcall(function()
+                        s.ActiveReloadBounds.CurrentValue = 200.0
+                        s.ActiveReloadBounds.BaseValue = 200.0
+                    end)
+                    reloadAttrCache = reloadAttrCache or s
+                end
             end
-        end
-    end)
+        end)
+    end
     if not windowForcedLogged then
         windowForcedLogged = true
         log("reload: window forced open")
@@ -995,9 +1040,15 @@ local function scheduleWindowPress(ab, t0, attempt)
                 phase = "press"
                 local function firePress()
                     if not (state.reload and currentReload and currentReload.t0 == t0 and ab:IsValid()) then return end
+                    -- late-press guard: if game-thread lag slipped us well past the early target,
+                    -- ABORT. a late press lands at/after the real reload end and is misread as a NEW
+                    -- reload (the feedback loop). window is force-open, so a skipped press just
+                    -- costs the active-reload bonus this mag - never a loop.
+                    local el = os.clock() - t0
+                    if el > PRESS_EARLY + 0.3 then log("reload: press aborted (late %.2fs) - loop guard", el); return end
                     currentReload.pressed = true
-                    pressReload(ab, os.clock() - t0)
-                    log("reload: pressed at %.2fs", os.clock() - t0)
+                    pressReload(ab, el)
+                    log("reload: pressed at %.2fs", el)
                 end
                 local remainMs = math.floor((PRESS_EARLY - RELOAD_LATENCY - (os.clock() - t0)) * 1000)
                 if remainMs <= 10 then
@@ -1015,6 +1066,7 @@ local function scheduleWindowPress(ab, t0, attempt)
     end)
 end
 
+local lastReloadActivate = 0.0
 local function onReloadActivated(self)
     local ok, err = pcall(function()
         local ab = self:get()
@@ -1028,7 +1080,14 @@ local function onReloadActivated(self)
             local mine = getPawn()
             if mine and addrOf(avatar) ~= addrOf(mine) then return end
         end
+        -- RE-ENTRANCY GUARD (anti-freeze): our injected press can be misread as a fresh reload
+        -- input under game-thread lag, re-firing THIS hook. unguarded, each re-fire rebuilds state
+        -- + runs forceWindowOpen + schedules another press = positive-feedback loop -> game-thread
+        -- saturation -> freeze. a genuine reload can't restart within ~0.4s (the reload is longer),
+        -- so a faster re-activation is spurious - drop it (keeps the original cycle intact).
         local t0 = os.clock()
+        if (t0 - lastReloadActivate) < 0.4 then return end
+        lastReloadActivate = t0
         successThisCycle = false
         currentReload = { t0 = t0, maxT = nil, pressed = false, successClass = nil }
         pcall(function() currentReload.maxT = ab.MaxReloadTime end)
