@@ -191,10 +191,17 @@ local lastConnectLog = 0.0
 local BLOCK_SNS_MATCH = "Block_SNS"    -- SnS block ability class substring (GA_Player_Block_SNS_C)
 local BLOCK_WINDOW = 0.9               -- hold the shield this long after each incoming attack
 local BLOCK_STAMINA_RESERVE = 0.15     -- never block below this (blocking to 0 stamina = guard break)
+-- shield is raised the SAME way sprint works: inject the Blocking STATE tag -> the native
+-- OnBlockingTagChanged listener on WFLocomotionComponent applies the block. class-activating
+-- GA_Player_Block_SNS_C is INERT (block is a hold ability). tag name mirrors the Sprinting tag;
+-- the OnBlockingTagChanged diagnostic hook confirms/corrects it from a real (manual or auto) block.
+local BLOCKING_TAG = { TagName = FName("Character.State.Generic.Blocking") }
 local onSnS = false                    -- true when the equipped weapon is a Sword & Shield
 local snsBlockAbility = nil            -- cached GA_Player_Block_SNS ability
 local blockUntil = 0.0                 -- keep the shield up until this os.clock()
+local blockTagByUs = false             -- true only while WE hold the Blocking tag (never strip a manual block)
 local blockRaiseLogged = false         -- one-shot diag
+local blockTagNameLogged = false       -- one-shot: real blocking tag name captured from OnBlockingTagChanged
 
 local function isMeleeAttack(ability)
     local hasAttack, hasMelee = false, false
@@ -396,7 +403,11 @@ local function refreshSnS(asc)
         local ok, nm = pcall(function() return ab:GetClass():GetFName():ToString() end)
         if ok and nm and nm:find(BLOCK_SNS_MATCH) then isSnS = true; snsBlockAbility = ab end
     end
-    if not isSnS then snsBlockAbility = nil end
+    if not isSnS then
+        snsBlockAbility = nil
+        -- unequipped SnS while we held the block -> drop our injected tag so it can't stick
+        if blockTagByUs then pcall(function() asc:RemoveGameplayTag(BLOCKING_TAG) end); blockTagByUs = false end
+    end
     if isSnS ~= onSnS then
         onSnS = isSnS
         blockRaiseLogged = false
@@ -683,20 +694,22 @@ LoopAsync(300, function()
                 if state.parry then pcall(function() preloadAbilityGraph(asc:GetAbilityFromInputTag(BLOCK_TAG)) end) end
             end
 
-            -- AutoBlock driver: while an incoming-attack window is open + stamina healthy, keep the
-            -- SnS shield raised. activate ONLY if not already active (no toggling), and NO
-            -- montage-stop, so it never cancels your own actions (mid-swing = activation just gets
-            -- rejected, no harm). the stamina reserve stops it blocking you into a guard-break.
-            if onSnS and snsBlockAbility and snsBlockAbility:IsValid() and os.clock() < blockUntil then
+            -- AutoBlock driver: raise the SnS shield by injecting the Blocking STATE tag (native
+            -- OnBlockingTagChanged listener applies the block; class-activation is inert). hold
+            -- while an incoming-attack window is open + stamina healthy. add ONLY if not already
+            -- blocking (don't claim your manual block); remove ONLY the tag WE added (never strip
+            -- your manual block). stamina reserve stops it blocking you into a guard-break. NO
+            -- montage-stop -> never cancels your actions.
+            if onSnS then
                 local sp = staminaPct()
-                if not sp or sp > BLOCK_STAMINA_RESERVE then
-                    local active = false
-                    pcall(function() active = snsBlockAbility:IsActive() end)
-                    if not active then
-                        local cls = snsBlockAbility:GetClass()
-                        if cls and cls:IsValid() then pcall(function() asc:TryActivateAbilityByClass(cls, true) end) end
-                        if not blockRaiseLogged then blockRaiseLogged = true; log("autoblock: shield raised (stamina %.0f%%)", (sp or 1) * 100) end
-                    end
+                local wantBlock = (os.clock() < blockUntil) and (not sp or sp > BLOCK_STAMINA_RESERVE)
+                if wantBlock and not ascHasTag(asc, BLOCKING_TAG) then
+                    pcall(function() asc:AddUniqueGameplayTag(BLOCKING_TAG) end)
+                    blockTagByUs = true
+                    if not blockRaiseLogged then blockRaiseLogged = true; log("autoblock: shield UP (Blocking tag, stamina %.0f%%)", (sp or 1) * 100) end
+                elseif not wantBlock and blockTagByUs then
+                    pcall(function() asc:RemoveGameplayTag(BLOCKING_TAG) end)
+                    blockTagByUs = false
                 end
             end
 
@@ -1105,6 +1118,19 @@ local function registerAll()
     tryHook("/Game/Blueprints/GameplayCueNotifies/Ability/2HR/GCNA_2HR_ActiveReload_Fail.GCNA_2HR_ActiveReload_Fail_C:K2_HandleGameplayCue", function()
         log("reload: FAIL cue (should be impossible - report this)")
     end)
+    -- AutoBlock DIAG: OnBlockingTagChanged fires when the Blocking state tag flips (manual OR our
+    -- injected block). captures the REAL tag name once so we can confirm/correct BLOCKING_TAG.
+    tryHook("/Script/Wayfinder.WFLocomotionComponent:OnBlockingTagChanged", function(self, tagParam, countParam)
+        pcall(function()
+            if blockTagNameLogged then return end
+            local nm = "?"
+            pcall(function() nm = tagParam:get().TagName:ToString() end)
+            local cnt = -1
+            pcall(function() cnt = countParam:get() end)
+            blockTagNameLogged = true
+            log("autoblock DIAG: real Blocking tag = %s (count=%s) - byUs=%s", nm, tostring(cnt), tostring(blockTagByUs))
+        end)
+    end)
 end
 
 registerAll()
@@ -1148,6 +1174,8 @@ local function onTeardown()
     transitionAt = os.clock()
     pawnRef = nil
     sprintTagByUs = false
+    blockTagByUs = false
+    blockUntil = 0.0
 end
 RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenu", onTeardown)
 RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenuWithTextReason", onTeardown)
