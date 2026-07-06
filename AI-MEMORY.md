@@ -536,3 +536,9 @@ Per-repo memory. Append-only, concise. Format: `### YYYY-MM-DD - Category - entr
   3. PREEMPTIVE: covered by #2 (raise on detection = wind-up start, hold longer).
 - Diag: "shield UP (stamina X%)" throttled to 1.5s (was one-shot) so we can see block cycles + stamina over a fight to tune. "block-counter M1" one-shot.
 - Deployed. NEEDS test on SnS: block still raises vs melee/projectile; after blocking a melee hit while near+facing -> auto M1 counter fires (not spammy, doesn't interrupt your own attacks); shield holds through combos without dropping; stamina doesn't bottom out. Tune BLOCK_TAIL / COUNTER_DELAY / reserve from the throttled log.
+
+## 2026-07-06 - v75 test results + block directionality (FMC checkpoint)
+- AutoBlock v3 STABLE: log shows clean ENABLE/disable on SnS equip-swap + "shield UP (stamina X%)"; NO crashes, NO errors over a ~1hr session. Block raising confirmed.
+- OPEN/UNVERIFIED: block-counter M1 never logged this session ("autoblock: block-counter M1" absent) - either the near+facing+cooldown+not-attacking gate never all lined up, or scheduleCounter needs tuning. NEXT SESSION: block a melee hit while facing the enemy and confirm the counter M1 fires; if not, loosen the gate / check ExecuteWithDelay path.
+- BLOCK IS DIRECTIONAL (user-confirmed mechanic, saved to reference-wayfinder-weapons-echoes): pressing block switches char to mouse-facing/aim mode (shield faces mouse-look; WASD stays free for backpedal/sidestep); attacks from BEHIND are NOT blocked, front only. AutoBlock relies on the player aiming manually (they do). Optional un-built stamina-saver: skip raising block when the attacker is directly behind (offered, user hasn't decided).
+- All AutoBlock work (v1 groundwork -> v3 counter) + earlier session fixes (teardown crash guards, nameplate driveSelf split, parry no-montage-stop, sprint tag-only manual-safe, reload-cue dedupe, OptiScaler trace off) committed. Pushing at this FMC.
