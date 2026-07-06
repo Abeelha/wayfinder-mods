@@ -183,6 +183,19 @@ local lastParryInfo = "" -- for the external overlay
 local lastStaminaSkipLog = 0.0
 local lastConnectLog = 0.0
 
+-- ---- AutoBlock (Sword & Shield / "Guardian") ----
+-- SnS shield blocks incoming MELEE + RANGED (projectiles); ground AoEs are unblockable (they
+-- carry neither Characteristic tag, log-verified). auto-active whenever a SnS is equipped (no
+-- toggle); no counter, no montage-stop (won't cancel your actions); stamina-gated so it never
+-- blocks you into a guard-break.
+local BLOCK_SNS_MATCH = "Block_SNS"    -- SnS block ability class substring (GA_Player_Block_SNS_C)
+local BLOCK_WINDOW = 0.9               -- hold the shield this long after each incoming attack
+local BLOCK_STAMINA_RESERVE = 0.15     -- never block below this (blocking to 0 stamina = guard break)
+local onSnS = false                    -- true when the equipped weapon is a Sword & Shield
+local snsBlockAbility = nil            -- cached GA_Player_Block_SNS ability
+local blockUntil = 0.0                 -- keep the shield up until this os.clock()
+local blockRaiseLogged = false         -- one-shot diag
+
 local function isMeleeAttack(ability)
     local hasAttack, hasMelee = false, false
     local ok = pcall(function()
@@ -194,6 +207,22 @@ local function isMeleeAttack(ability)
         end
     end)
     return ok and hasAttack and hasMelee
+end
+
+-- AutoBlock: SnS blocks MELEE + RANGED (projectiles). ground AoEs carry neither Characteristic
+-- tag (log-verified) so they're naturally skipped - they can't be blocked anyway.
+local function isBlockableAttack(ability)
+    local blockable = false
+    pcall(function()
+        local tags = ability.AbilityTags.GameplayTags
+        for i = 1, #tags do
+            local n = tags[i].TagName:ToString()
+            if n == "Ability.Characteristic.Melee" or n == "Ability.Characteristic.Ranged" then
+                blockable = true
+            end
+        end
+    end)
+    return blockable
 end
 
 local function distTo(a, b)
@@ -357,6 +386,24 @@ local function currentBlockAbility(asc)
     return ab
 end
 
+-- AutoBlock: detect whether the equipped weapon is a Sword & Shield by its block ability class
+-- (GA_Player_Block_SNS_C) + cache that ability for the AutoBlock driver. called throttled (~3s),
+-- not per tick - the granted-ability scan is bounded but not free.
+local function refreshSnS(asc)
+    local ab = findGrantedBlockAbility(asc)
+    local isSnS = false
+    if ab and ab:IsValid() then
+        local ok, nm = pcall(function() return ab:GetClass():GetFName():ToString() end)
+        if ok and nm and nm:find(BLOCK_SNS_MATCH) then isSnS = true; snsBlockAbility = ab end
+    end
+    if not isSnS then snsBlockAbility = nil end
+    if isSnS ~= onSnS then
+        onSnS = isSnS
+        blockRaiseLogged = false
+        log("autoblock: %s", isSnS and "ENABLED (SnS equipped)" or "disabled (SnS unequipped)")
+    end
+end
+
 -- returns "ok"/"active"/"noblock"/false. block resolved weapon-accurately + rebind-safe.
 -- "noblock" = no parry on this weapon -> doParry bails BEFORE the montage-stop force ladder
 -- (= no cancelling the player's own actions on a no-parry weapon).
@@ -442,7 +489,7 @@ end
 local meleeCache = {}
 
 local function onEnemyAbility(self)
-    if not state.parry or not ready or settling() then return end
+    if (not state.parry and not onSnS) or not ready or settling() then return end
     local now = os.clock()
     if now - lastScheduled < 0.05 then return end
     local ok, err = pcall(function()
@@ -468,6 +515,10 @@ local function onEnemyAbility(self)
             end)
             log("parry: enemy GA seen %s [tags: %s]", className, tagStr)
         end
+        -- AutoBlock (SnS): raise the shield for incoming MELEE or RANGED, regardless of the parry
+        -- toggle. sets the hold window; the sprint-loop driver keeps the shield up.
+        if onSnS and isBlockableAttack(ab) then blockUntil = os.clock() + BLOCK_WINDOW end
+        if not state.parry then return end -- everything below is PARRY-only (AutoBlock done above)
         local verdict = meleeCache[className]
         if verdict == nil then
             verdict = isMeleeAttack(ab)
@@ -627,8 +678,26 @@ LoopAsync(300, function()
             -- weapon-swap parry preload: throttled to ~every 10th tick (~3s) instead of a
             -- native GetAbilityFromInputTag every 300ms tick (moderate perf trim).
             preloadTick = (preloadTick + 1) % 10
-            if state.parry and preloadTick == 0 then
-                pcall(function() preloadAbilityGraph(asc:GetAbilityFromInputTag(BLOCK_TAG)) end)
+            if preloadTick == 0 then
+                refreshSnS(asc) -- detect SnS equip/unequip (~every 3s) for AutoBlock
+                if state.parry then pcall(function() preloadAbilityGraph(asc:GetAbilityFromInputTag(BLOCK_TAG)) end) end
+            end
+
+            -- AutoBlock driver: while an incoming-attack window is open + stamina healthy, keep the
+            -- SnS shield raised. activate ONLY if not already active (no toggling), and NO
+            -- montage-stop, so it never cancels your own actions (mid-swing = activation just gets
+            -- rejected, no harm). the stamina reserve stops it blocking you into a guard-break.
+            if onSnS and snsBlockAbility and snsBlockAbility:IsValid() and os.clock() < blockUntil then
+                local sp = staminaPct()
+                if not sp or sp > BLOCK_STAMINA_RESERVE then
+                    local active = false
+                    pcall(function() active = snsBlockAbility:IsActive() end)
+                    if not active then
+                        local cls = snsBlockAbility:GetClass()
+                        if cls and cls:IsValid() then pcall(function() asc:TryActivateAbilityByClass(cls, true) end) end
+                        if not blockRaiseLogged then blockRaiseLogged = true; log("autoblock: shield raised (stamina %.0f%%)", (sp or 1) * 100) end
+                    end
+                end
             end
 
             -- mount resolved BEFORE the moving gate: rider velocity is ~0 while
