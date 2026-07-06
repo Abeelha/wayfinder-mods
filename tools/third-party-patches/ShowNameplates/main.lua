@@ -217,4 +217,31 @@ do
     if wp and wp:IsValid() then pcall(installHooks) end
 end
 
-print("[ShowNameplates] loaded - players only, event-driven (no polling), MP + perf safe\n")
+-- LIFECYCLE RAIL: the game swaps the local pawn on EVERY instance change (dungeon / other
+-- instance / death / fall-out-of-map / hub) and MOST do NOT fire ClientRestart - so the cached
+-- self-nameplate + HUD-meter refs would keep pointing at the OLD instance (the "HP stuck full /
+-- stamina blank after a zone change" bug). cheap 300ms poll of the local pawn ADDRESS (a pointer
+-- read, NOT the per-frame object scan that was the old fps killer): any change - or a cached ref
+-- going invalid - arms the settle gate + drops the caches so ShouldBeVisible/driveSelf re-capture
+-- cleanly for the new pawn. degrades safely: if localPawn() can't resolve, the stale-ref check
+-- still drops caches the moment they go invalid.
+local npLastPawnAddr = nil
+LoopAsync(300, function()
+    pcall(function()
+        local p = localPawn()
+        local pa = p and addrOf(p) or nil
+        local staleRef = (selfNameplate and not selfNameplate:IsValid())
+                      or (hudMeters and not hudMeters:IsValid())
+        if pa ~= npLastPawnAddr or staleRef then
+            npLastPawnAddr = pa
+            transitionAt = os.clock()
+            selfNameplate = nil
+            hudMeters = nil
+            captureMissLogged = false
+            svbLogged = false
+        end
+    end)
+    return false
+end)
+
+print("[ShowNameplates] loaded - players only, event-driven + 300ms lifecycle poll, MP + perf safe\n")

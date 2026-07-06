@@ -467,9 +467,30 @@ end
 local SS_CMD_REL = "Mods/SmartSort/smartsort-cmd.json"
 local SS_CMD_ABS = "D:/SteamLibrary/steamapps/common/Wayfinder/Atlas/Binaries/Win64/Mods/SmartSort/smartsort-cmd.json"
 local lastSortSeq = nil
+-- LIFECYCLE: a sort must never launch into a mid-transition (half-built) inventory. `tearing`
+-- only covers menu-return; dungeon / death / fall-out-of-map swap the pawn WITHOUT firing those
+-- hooks. poll the local pawn ADDRESS (cheap pointer read) - any change arms a short settle
+-- window during which SORT clicks are ignored (each sort re-resolves + IsValid-guards the
+-- inventory anyway, so this just avoids grabbing a loading-screen inventory). degrades safely:
+-- if the pawn can't resolve, this is a no-op and the per-sort guards still hold.
+local ssLastPawnAddr = nil
+local ssSettleUntil = 0.0
+local function ssLocalPawnAddr()
+    local ok, a = pcall(function()
+        local pc = require("UEHelpers"):GetPlayerController()
+        local p = pc and pc.Pawn
+        return (p and p:IsValid()) and p:GetAddress() or nil
+    end)
+    return ok and a or nil
+end
 LoopAsync(500, function()
     pcall(function()
-        if tearing then return end -- don't launch a sort into a tearing-down world
+        local pa = ssLocalPawnAddr()
+        if pa ~= ssLastPawnAddr then
+            ssLastPawnAddr = pa
+            ssSettleUntil = os.clock() + 1.5
+        end
+        if tearing or os.clock() < ssSettleUntil then return end -- tearing / mid-transition
         local f = io.open(SS_CMD_REL, "r") or io.open(SS_CMD_ABS, "r")
         if not f then return end
         local raw = f:read("*a"); f:close()

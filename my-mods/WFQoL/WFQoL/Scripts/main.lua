@@ -727,23 +727,57 @@ local function getMount(pawn)
     return nil
 end
 
+-- LIFECYCLE: wipe EVERY per-pawn cache + ownership flag so a new instance (dungeon / other
+-- instance / death / fall-out-of-map / hub) starts 100% clean - nothing stale from the old
+-- pawn carries over (stale sprint/block tag ownership was the "sprint stopped / manual sprint
+-- blocked" bug). called by the rail the instant the local pawn address changes, and by the
+-- teardown + ClientRestart hooks. sets ONLY Lua state -> no object access -> crash-safe.
+local function onNewInstance()
+    pawnRef = nil
+    libCache = nil
+    metersCache = nil          -- HUD widgets are rebuilt on the new level
+    currentReload = nil        -- drop any in-flight reload from the old instance
+    m1Held = false; m2Held = false
+    sendRelease = false; sendRelease2 = false; injecting = false
+    sprintTagByUs = false      -- never strip the NEW pawn's manual sprint
+    blockTagByUs = false       -- never strip the NEW pawn's manual block
+    blockUntil = 0.0
+    onSnS = false              -- re-detected by refreshSnS after settle
+    snsBlockAbility = nil
+    lastCombat = nil
+    loggedCombat = nil
+    combatPendingSince = 0.0
+    incoming = { name = "", kind = "", ts = 0 }
+end
+
 LoopAsync(300, function()
-    if not ready or settling() then return false end
+    -- LIFECYCLE RAIL - the SINGLE authority for `ready`. runs EVERY tick (NOT gated on ready)
+    -- so it can always detect the local pawn swapping. the game swaps the pawn on EVERY
+    -- instance change (dungeon / other instance / death / fall-out-of-map / hub) and MOST do
+    -- NOT fire ClientRestart - so identity, not events, drives readiness:
+    --   pawn nil/invalid  -> ready=false (mid-transition; touch nothing)
+    --   pawn addr changed -> new instance: wipe ALL per-pawn state, arm settle, ready=false
+    --   pawn stable + past the settle window -> ready=true
+    -- every other loop/hook (chain, parry, block, reload) just reads this `ready`/settling().
     ExecuteInGameThread(function()
         local ok, err = pcall(function()
-            if settling() then return end
             local pawn = getPawn()
-            if not pawn then return end
-            -- transition detection (open-world streaming doesn't fire ClientRestart):
-            -- a changed pawn address means actors were rebuilt; arm the settle gate
-            -- and skip this tick so we don't drive half-constructed movement/ASC
-            -- through a loading screen (perma-load guard).
-            local pa = addrOf(pawn)
-            if pa and pa ~= lastPawnAddr then
+            local pa = (pawn and pawn:IsValid()) and addrOf(pawn) or nil
+            if not pa then ready = false; return end
+            if pa ~= lastPawnAddr then
                 local firstSeen = (lastPawnAddr == nil)
                 lastPawnAddr = pa
-                if not firstSeen then transitionAt = os.clock(); return end
+                if not firstSeen then
+                    transitionAt = os.clock()
+                    ready = false
+                    onNewInstance()
+                    log("lifecycle: new instance - per-pawn state reset, settling %.1fs", SETTLE_SECS)
+                    return
+                end
             end
+            if settling() then return end
+            ready = true
+            -- ---- pawn is the SAME stable, settled local pawn from here down ----
             local asc = getASC(pawn)
             if not asc then return end
 
@@ -1219,18 +1253,14 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(self, New
     -- whole body guarded: an uncaught throw here surfaces as UE4SS
     -- "Error executing hook pre-callback ClientRestart" and can abort a transition
     local hookOk, hookErr = pcall(function()
-        transitionAt = os.clock() -- arm the settle gate: actors are (un)constructing
-        ready = true
-        m1Held = false
-        local ok, p = pcall(function() return NewPawn:get() end)
-        if ok and p and p:IsValid() then
-            pawnRef = p -- cache only a VALID pawn; else getPawn re-finds the local one
-            -- do NOT read p:GetClass() here: the raw ClientRestart pawn can still be
-            -- mid-construction with a null class ptr -> native 0x10 AV pcall can't catch
-            -- (load/transition crash). getPawn() re-validates lazily when actually used.
-        end
-        libCache = nil
-        metersCache = nil -- HUD widgets are rebuilt on the new level; drop stale ref
+        -- ClientRestart is only ONE of the transition paths (not all fire it - the lifecycle
+        -- rail is the universal backstop). treat it as a transition: arm settle + wipe per-pawn
+        -- state via onNewInstance; the rail brings `ready` back after the settle window. do NOT
+        -- set ready=true here - the raw ClientRestart pawn can be mid-construction (null class
+        -- ptr -> native AV pcall can't catch). also (re)do the one-time per-level setup.
+        transitionAt = os.clock()
+        ready = false
+        onNewInstance()
         preloadParryAssets() -- ClientRestart hook = guaranteed game thread
         launchOverlay()
         registerAll()
@@ -1246,10 +1276,8 @@ end)
 local function onTeardown()
     ready = false
     transitionAt = os.clock()
-    pawnRef = nil
-    sprintTagByUs = false
-    blockTagByUs = false
-    blockUntil = 0.0
+    lastPawnAddr = nil   -- force the rail to treat the next pawn as a fresh instance
+    onNewInstance()
 end
 RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenu", onTeardown)
 RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenuWithTextReason", onTeardown)
