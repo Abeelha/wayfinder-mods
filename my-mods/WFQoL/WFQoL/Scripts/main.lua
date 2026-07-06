@@ -167,18 +167,33 @@ local function reloadInProgress()
     return (os.clock() - currentReload.t0) < ((currentReload.maxT or 3.0) + 0.5)
 end
 
--- AutoChain INJECTION TIMING. a "tap" = press -> hold CHAIN_HOLD -> release -> wait CHAIN_GAP
--- before the next press. the OLD code alternated press/release every 70ms (~140ms/tap), which
--- re-pressed WHILE the swing was still in its wind-up; some weapons (Sword & Shield melee)
--- RESTART the swing on a fresh press -> the attack never leaves the START of the animation =
--- "perma-stuck trying to start the melee". a real hold + a gap between taps lets each swing
--- commit + progress. ~one tap per (HOLD+GAP) ~= natural swing cadence.
-local CHAIN_HOLD = 0.10  -- press held this long before release (a real tap, not a 70ms flick)
-local CHAIN_GAP  = 0.24  -- wait after a release before the next press (don't re-press mid-swing)
+-- AutoChain BUFFERS attacks off the game's OWN animation: it injects the NEXT attack only when
+-- the character is free again (the previous swing's montage has finished), so the weapon's real
+-- attack speed + animation drive the cadence - we never force a rate. forcing a rate re-pressed
+-- mid-swing and some weapons (Sword & Shield melee) RESTART the swing on a fresh press -> stuck
+-- at the wind-up start. a "tap" = press -> brief hold -> release; the next tap waits for the
+-- montage to end.
+local CHAIN_HOLD = 0.06          -- brief press-hold so the tap registers (melee doesn't need hold)
+local CHAIN_MINGAP = 0.12        -- after release, wait this long before checking - lets the swing's
+                                 -- montage actually START (else we'd re-press before it registers)
+local CHAIN_FALLBACK_GAP = 0.35  -- if montage state is unreadable, tap at this safe slow rate
 local chainDown = false      -- is our injected attack button currently pressed?
 local chainPressAt = 0.0     -- os.clock() when we pressed (hold timer)
-local chainReleaseAt = 0.0   -- os.clock() when we last released (gap timer)
+local chainReleaseAt = 0.0   -- os.clock() when we last released
 local lastChainLog = 0.0
+
+-- is the character currently in a montage (attack swing, block, dodge, hit-react...)? we inject
+-- the next attack only when this is FALSE = the game is free to swing again. returns nil if the
+-- anim state can't be read (then the loop uses a fixed fallback gap so it never spams).
+local function montagePlaying(pawn)
+    local res = nil
+    pcall(function()
+        local mesh = pawn.Mesh
+        local ai = mesh and mesh:IsValid() and mesh:GetAnimInstance()
+        if ai and ai:IsValid() then res = ai:IsAnyMontagePlaying() end
+    end)
+    return res
+end
 
 -- release any outstanding injected press so stopping the chain (ready flips false, reload starts,
 -- a transition/settle, or the button released) never leaves the attack button "held" = the
@@ -210,19 +225,23 @@ LoopAsync(70, function()
         injecting = true
         pcall(function()
             if chainDown then
-                -- release once the hold has elapsed (completes the tap)
+                -- release once the brief hold has elapsed (completes the tap)
                 if now - chainPressAt >= CHAIN_HOLD then
                     if m1Held then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_37(LMB) end
                     if m2Held then pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_41(RMB) end
                     chainDown = false; chainReleaseAt = now
                     sendRelease = false; sendRelease2 = false
                 end
-            elseif now - chainReleaseAt >= CHAIN_GAP then
-                -- start a new tap once the gap has passed (the swing had time to commit)
-                if m1Held then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_36(LMB); sendRelease = true end
-                if m2Held then pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_40(RMB); sendRelease2 = true end
-                chainDown = true; chainPressAt = now
-                if now - lastChainLog > 3.0 then lastChainLog = now; log("chain: tapping (m1=%s m2=%s)", tostring(m1Held), tostring(m2Held)) end
+            elseif now - chainReleaseAt >= CHAIN_MINGAP then
+                -- BUFFER: inject the next tap only when the swing animation is DONE (no montage
+                -- playing) = respect the game's attack speed. unreadable montage -> safe fixed gap.
+                local busy = montagePlaying(pawn)
+                if busy == false or (busy == nil and now - chainReleaseAt >= CHAIN_FALLBACK_GAP) then
+                    if m1Held then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_36(LMB); sendRelease = true end
+                    if m2Held then pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_40(RMB); sendRelease2 = true end
+                    chainDown = true; chainPressAt = now
+                    if now - lastChainLog > 3.0 then lastChainLog = now; log("chain: tap (montage=%s)", tostring(busy)) end
+                end
             end
         end)
         injecting = false
