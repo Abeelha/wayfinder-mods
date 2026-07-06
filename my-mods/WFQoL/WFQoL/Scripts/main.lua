@@ -112,6 +112,7 @@ local function getASC(pawn)
 end
 
 local function ascHasTag(asc, tag)
+    if not (asc and asc:IsValid()) then return false end
     local lib = getLib()
     return lib and lib:AbilitySystemHasTagExactly(asc, tag) or false
 end
@@ -238,6 +239,7 @@ local function isBlockableAttack(ability)
 end
 
 local function distTo(a, b)
+    if not (a and a:IsValid() and b and b:IsValid()) then return math.huge end
     local pa = a:K2_GetActorLocation()
     local pb = b:K2_GetActorLocation()
     local dx, dy, dz = pa.X - pb.X, pa.Y - pb.Y, pa.Z - pb.Z
@@ -336,7 +338,7 @@ end
 -- fire-time check: is this attack actually going to land on us?
 local function willConnect(enemy, pawn)
     local ok, res = pcall(function()
-        if not enemy or not enemy:IsValid() then return false end
+        if not (enemy and enemy:IsValid() and pawn and pawn:IsValid()) then return false end
         local pe = enemy:K2_GetActorLocation()
         local pp = pawn:K2_GetActorLocation()
         local dx, dy, dz = pp.X - pe.X, pp.Y - pe.Y, pp.Z - pe.Z
@@ -424,7 +426,7 @@ end
 -- facing us; the counter needs the reverse (we face them), so this is its own check.
 local function nearFacing(pawn, enemy)
     local ok, res = pcall(function()
-        if not (enemy and enemy:IsValid() and pawn) then return false end
+        if not (enemy and enemy:IsValid() and pawn and pawn:IsValid()) then return false end
         local pp = pawn:K2_GetActorLocation()
         local pe = enemy:K2_GetActorLocation()
         local dx, dy, dz = pe.X - pp.X, pe.Y - pp.Y, pe.Z - pp.Z
@@ -483,6 +485,7 @@ end
 -- "noblock" = no parry on this weapon -> doParry bails BEFORE the montage-stop force ladder
 -- (= no cancelling the player's own actions on a no-parry weapon).
 local function tryActivateParry(asc)
+    if not (asc and asc:IsValid()) then return false end
     local blockAbility = currentBlockAbility(asc)
     if not (blockAbility and blockAbility:IsValid()) then return "noblock" end
     preloadAbilityGraph(blockAbility)

@@ -104,8 +104,15 @@ end
 
 -- Check if the string contains any of the table values
 function existsInTable(dataString, list)
+    -- type/nil-safe: echoRarity is a NUMBER (and may be nil if the field is absent);
+    -- raw string.find(nil, ...) threw in the console RunSmartSort path (no pcall there,
+    -- unlike the overlay ss_ruleFlag path). coerce both sides + plain-text find (the 4th
+    -- arg `true` disables pattern magic - correct for slot/rarity tokens, and the string
+    -- slots path is unchanged since those tokens have no magic chars).
+    if dataString == nil or list == nil then return false end
+    dataString = tostring(dataString)
     for _, item in ipairs(list) do
-        if string.find(dataString, item) then
+        if string.find(dataString, tostring(item), 1, true) then
             return true -- Found a match
         end
     end
