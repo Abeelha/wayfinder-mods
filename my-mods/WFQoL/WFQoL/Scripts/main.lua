@@ -871,6 +871,13 @@ end)
 --    bug). the graph's bound press handlers (OnTriggered_*(ElapsedTime)) are
 --    plain UFunctions on the ability - call those directly.
 local RELOAD_LATENCY = 0.03 -- scheduling/input latency compensation, seconds
+-- press this many seconds into the reload. the window is FORCE-OPEN (Tolerance=1000) so ANY
+-- press = perfect; we do NOT need to hit the displayed center. pressing at the maxT-derived
+-- center failed: some weapons' real reload (~0.5s) is far shorter than the reported
+-- MaxReloadTime (1.5s), so a center press (0.75s) landed AT/AFTER the reload end and the game
+-- read it as a fresh reload-button press -> perma-reload loop. an early press lands mid-reload,
+-- feeds the minigame, and can never be mistaken for a new reload input.
+local PRESS_EARLY = 0.18
 local windowForcedLogged = false
 local successThisCycle = false
 
@@ -945,27 +952,17 @@ local function scheduleWindowPress(ab, t0, attempt)
                     return
                 end
                 currentReload.maxT = maxT
-                log("reload: window %.2f-%.2f max %.2fs -> press at %.2fs", wmin, wmax, maxT, pressSec)
+                -- readWindow still runs (probes the minigame is live + logs maxT), but we press
+                -- EARLY (PRESS_EARLY), NOT at the maxT-center pressSec - see PRESS_EARLY note.
+                log("reload: window %.2f-%.2f max %.2fs -> press at %.2fs (early)", wmin, wmax, maxT, PRESS_EARLY)
                 phase = "press"
                 local function firePress()
                     if not (state.reload and currentReload and currentReload.t0 == t0 and ab:IsValid()) then return end
                     currentReload.pressed = true
                     pressReload(ab, os.clock() - t0)
                     log("reload: pressed at %.2fs", os.clock() - t0)
-                    -- second bound handler, in case the first isn't the press path
-                    ExecuteWithDelay(250, function()
-                        ExecuteInGameThread(function()
-                            pcall(function()
-                                if state.reload and currentReload and currentReload.t0 == t0 and ab:IsValid() then
-                                    local e2 = os.clock() - t0
-                                    pcall(function() ab:OnTriggered_0C5309BB4DBB1136C0E5DEBE6E42DF1A(e2) end)
-                                    log("reload: fallback press at %.2fs", e2)
-                                end
-                            end)
-                        end)
-                    end)
                 end
-                local remainMs = math.floor((pressSec - RELOAD_LATENCY - (os.clock() - t0)) * 1000)
+                local remainMs = math.floor((PRESS_EARLY - RELOAD_LATENCY - (os.clock() - t0)) * 1000)
                 if remainMs <= 10 then
                     firePress()
                     return
