@@ -167,23 +167,62 @@ local function reloadInProgress()
     return (os.clock() - currentReload.t0) < ((currentReload.maxT or 3.0) + 0.5)
 end
 
+-- AutoChain INJECTION TIMING. a "tap" = press -> hold CHAIN_HOLD -> release -> wait CHAIN_GAP
+-- before the next press. the OLD code alternated press/release every 70ms (~140ms/tap), which
+-- re-pressed WHILE the swing was still in its wind-up; some weapons (Sword & Shield melee)
+-- RESTART the swing on a fresh press -> the attack never leaves the START of the animation =
+-- "perma-stuck trying to start the melee". a real hold + a gap between taps lets each swing
+-- commit + progress. ~one tap per (HOLD+GAP) ~= natural swing cadence.
+local CHAIN_HOLD = 0.10  -- press held this long before release (a real tap, not a 70ms flick)
+local CHAIN_GAP  = 0.24  -- wait after a release before the next press (don't re-press mid-swing)
+local chainDown = false      -- is our injected attack button currently pressed?
+local chainPressAt = 0.0     -- os.clock() when we pressed (hold timer)
+local chainReleaseAt = 0.0   -- os.clock() when we last released (gap timer)
+local lastChainLog = 0.0
+
+-- release any outstanding injected press so stopping the chain (ready flips false, reload starts,
+-- a transition/settle, or the button released) never leaves the attack button "held" = the
+-- character stuck mid-attack-animation. game thread.
+local function flushChainRelease()
+    if not (sendRelease or sendRelease2) then chainDown = false; return end
+    ExecuteInGameThread(function()
+        if pawnRef and pawnRef:IsValid() then
+            injecting = true
+            pcall(function()
+                if sendRelease then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_37(LMB) end
+                if sendRelease2 then pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_41(RMB) end
+            end)
+            injecting = false
+        end
+        sendRelease = false; sendRelease2 = false; chainDown = false
+    end)
+end
+
 LoopAsync(70, function()
-    if not (state.chain and ready) or settling() then return false end
-    if not (m1Held or m2Held) then return false end
-    if reloadInProgress() then return false end
+    -- can't continue the chain? flush any outstanding press so nothing is left held.
+    if not (state.chain and ready) or settling() or reloadInProgress() or not (m1Held or m2Held) then
+        flushChainRelease()
+        return false
+    end
     ExecuteInGameThread(function()
         if not pawnRef or not pawnRef:IsValid() then return end
+        local now = os.clock()
         injecting = true
         pcall(function()
-            if m1Held then
-                if sendRelease then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_37(LMB)
-                else pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_36(LMB) end
-                sendRelease = not sendRelease
-            end
-            if m2Held then
-                if sendRelease2 then pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_41(RMB)
-                else pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_40(RMB) end
-                sendRelease2 = not sendRelease2
+            if chainDown then
+                -- release once the hold has elapsed (completes the tap)
+                if now - chainPressAt >= CHAIN_HOLD then
+                    if m1Held then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_37(LMB) end
+                    if m2Held then pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_41(RMB) end
+                    chainDown = false; chainReleaseAt = now
+                    sendRelease = false; sendRelease2 = false
+                end
+            elseif now - chainReleaseAt >= CHAIN_GAP then
+                -- start a new tap once the gap has passed (the swing had time to commit)
+                if m1Held then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_36(LMB); sendRelease = true end
+                if m2Held then pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_40(RMB); sendRelease2 = true end
+                chainDown = true; chainPressAt = now
+                if now - lastChainLog > 3.0 then lastChainLog = now; log("chain: tapping (m1=%s m2=%s)", tostring(m1Held), tostring(m2Held)) end
             end
         end)
         injecting = false
@@ -771,7 +810,7 @@ local function onNewInstance()
     metersCache = nil          -- HUD widgets are rebuilt on the new level
     currentReload = nil        -- drop any in-flight reload from the old instance
     m1Held = false; m2Held = false
-    sendRelease = false; sendRelease2 = false; injecting = false
+    sendRelease = false; sendRelease2 = false; injecting = false; chainDown = false
     sprintTagByUs = false      -- never strip the NEW pawn's manual sprint
     blockTagByUs = false       -- never strip the NEW pawn's manual block
     blockUntil = 0.0
