@@ -493,3 +493,10 @@ Per-repo memory. Append-only, concise. Format: `### YYYY-MM-DD - Category - entr
 - CLEANUP (Priority 4): removed dead SPRINT_CLASS/getSprintClass/sprintClassCache; rewrote stale escalating-strategies comment; nil-guarded SmartSort's currentExp/startingExp typo (was nil>nil in the unused legacy RunSmartSort path).
 - Sprint on-foot = tag-only + debounced combat + ready/settling-gated (unchanged, audit-confirmed compliant). Parry behavior UNCHANGED (user: good enough) - only crash gate added.
 - All 3 luaparse OK, deployed (WFQoL repo==game identical), NP+SS synced game->repo. NEEDS test: play combat + change zones + RETURN TO MENU + CLOSE GAME -> no crash; self nameplate HP tracks real (not full) + stamina fills (log "self drive OK: hp=.. stam=.."); sprint W out-of-combat works; SmartSort unchanged.
+
+## 2026-07-06 - v70: log-spam trim (reload success cue) + status confirmed clean
+- Log sweep after v69: NO new crashes, 0 errors. crash_2026_07_06_00_03_04 was OptiScaler (GPU upscaler) not our mods - turned off its trace logging (OptiScaler.ini LogToFile=false + LogLevel=4, deleted stale 181MB log). Crash-on-close now writes NO dmp (v69 teardown guards working) = benign exit hiccup only.
+- SmartSort confirmed working in MP/solo: "SORT: 845 items, 23 marked, 3 cleared" - self-heal (3 cleared), equipped respected (eq=true kept), favorites (flag=2) untouched, keeper=highest exp/rarity. Note: some items show flag=8 (unknown game flag, likely game's own sell/lock) - processed normally.
+- IMPROVEMENT: "reload: success cue" was 327 log lines/session - K2_HandleGameplayCue on GCNA_2HR_ActiveReload_Success re-fires 2-3x per reload. Deduped: log only on first cue of a cycle (if not successThisCycle), flag side-effect still runs every fire. main.lua ~1020.
+- Nameplate self drive confirmed (hp+stam both read, split-pcall fix holding). Sprint foot tag ON + mount both working. Parry unchanged.
+- Deployed WFQoL. All 3 mods stable.

@@ -1018,8 +1018,11 @@ local function registerAll()
     tryHook(RELOAD_OK_GA .. ":K2_ActivateAbility", onReloadSucceeded)
     -- ground-truth signals from the game's own success/fail cues (preloaded)
     tryHook("/Game/Blueprints/GameplayCueNotifies/Ability/2HR/GCNA_2HR_ActiveReload_Success.GCNA_2HR_ActiveReload_Success_C:K2_HandleGameplayCue", function()
+        -- K2_HandleGameplayCue re-fires 2-3x per reload (OnActive/WhileActive/OnExecute) - was
+        -- 327 log lines/session. log only on the first cue of a cycle (successThisCycle resets
+        -- to false at reload start); the flag side-effect still runs every time.
+        if not successThisCycle then log("reload: success cue") end
         successThisCycle = true
-        log("reload: success cue")
     end)
     tryHook("/Game/Blueprints/GameplayCueNotifies/Ability/2HR/GCNA_2HR_ActiveReload_Fail.GCNA_2HR_ActiveReload_Fail_C:K2_HandleGameplayCue", function()
         log("reload: FAIL cue (should be impossible - report this)")
