@@ -458,7 +458,15 @@ local function onEnemyAbility(self)
         if not meleeCache["_seen_" .. className] then
             meleeCache["_seen_" .. className] = true
             stat.seen = stat.seen + 1
-            log("parry: enemy GA seen %s", className)
+            -- DIAG (AutoBlock groundwork): dump the ability's full tag list once per class so we
+            -- can see how ground AoEs are tagged vs melee (Attack + Melee = melee; Attack without
+            -- Melee, or an AoE/Ranged tag = the AoE case AutoBlock needs to catch).
+            local tagStr = ""
+            pcall(function()
+                local tags = ab.AbilityTags.GameplayTags
+                for i = 1, #tags do tagStr = tagStr .. tags[i].TagName:ToString() .. " " end
+            end)
+            log("parry: enemy GA seen %s [tags: %s]", className, tagStr)
         end
         local verdict = meleeCache[className]
         if verdict == nil then
