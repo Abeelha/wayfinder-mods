@@ -189,8 +189,10 @@ local lastConnectLog = 0.0
 -- toggle); no counter, no montage-stop (won't cancel your actions); stamina-gated so it never
 -- blocks you into a guard-break.
 local BLOCK_SNS_MATCH = "Block_SNS"    -- SnS block ability class substring (GA_Player_Block_SNS_C)
-local BLOCK_WINDOW = 0.9               -- hold the shield this long after each incoming attack
+local BLOCK_TAIL = 0.55                 -- keep the shield up this long AFTER the hit lands (bridges combos)
 local BLOCK_STAMINA_RESERVE = 0.15     -- never block below this (blocking to 0 stamina = guard break)
+local COUNTER_COOLDOWN = 0.6           -- min gap between block-counter M1s
+local COUNTER_DELAY = 0.12             -- after the shield absorbs the hit, before the counter M1
 -- shield is raised the SAME way sprint works: inject the Blocking STATE tag -> the native
 -- OnBlockingTagChanged listener on WFLocomotionComponent applies the block. class-activating
 -- GA_Player_Block_SNS_C is INERT (block is a hold ability). tag name mirrors the Sprinting tag;
@@ -202,6 +204,9 @@ local blockUntil = 0.0                 -- keep the shield up until this os.clock
 local blockTagByUs = false             -- true only while WE hold the Blocking tag (never strip a manual block)
 local blockRaiseLogged = false         -- one-shot diag
 local blockTagNameLogged = false       -- one-shot: real blocking tag name captured from OnBlockingTagChanged
+local lastCounter = 0.0                 -- last block-counter M1 time (cooldown)
+local lastBlockLog = 0.0               -- throttle for the block-UP diag
+local counterLogged = false            -- one-shot: block-counter fired
 
 local function isMeleeAttack(ability)
     local hasAttack, hasMelee = false, false
@@ -415,6 +420,65 @@ local function refreshSnS(asc)
     end
 end
 
+-- AutoBlock counter: US near + facing the enemy (SnS melee range). willConnect checks the ENEMY
+-- facing us; the counter needs the reverse (we face them), so this is its own check.
+local function nearFacing(pawn, enemy)
+    local ok, res = pcall(function()
+        if not (enemy and enemy:IsValid() and pawn) then return false end
+        local pp = pawn:K2_GetActorLocation()
+        local pe = enemy:K2_GetActorLocation()
+        local dx, dy, dz = pe.X - pp.X, pe.Y - pp.Y, pe.Z - pp.Z
+        if math.sqrt(dx * dx + dy * dy + dz * dz) > CONNECT_RANGE then return false end
+        local fwd = pawn:GetActorForwardVector()
+        local len = math.sqrt(dx * dx + dy * dy)
+        if len > 1 then
+            local dot = (fwd.X * dx + fwd.Y * dy) / len
+            if dot < FACING_DOT then return false end
+        end
+        return true
+    end)
+    return ok and res
+end
+
+-- inject one M1 tap (press + release) = the block counter. `injecting` guards the input hooks
+-- so our tap isn't mistaken for the player holding M1.
+local function counterM1()
+    if not (pawnRef and pawnRef:IsValid()) then return end
+    injecting = true
+    pcall(function() pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_36(LMB) end)
+    injecting = false
+    ExecuteWithDelay(60, function()
+        ExecuteInGameThread(function()
+            if not (pawnRef and pawnRef:IsValid()) then return end
+            injecting = true
+            pcall(function() pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_37(LMB) end)
+            injecting = false
+        end)
+    end)
+end
+
+-- schedule a block-counter: an M1 shortly after the shield absorbs the hit, but ONLY if we're
+-- still near+facing the enemy, on SnS, off cooldown, and NOT already attacking (never inject
+-- over your own combo).
+local function scheduleCounter(enemy, hitTime)
+    local delayMs = math.floor(math.max(hitTime + COUNTER_DELAY, 0.05) * 1000)
+    ExecuteWithDelay(delayMs, function()
+        ExecuteInGameThread(function()
+            pcall(function()
+                if not onSnS or not ready or settling() then return end
+                if m1Held or m2Held then return end
+                local now = os.clock()
+                if now - lastCounter < COUNTER_COOLDOWN then return end
+                local pawn = getPawn()
+                if not (pawn and nearFacing(pawn, enemy)) then return end
+                lastCounter = now
+                counterM1()
+                if not counterLogged then counterLogged = true; log("autoblock: block-counter M1") end
+            end)
+        end)
+    end)
+end
+
 -- returns "ok"/"active"/"noblock"/false. block resolved weapon-accurately + rebind-safe.
 -- "noblock" = no parry on this weapon -> doParry bails BEFORE the montage-stop force ladder
 -- (= no cancelling the player's own actions on a no-parry weapon).
@@ -527,8 +591,17 @@ local function onEnemyAbility(self)
             log("parry: enemy GA seen %s [tags: %s]", className, tagStr)
         end
         -- AutoBlock (SnS): raise the shield for incoming MELEE or RANGED, regardless of the parry
-        -- toggle. sets the hold window; the sprint-loop driver keeps the shield up.
-        if onSnS and isBlockableAttack(ab) then blockUntil = os.clock() + BLOCK_WINDOW end
+        -- toggle. hold = from wind-up detection now, THROUGH the hit (hitTime), PLUS BLOCK_TAIL so
+        -- multi-hit combos don't drop the shield between swings. driver keeps it up.
+        if onSnS and isBlockableAttack(ab) then
+            local ht = timings[className] or DEFAULT_HIT
+            blockUntil = os.clock() + ht + BLOCK_TAIL
+            -- block-counter: after the shield absorbs a MELEE hit, if near+facing, throw one M1
+            if isMeleeAttack(ab) then
+                local ce = ab:GetAvatarActorFromActorInfo()
+                if ce and ce:IsValid() then scheduleCounter(ce, ht) end
+            end
+        end
         if not state.parry then return end -- everything below is PARRY-only (AutoBlock done above)
         local verdict = meleeCache[className]
         if verdict == nil then
@@ -706,7 +779,8 @@ LoopAsync(300, function()
                 if wantBlock and not ascHasTag(asc, BLOCKING_TAG) then
                     pcall(function() asc:AddUniqueGameplayTag(BLOCKING_TAG) end)
                     blockTagByUs = true
-                    if not blockRaiseLogged then blockRaiseLogged = true; log("autoblock: shield UP (Blocking tag, stamina %.0f%%)", (sp or 1) * 100) end
+                    local nowb = os.clock()
+                    if nowb - lastBlockLog > 1.5 then lastBlockLog = nowb; log("autoblock: shield UP (stamina %.0f%%)", (sp or 1) * 100) end
                 elseif not wantBlock and blockTagByUs then
                     pcall(function() asc:RemoveGameplayTag(BLOCKING_TAG) end)
                     blockTagByUs = false
