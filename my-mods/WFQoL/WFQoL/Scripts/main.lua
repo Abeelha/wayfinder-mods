@@ -50,6 +50,17 @@ local RMB = { KeyName = FName("RightMouseButton") }  -- Attack2 = heavy melee, b
 local BLOCK_TAG = { TagName = FName("Input.Combat.Block") }
 local INCOMBAT_TAG = { TagName = FName("Character.State.Generic.InCombat") }
 local SPRINTING_TAG = { TagName = FName("Character.State.Generic.Sprinting") }
+-- player ACTION-STATE tags (GA ActivationOwnedTags, confirmed in the object/asset dump). AutoChain
+-- reads these to BUFFER off the game's own animation: it presses the next attack only when NONE are
+-- set = the previous swing finished AND the player isn't dodging/casting/staggered, so it respects
+-- the weapon's real speed and never cancels a manual action. `Attacking` is held for the whole
+-- melee swing on every weapon (ActivationOwnedTags on GA_Player_Melee_Base).
+local ATTACKING_TAG        = { TagName = FName("Character.State.Generic.Attacking") }
+local DODGING_TAG          = { TagName = FName("Character.State.Generic.Dodging") }
+local GUARDBREAK_TAG       = { TagName = FName("Character.State.Generic.GuardBreak") }
+local CONTROLLEDLAUNCH_TAG = { TagName = FName("Character.State.Generic.ControlledLaunch") }
+local CHARABILITY_TAG      = { TagName = FName("Character.State.Generic.CharacterAbility") }
+local WEAPONABILITY_TAG    = { TagName = FName("Character.State.Generic.WeaponAbilityUsed") }
 
 local timings = require("timings") -- enemy GA class -> seconds to first weapon trace
 
@@ -148,6 +159,18 @@ local function ascHasTag(asc, tag)
     return lib and lib:AbilitySystemHasTagExactly(asc, tag) or false
 end
 
+-- is the player in ANY action (attacking / dodging / casting / staggered / knocked)? AutoChain
+-- buffers off this: it won't inject the next attack while any of these is set, so it never cancels
+-- what the player/character is doing and it re-presses only once the swing has ended.
+local ACTING_TAGS = { ATTACKING_TAG, DODGING_TAG, GUARDBREAK_TAG, CONTROLLEDLAUNCH_TAG, CHARABILITY_TAG, WEAPONABILITY_TAG }
+local function playerActing(asc)
+    if not (asc and asc:IsValid()) then return false end
+    for i = 1, #ACTING_TAGS do
+        if ascHasTag(asc, ACTING_TAGS[i]) then return true end
+    end
+    return false
+end
+
 -- ---------------------------------------------------------------- AutoChain
 -- one loop chains BOTH: hold M1 -> auto light attacks (Attack1), hold M2 -> auto heavy
 -- attacks (Attack2). same F7 toggle. the game gates the next swing by animation, so a
@@ -167,33 +190,21 @@ local function reloadInProgress()
     return (os.clock() - currentReload.t0) < ((currentReload.maxT or 3.0) + 0.5)
 end
 
--- AutoChain BUFFERS attacks off the game's OWN animation: it injects the NEXT attack only when
--- the character is free again (the previous swing's montage has finished), so the weapon's real
--- attack speed + animation drive the cadence - we never force a rate. forcing a rate re-pressed
--- mid-swing and some weapons (Sword & Shield melee) RESTART the swing on a fresh press -> stuck
--- at the wind-up start. a "tap" = press -> brief hold -> release; the next tap waits for the
--- montage to end.
-local CHAIN_HOLD = 0.06          -- brief press-hold so the tap registers (melee doesn't need hold)
-local CHAIN_MINGAP = 0.12        -- after release, wait this long before checking - lets the swing's
-                                 -- montage actually START (else we'd re-press before it registers)
-local CHAIN_FALLBACK_GAP = 0.35  -- if montage state is unreadable, tap at this safe slow rate
+-- AutoChain BUFFERS attacks off the game's OWN action state: it injects the NEXT attack only when
+-- the previous swing's `Attacking` tag has cleared (swing finished) AND the player isn't in another
+-- action (dodge/cast/stagger) - so the weapon's real attack speed drives the cadence, we never
+-- force a rate, and we never cancel a manual action. forcing a rate re-pressed mid-swing and some
+-- weapons (SnS melee) RESTART the swing on a fresh press -> stuck at the wind-up. a "tap" = press ->
+-- brief hold -> release; the next tap waits for `playerActing` to go false.
+local CHAIN_HOLD = 0.06      -- brief press-hold so the tap registers (melee doesn't need hold)
+local CHAIN_MINGAP = 0.12    -- min gap after release before the next press: lets the swing's
+                             -- Attacking tag SET (so we don't re-press before it registers), and
+                             -- caps the tap rate if the tag ever can't be read (anti-spam floor)
 local chainDown = false      -- is our injected attack button currently pressed?
 local chainPressAt = 0.0     -- os.clock() when we pressed (hold timer)
 local chainReleaseAt = 0.0   -- os.clock() when we last released
+local chainLastTapAt = 0.0   -- os.clock() of the previous press (diag: inter-tap interval)
 local lastChainLog = 0.0
-
--- is the character currently in a montage (attack swing, block, dodge, hit-react...)? we inject
--- the next attack only when this is FALSE = the game is free to swing again. returns nil if the
--- anim state can't be read (then the loop uses a fixed fallback gap so it never spams).
-local function montagePlaying(pawn)
-    local res = nil
-    pcall(function()
-        local mesh = pawn.Mesh
-        local ai = mesh and mesh:IsValid() and mesh:GetAnimInstance()
-        if ai and ai:IsValid() then res = ai:IsAnyMontagePlaying() end
-    end)
-    return res
-end
 
 -- release any outstanding injected press so stopping the chain (ready flips false, reload starts,
 -- a transition/settle, or the button released) never leaves the attack button "held" = the
@@ -233,14 +244,17 @@ LoopAsync(70, function()
                     sendRelease = false; sendRelease2 = false
                 end
             elseif now - chainReleaseAt >= CHAIN_MINGAP then
-                -- BUFFER: inject the next tap only when the swing animation is DONE (no montage
-                -- playing) = respect the game's attack speed. unreadable montage -> safe fixed gap.
-                local busy = montagePlaying(pawn)
-                if busy == false or (busy == nil and now - chainReleaseAt >= CHAIN_FALLBACK_GAP) then
+                -- BUFFER off the game's own state: inject the next tap only when the previous swing's
+                -- Attacking tag has cleared AND the player isn't in another action = respect the
+                -- weapon's real attack speed + never cancel a manual dodge/cast. asc nil (transition)
+                -- -> skip this tick; the lifecycle rail handles readiness.
+                local asc = getASC(pawnRef)
+                if asc and not playerActing(asc) then
                     if m1Held then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_36(LMB); sendRelease = true end
                     if m2Held then pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_40(RMB); sendRelease2 = true end
                     chainDown = true; chainPressAt = now
-                    if now - lastChainLog > 3.0 then lastChainLog = now; log("chain: tap (montage=%s)", tostring(busy)) end
+                    local dt = now - chainLastTapAt; chainLastTapAt = now
+                    if now - lastChainLog > 3.0 then lastChainLog = now; log("chain: tap (dt=%.2fs)", dt) end
                 end
             end
         end)
@@ -273,31 +287,6 @@ local lastParryInfo = "" -- for the external overlay
 local lastStaminaSkipLog = 0.0
 local lastConnectLog = 0.0
 
--- ---- AutoBlock (Sword & Shield / "Guardian") ----
--- SnS shield blocks incoming MELEE + RANGED (projectiles); ground AoEs are unblockable (they
--- carry neither Characteristic tag, log-verified). auto-active whenever a SnS is equipped (no
--- toggle); no counter, no montage-stop (won't cancel your actions); stamina-gated so it never
--- blocks you into a guard-break.
-local BLOCK_SNS_MATCH = "Block_SNS"    -- SnS block ability class substring (GA_Player_Block_SNS_C)
-local BLOCK_TAIL = 0.55                 -- keep the shield up this long AFTER the hit lands (bridges combos)
-local BLOCK_STAMINA_RESERVE = 0.15     -- never block below this (blocking to 0 stamina = guard break)
-local COUNTER_COOLDOWN = 0.6           -- min gap between block-counter M1s
-local COUNTER_DELAY = 0.12             -- after the shield absorbs the hit, before the counter M1
--- shield is raised the SAME way sprint works: inject the Blocking STATE tag -> the native
--- OnBlockingTagChanged listener on WFLocomotionComponent applies the block. class-activating
--- GA_Player_Block_SNS_C is INERT (block is a hold ability). tag name mirrors the Sprinting tag;
--- the OnBlockingTagChanged diagnostic hook confirms/corrects it from a real (manual or auto) block.
-local BLOCKING_TAG = { TagName = FName("Character.State.Generic.Blocking") }
-local onSnS = false                    -- true when the equipped weapon is a Sword & Shield
-local snsBlockAbility = nil            -- cached GA_Player_Block_SNS ability
-local blockUntil = 0.0                 -- keep the shield up until this os.clock()
-local blockTagByUs = false             -- true only while WE hold the Blocking tag (never strip a manual block)
-local blockRaiseLogged = false         -- one-shot diag
-local blockTagNameLogged = false       -- one-shot: real blocking tag name captured from OnBlockingTagChanged
-local lastCounter = 0.0                 -- last block-counter M1 time (cooldown)
-local lastBlockLog = 0.0               -- throttle for the block-UP diag
-local counterLogged = false            -- one-shot: block-counter fired
-
 local function isMeleeAttack(ability)
     local hasAttack, hasMelee = false, false
     local ok = pcall(function()
@@ -309,22 +298,6 @@ local function isMeleeAttack(ability)
         end
     end)
     return ok and hasAttack and hasMelee
-end
-
--- AutoBlock: SnS blocks MELEE + RANGED (projectiles). ground AoEs carry neither Characteristic
--- tag (log-verified) so they're naturally skipped - they can't be blocked anyway.
-local function isBlockableAttack(ability)
-    local blockable = false
-    pcall(function()
-        local tags = ability.AbilityTags.GameplayTags
-        for i = 1, #tags do
-            local n = tags[i].TagName:ToString()
-            if n == "Ability.Characteristic.Melee" or n == "Ability.Characteristic.Ranged" then
-                blockable = true
-            end
-        end
-    end)
-    return blockable
 end
 
 local function distTo(a, b)
@@ -489,87 +462,6 @@ local function currentBlockAbility(asc)
     return ab
 end
 
--- AutoBlock: detect whether the equipped weapon is a Sword & Shield by its block ability class
--- (GA_Player_Block_SNS_C) + cache that ability for the AutoBlock driver. called throttled (~3s),
--- not per tick - the granted-ability scan is bounded but not free.
-local function refreshSnS(asc)
-    local ab = findGrantedBlockAbility(asc)
-    local isSnS = false
-    if ab and ab:IsValid() then
-        local ok, nm = pcall(function() return ab:GetClass():GetFName():ToString() end)
-        if ok and nm and nm:find(BLOCK_SNS_MATCH) then isSnS = true; snsBlockAbility = ab end
-    end
-    if not isSnS then
-        snsBlockAbility = nil
-        -- unequipped SnS while we held the block -> drop our injected tag so it can't stick
-        if blockTagByUs then pcall(function() asc:RemoveGameplayTag(BLOCKING_TAG) end); blockTagByUs = false end
-    end
-    if isSnS ~= onSnS then
-        onSnS = isSnS
-        blockRaiseLogged = false
-        log("autoblock: %s", isSnS and "ENABLED (SnS equipped)" or "disabled (SnS unequipped)")
-    end
-end
-
--- AutoBlock counter: US near + facing the enemy (SnS melee range). willConnect checks the ENEMY
--- facing us; the counter needs the reverse (we face them), so this is its own check.
-local function nearFacing(pawn, enemy)
-    local ok, res = pcall(function()
-        if not (enemy and enemy:IsValid() and pawn and pawn:IsValid()) then return false end
-        local pp = pawn:K2_GetActorLocation()
-        local pe = enemy:K2_GetActorLocation()
-        local dx, dy, dz = pe.X - pp.X, pe.Y - pp.Y, pe.Z - pp.Z
-        if math.sqrt(dx * dx + dy * dy + dz * dz) > CONNECT_RANGE then return false end
-        local fwd = pawn:GetActorForwardVector()
-        local len = math.sqrt(dx * dx + dy * dy)
-        if len > 1 then
-            local dot = (fwd.X * dx + fwd.Y * dy) / len
-            if dot < FACING_DOT then return false end
-        end
-        return true
-    end)
-    return ok and res
-end
-
--- inject one M1 tap (press + release) = the block counter. `injecting` guards the input hooks
--- so our tap isn't mistaken for the player holding M1.
-local function counterM1()
-    if not (pawnRef and pawnRef:IsValid()) then return end
-    injecting = true
-    pcall(function() pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_36(LMB) end)
-    injecting = false
-    ExecuteWithDelay(60, function()
-        ExecuteInGameThread(function()
-            if not (pawnRef and pawnRef:IsValid()) then return end
-            injecting = true
-            pcall(function() pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_37(LMB) end)
-            injecting = false
-        end)
-    end)
-end
-
--- schedule a block-counter: an M1 shortly after the shield absorbs the hit, but ONLY if we're
--- still near+facing the enemy, on SnS, off cooldown, and NOT already attacking (never inject
--- over your own combo).
-local function scheduleCounter(enemy, hitTime)
-    local delayMs = math.floor(math.max(hitTime + COUNTER_DELAY, 0.05) * 1000)
-    ExecuteWithDelay(delayMs, function()
-        ExecuteInGameThread(function()
-            pcall(function()
-                if not onSnS or not ready or settling() then return end
-                if m1Held or m2Held then return end
-                local now = os.clock()
-                if now - lastCounter < COUNTER_COOLDOWN then return end
-                local pawn = getPawn()
-                if not (pawn and nearFacing(pawn, enemy)) then return end
-                lastCounter = now
-                counterM1()
-                if not counterLogged then counterLogged = true; log("autoblock: block-counter M1") end
-            end)
-        end)
-    end)
-end
-
 -- returns "ok"/"active"/"noblock"/false. block resolved weapon-accurately + rebind-safe.
 -- "noblock" = no parry on this weapon -> doParry bails BEFORE the montage-stop force ladder
 -- (= no cancelling the player's own actions on a no-parry weapon).
@@ -656,12 +548,11 @@ end
 local meleeCache = {}
 
 local function onEnemyAbility(self)
-    if (not state.parry and not onSnS) or not ready or settling() then return end
+    if not state.parry or not ready or settling() then return end
     local now = os.clock()
     if now - lastScheduled < 0.05 then return end
-    lastScheduled = now -- bound ALL downstream work (AutoBlock + parry). the old spot was after
-                        -- the parry bail, so with parry OFF + SnS ON the AutoBlock/scheduleCounter
-                        -- path ran unthrottled per enemy ability (swarm = game-thread callback burst).
+    lastScheduled = now -- throttle the parry scheduler to <=20/sec so a swarm can't queue a burst
+                        -- of delayed doParry callbacks (game-thread callback storm).
     local ok, err = pcall(function()
         local ab = self:get()
         -- MULTIPLAYER: this hook fires for replicated/remote enemy abilities too;
@@ -675,9 +566,8 @@ local function onEnemyAbility(self)
         if not meleeCache["_seen_" .. className] then
             meleeCache["_seen_" .. className] = true
             stat.seen = stat.seen + 1
-            -- DIAG (AutoBlock groundwork): dump the ability's full tag list once per class so we
-            -- can see how ground AoEs are tagged vs melee (Attack + Melee = melee; Attack without
-            -- Melee, or an AoE/Ranged tag = the AoE case AutoBlock needs to catch).
+            -- DIAG: dump the ability's full tag list once per class so we can classify it
+            -- (Attack + Melee = parryable melee; anything else routes elsewhere).
             local tagStr = ""
             pcall(function()
                 local tags = ab.AbilityTags.GameplayTags
@@ -685,19 +575,6 @@ local function onEnemyAbility(self)
             end)
             log("parry: enemy GA seen %s [tags: %s]", className, tagStr)
         end
-        -- AutoBlock (SnS): raise the shield for incoming MELEE or RANGED, regardless of the parry
-        -- toggle. hold = from wind-up detection now, THROUGH the hit (hitTime), PLUS BLOCK_TAIL so
-        -- multi-hit combos don't drop the shield between swings. driver keeps it up.
-        if onSnS and isBlockableAttack(ab) then
-            local ht = timings[className] or DEFAULT_HIT
-            blockUntil = os.clock() + ht + BLOCK_TAIL
-            -- block-counter: after the shield absorbs a MELEE hit, if near+facing, throw one M1
-            if isMeleeAttack(ab) then
-                local ce = ab:GetAvatarActorFromActorInfo()
-                if ce and ce:IsValid() then scheduleCounter(ce, ht) end
-            end
-        end
-        if not state.parry then return end -- everything below is PARRY-only (AutoBlock done above)
         local verdict = meleeCache[className]
         if verdict == nil then
             verdict = isMeleeAttack(ab)
@@ -831,10 +708,6 @@ local function onNewInstance()
     m1Held = false; m2Held = false
     sendRelease = false; sendRelease2 = false; injecting = false; chainDown = false
     sprintTagByUs = false      -- never strip the NEW pawn's manual sprint
-    blockTagByUs = false       -- never strip the NEW pawn's manual block
-    blockUntil = 0.0
-    onSnS = false              -- re-detected by refreshSnS after settle
-    snsBlockAbility = nil
     lastCombat = nil
     loggedCombat = nil
     combatPendingSince = 0.0
@@ -891,28 +764,7 @@ LoopAsync(300, function()
             -- native GetAbilityFromInputTag every 300ms tick (moderate perf trim).
             preloadTick = (preloadTick + 1) % 10
             if preloadTick == 0 then
-                refreshSnS(asc) -- detect SnS equip/unequip (~every 3s) for AutoBlock
                 if state.parry then pcall(function() preloadAbilityGraph(asc:GetAbilityFromInputTag(BLOCK_TAG)) end) end
-            end
-
-            -- AutoBlock driver: raise the SnS shield by injecting the Blocking STATE tag (native
-            -- OnBlockingTagChanged listener applies the block; class-activation is inert). hold
-            -- while an incoming-attack window is open + stamina healthy. add ONLY if not already
-            -- blocking (don't claim your manual block); remove ONLY the tag WE added (never strip
-            -- your manual block). stamina reserve stops it blocking you into a guard-break. NO
-            -- montage-stop -> never cancels your actions.
-            if onSnS then
-                local sp = staminaPct()
-                local wantBlock = (os.clock() < blockUntil) and (not sp or sp > BLOCK_STAMINA_RESERVE)
-                if wantBlock and not ascHasTag(asc, BLOCKING_TAG) then
-                    pcall(function() asc:AddUniqueGameplayTag(BLOCKING_TAG) end)
-                    blockTagByUs = true
-                    local nowb = os.clock()
-                    if nowb - lastBlockLog > 1.5 then lastBlockLog = nowb; log("autoblock: shield UP (stamina %.0f%%)", (sp or 1) * 100) end
-                elseif not wantBlock and blockTagByUs then
-                    pcall(function() asc:RemoveGameplayTag(BLOCKING_TAG) end)
-                    blockTagByUs = false
-                end
             end
 
             -- mount resolved BEFORE the moving gate: rider velocity is ~0 while
@@ -1342,19 +1194,6 @@ local function registerAll()
     end)
     tryHook("/Game/Blueprints/GameplayCueNotifies/Ability/2HR/GCNA_2HR_ActiveReload_Fail.GCNA_2HR_ActiveReload_Fail_C:K2_HandleGameplayCue", function()
         log("reload: FAIL cue (should be impossible - report this)")
-    end)
-    -- AutoBlock DIAG: OnBlockingTagChanged fires when the Blocking state tag flips (manual OR our
-    -- injected block). captures the REAL tag name once so we can confirm/correct BLOCKING_TAG.
-    tryHook("/Script/Wayfinder.WFLocomotionComponent:OnBlockingTagChanged", function(self, tagParam, countParam)
-        pcall(function()
-            if blockTagNameLogged then return end
-            local nm = "?"
-            pcall(function() nm = tagParam:get().TagName:ToString() end)
-            local cnt = -1
-            pcall(function() cnt = countParam:get() end)
-            blockTagNameLogged = true
-            log("autoblock DIAG: real Blocking tag = %s (count=%s) - byUs=%s", nm, tostring(cnt), tostring(blockTagByUs))
-        end)
     end)
 end
 
