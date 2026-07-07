@@ -623,3 +623,11 @@ Per-repo memory. Append-only, concise. Format: `### YYYY-MM-DD - Category - entr
 - KEPT (free perf/clarity/anti-stutter): whole stutter pass (OneFrameThreadLag, GTSyncType, PSOPrecaching, ShaderPipelineCache, streaming clamps), DistanceFieldGI=0, SkyLight.UpdateEveryFrame=0, AO radius 1.5/fade 6000, Streaming.MipBias -1, PoolSize 6000, FX.MaxGPUParticles 200k, EmitterSpawn 1.0, MotionBlur/DoF/Grain/ChromaticAberration off.
 - Heaviest restores = VolumetricFog (8/64) + Shadow 2048; pull those back first if FPS dips.
 - Deployed to live: %LOCALAPPDATA%\Wayfinder\Saved\Config\WindowsNoEditor\Engine.ini (backup .bak-20260706-050000). NEEDS in-game test: confirm looks + FPS acceptable.
+
+### 2026-07-06 - Fix - AutoChain reverted to simple M1/M2 spam (tag-buffering was over-gating)
+- SYMPTOM: auto-swing only did the FIRST chain then stopped; M1-spam ultimate ability didn''t fire at all.
+- ROOT CAUSE: this session''s playerActing() tag-buffering gated the next press on the `Character.State.Generic.Attacking` tag CLEARING. Tag doesn''t clear cleanly through combo GAs / the ultimate, so it stalled after swing 1.
+- FIX: restored the original working loop (commit 3c4d755): LoopAsync(70) alternates press->release->press->release each tick = ~7 taps/sec. Game gates the real swing by animation, so this only FEEDS input, never forces a rate. Flows every weapon combo + M1-spam abilities.
+- KEPT all safety (was never the problem): ExecuteInGameThread wrap, pawnRef:IsValid guard, `injecting` flag, ready/settling/reloadInProgress gates, flushChainRelease (releases dangling press on stop), M1+M2 support.
+- REMOVED dead code: playerActing, ACTING_TAGS, the 6 action-state tag consts (ATTACKING/DODGING/GUARDBREAK/CONTROLLEDLAUNCH/CHARABILITY/WEAPONABILITY_TAG), CHAIN_HOLD/CHAIN_MINGAP + chainPressAt/chainReleaseAt/chainLastTapAt. Grepped: nothing else referenced them. getASC/ascHasTag KEPT (parry uses them).
+- Diag now logs `chain: spam m1=%s m2=%s` (throttled 3s). Deployed live + parse-clean. NEEDS in-game test: hold M1 flows full combo + ultimate spams.

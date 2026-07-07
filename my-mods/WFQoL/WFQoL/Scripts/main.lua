@@ -50,17 +50,6 @@ local RMB = { KeyName = FName("RightMouseButton") }  -- Attack2 = heavy melee, b
 local BLOCK_TAG = { TagName = FName("Input.Combat.Block") }
 local INCOMBAT_TAG = { TagName = FName("Character.State.Generic.InCombat") }
 local SPRINTING_TAG = { TagName = FName("Character.State.Generic.Sprinting") }
--- player ACTION-STATE tags (GA ActivationOwnedTags, confirmed in the object/asset dump). AutoChain
--- reads these to BUFFER off the game's own animation: it presses the next attack only when NONE are
--- set = the previous swing finished AND the player isn't dodging/casting/staggered, so it respects
--- the weapon's real speed and never cancels a manual action. `Attacking` is held for the whole
--- melee swing on every weapon (ActivationOwnedTags on GA_Player_Melee_Base).
-local ATTACKING_TAG        = { TagName = FName("Character.State.Generic.Attacking") }
-local DODGING_TAG          = { TagName = FName("Character.State.Generic.Dodging") }
-local GUARDBREAK_TAG       = { TagName = FName("Character.State.Generic.GuardBreak") }
-local CONTROLLEDLAUNCH_TAG = { TagName = FName("Character.State.Generic.ControlledLaunch") }
-local CHARABILITY_TAG      = { TagName = FName("Character.State.Generic.CharacterAbility") }
-local WEAPONABILITY_TAG    = { TagName = FName("Character.State.Generic.WeaponAbilityUsed") }
 
 local timings = require("timings") -- enemy GA class -> seconds to first weapon trace
 
@@ -159,18 +148,6 @@ local function ascHasTag(asc, tag)
     return lib and lib:AbilitySystemHasTagExactly(asc, tag) or false
 end
 
--- is the player in ANY action (attacking / dodging / casting / staggered / knocked)? AutoChain
--- buffers off this: it won't inject the next attack while any of these is set, so it never cancels
--- what the player/character is doing and it re-presses only once the swing has ended.
-local ACTING_TAGS = { ATTACKING_TAG, DODGING_TAG, GUARDBREAK_TAG, CONTROLLEDLAUNCH_TAG, CHARABILITY_TAG, WEAPONABILITY_TAG }
-local function playerActing(asc)
-    if not (asc and asc:IsValid()) then return false end
-    for i = 1, #ACTING_TAGS do
-        if ascHasTag(asc, ACTING_TAGS[i]) then return true end
-    end
-    return false
-end
-
 -- ---------------------------------------------------------------- AutoChain
 -- one loop chains BOTH: hold M1 -> auto light attacks (Attack1), hold M2 -> auto heavy
 -- attacks (Attack2). same F7 toggle. the game gates the next swing by animation, so a
@@ -190,21 +167,12 @@ local function reloadInProgress()
     return (os.clock() - currentReload.t0) < ((currentReload.maxT or 3.0) + 0.5)
 end
 
--- AutoChain BUFFERS attacks off the game's OWN action state: it injects the NEXT attack only when
--- the previous swing's `Attacking` tag has cleared (swing finished) AND the player isn't in another
--- action (dodge/cast/stagger) - so the weapon's real attack speed drives the cadence, we never
--- force a rate, and we never cancel a manual action. forcing a rate re-pressed mid-swing and some
--- weapons (SnS melee) RESTART the swing on a fresh press -> stuck at the wind-up. a "tap" = press ->
--- brief hold -> release; the next tap waits for `playerActing` to go false.
-local CHAIN_HOLD = 0.06      -- brief press-hold so the tap registers (melee doesn't need hold)
-local CHAIN_MINGAP = 0.12    -- min gap after release before the next press: lets the swing's
-                             -- Attacking tag SET (so we don't re-press before it registers), and
-                             -- caps the tap rate if the tag ever can't be read (anti-spam floor)
-local chainDown = false      -- is our injected attack button currently pressed?
-local chainPressAt = 0.0     -- os.clock() when we pressed (hold timer)
-local chainReleaseAt = 0.0   -- os.clock() when we last released
-local chainLastTapAt = 0.0   -- os.clock() of the previous press (diag: inter-tap interval)
-local lastChainLog = 0.0
+-- AutoChain just alternates press -> release -> press -> release each tick (70ms) = ~7 taps/sec of
+-- the attack button. the GAME gates the actual next swing by its own animation, so this only FEEDS
+-- input, it never forces a swing rate. dead simple + reliable: flows every weapon's melee combo AND
+-- the M1-spam abilities (ultimate). the modern safety gates (ready/settling/reload/flush) stay.
+local chainDown = false      -- true = we pressed last tick; this tick releases it (completes one tap)
+local lastChainLog = 0.0     -- throttle the diag log
 
 -- release any outstanding injected press so stopping the chain (ready flips false, reload starts,
 -- a transition/settle, or the button released) never leaves the attack button "held" = the
@@ -232,30 +200,19 @@ LoopAsync(70, function()
     end
     ExecuteInGameThread(function()
         if not pawnRef or not pawnRef:IsValid() then return end
-        local now = os.clock()
         injecting = true
         pcall(function()
             if chainDown then
-                -- release once the brief hold has elapsed (completes the tap)
-                if now - chainPressAt >= CHAIN_HOLD then
-                    if m1Held then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_37(LMB) end
-                    if m2Held then pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_41(RMB) end
-                    chainDown = false; chainReleaseAt = now
-                    sendRelease = false; sendRelease2 = false
-                end
-            elseif now - chainReleaseAt >= CHAIN_MINGAP then
-                -- BUFFER off the game's own state: inject the next tap only when the previous swing's
-                -- Attacking tag has cleared AND the player isn't in another action = respect the
-                -- weapon's real attack speed + never cancel a manual dodge/cast. asc nil (transition)
-                -- -> skip this tick; the lifecycle rail handles readiness.
-                local asc = getASC(pawnRef)
-                if asc and not playerActing(asc) then
-                    if m1Held then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_36(LMB); sendRelease = true end
-                    if m2Held then pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_40(RMB); sendRelease2 = true end
-                    chainDown = true; chainPressAt = now
-                    local dt = now - chainLastTapAt; chainLastTapAt = now
-                    if now - lastChainLog > 3.0 then lastChainLog = now; log("chain: tap (dt=%.2fs)", dt) end
-                end
+                -- this tick RELEASES the press we sent last tick (completes one tap)
+                if m1Held then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_37(LMB) end
+                if m2Held then pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_41(RMB) end
+                chainDown = false; sendRelease = false; sendRelease2 = false
+            else
+                -- this tick PRESSES the attack button; next tick releases it
+                if m1Held then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_36(LMB); sendRelease = true end
+                if m2Held then pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_40(RMB); sendRelease2 = true end
+                chainDown = true
+                if os.clock() - lastChainLog > 3.0 then lastChainLog = os.clock(); log("chain: spam m1=%s m2=%s", tostring(m1Held), tostring(m2Held)) end
             end
         end)
         injecting = false
