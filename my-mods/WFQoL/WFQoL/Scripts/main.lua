@@ -1195,6 +1195,14 @@ end
 RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenu", onTeardown)
 RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenuWithTextReason", onTeardown)
 RegisterHook("/Script/Engine.PlayerController:ClientGameEnded", onTeardown)
+-- SEAMLESS MENU EXIT: "exit to main menu" goes through UWFPlayerTravelComponent::RequestMainMenuTravel
+-- -> a SEAMLESS travel to the FrontEnd map that fires NONE of the ClientReturnToMainMenu* hooks above
+-- (confirmed in the crash Atlas.log: RequestMainMenuTravel ~3s before the AV, no Client* teardown).
+-- our always-on loops then ran against the tearing-down world = native AV. arm teardown at the travel
+-- request AND on any travel start (CLIENT_OnTravelStarted = the universal signal, also reinforces the
+-- rail on dungeon/zone swaps). best-effort (pcall) in case a build renames them; the rail is the backstop.
+pcall(function() RegisterHook("/Script/Wayfinder.WFPlayerTravelComponent:CLIENT_OnTravelStarted", onTeardown) end)
+pcall(function() RegisterHook("/Script/Wayfinder.WFPlayerTravelComponent:RequestMainMenuTravel", onTeardown) end)
 
 -- ---------------------------------------------------------------- keybinds
 -- debounced: key auto-repeat fires RegisterKeyBind multiple times per press
