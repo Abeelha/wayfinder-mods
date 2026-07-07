@@ -631,3 +631,15 @@ Per-repo memory. Append-only, concise. Format: `### YYYY-MM-DD - Category - entr
 - KEPT all safety (was never the problem): ExecuteInGameThread wrap, pawnRef:IsValid guard, `injecting` flag, ready/settling/reloadInProgress gates, flushChainRelease (releases dangling press on stop), M1+M2 support.
 - REMOVED dead code: playerActing, ACTING_TAGS, the 6 action-state tag consts (ATTACKING/DODGING/GUARDBREAK/CONTROLLEDLAUNCH/CHARABILITY/WEAPONABILITY_TAG), CHAIN_HOLD/CHAIN_MINGAP + chainPressAt/chainReleaseAt/chainLastTapAt. Grepped: nothing else referenced them. getASC/ascHasTag KEPT (parry uses them).
 - Diag now logs `chain: spam m1=%s m2=%s` (throttled 3s). Deployed live + parse-clean. NEEDS in-game test: hold M1 flows full combo + ultimate spams.
+
+### 2026-07-06 - Crash fix - ShowNameplates: leave-dungeon teardown AV (autosave-blocking)
+- SYMPTOM: game crashed on leaving a dungeon (EXCEPTION_ACCESS_VIOLATION reading 0x...5ac, all UE4SS frames). High severity: autosave couldn''t run.
+- EVIDENCE: UE4SS.log tail = ShowNameplates `drive:` lines firing every tick right up to the crash (01:12:51). Chain last fired 01:12:36, combat:false 01:12:41 - NOT the chain fix. Crash CrashContext PCALLSTACK showed ~10 UE4SS frames x3 (re-entrant) bottoming into Wayfinder HUD teardown.
+- ROOT CAUSE: driveSelf''s only teardown guard was settling(), armed ONLY by ClientRestart / ReturnToMainMenu / GameEnded / the 300ms rail. Dungeon-leave (seamless transition) fires NONE synchronously - it destroys the pawn + fires the HUD meter-change hooks (OnHealthChanged/UpdateShieldBar/OnStaminaChanged -> driveSelf) BEFORE the 300ms rail notices the pawn swap. driveSelf then read the mid-free cached HUD widget (hudMeters.PlayerHealthBar) = native AV, uncatchable by pcall. The meter hooks cascade during teardown = the 3x re-entrancy in the stack.
+- FIX (layered, synchronous, all Lua-state + IsValid, no new per-frame cost) in tools/third-party-patches/ShowNameplates/main.lua driveSelf:
+  1. re-entrancy guard `driving` flag (nested driveSelf during the teardown cascade bails).
+  2. SYNCHRONOUS transition catch: `if not localPawn() then arm settling + drop caches + return` - beats the teardown storm the 300ms rail misses.
+  3. tightened: re-check hudMeters:IsValid() immediately before the field deref (smallest UAF window).
+  4. best-effort Destruct hooks on HUD_PlayerMeters_C + HUD_PlayerStaminaMeters_C -> npTeardown (pcall''d; arms settle the moment the HUD widget frees on seamless travel).
+- RULE reinforced: settling() must be armed for ALL transition kinds; seamless dungeon-leave needs a SYNCHRONOUS guard inside the hook (localPawn nil check), not just the async rail. pcall never catches native AV - only IsValid-before-deref + not-touching-during-teardown.
+- Deployed live + parse-clean. NEEDS in-game test: leave a dungeon (+ death/fall) with nameplates on = no crash, autosave completes.

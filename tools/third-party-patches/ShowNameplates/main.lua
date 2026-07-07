@@ -98,48 +98,68 @@ end
 -- mirror the local player's LIVE HUD health/shield/stamina onto the cached self nameplate.
 -- these are the real, responsive values the HUD itself shows. driven by the HUD meter-change
 -- events (fires on change) - no polling.
+local driving = false  -- re-entrancy guard: teardown fires the meter hooks in a nested cascade
+                       -- (crash stack showed 3x re-entry on dungeon-leave); a nested driveSelf must
+                       -- NOT run against the half-freed HUD.
 local function driveSelf()
-    if settling() then return end
+    if driving or settling() then return end
+    -- SYNCHRONOUS transition catch: dungeon-leave destroys the local pawn and fires the HUD
+    -- meter-change hooks (-> here) BEFORE the 300ms rail notices the pawn swap, so the cached HUD
+    -- widget is mid-free = native AV pcall can't catch (crash-on-leave-dungeon). if the local pawn
+    -- is gone we're tearing down: arm the settle gate, drop the stale caches, bail. mirrors the
+    -- rail but runs synchronously in the hook, so it beats the teardown storm.
+    if not localPawn() then
+        transitionAt = os.clock(); selfNameplate = nil; hudMeters = nil
+        return
+    end
     local np = selfNameplate
     if not (np and np:IsValid()) then return end
-    if not resolveHUD() then return end
-    -- read HEALTH+SHIELD independently from STAMINA. stamina lives on a SEPARATE widget
-    -- (HUD_PlayerStaminaMeters.PlayerStaminaMeter) that can be nil - reading all three in ONE
-    -- pcall meant a nil stamina widget threw and killed the health/shield update too (the
-    -- HP-stuck-full + stamina-blank bug). each sub-widget is guarded on its own now.
-    local okHS, shieldP, healthP = pcall(function()
-        local hb = hudMeters.PlayerHealthBar
-        local sb = hudMeters.PlayerShieldBar
-        local h = (hb and hb:IsValid()) and hb.Percent or nil
-        local s = (sb and sb:IsValid()) and sb.Percent or nil
-        return s, h
+    driving = true
+    pcall(function()
+        if not resolveHUD() then return end
+        -- read HEALTH+SHIELD independently from STAMINA. stamina lives on a SEPARATE widget
+        -- (HUD_PlayerStaminaMeters.PlayerStaminaMeter) that can be nil - reading all three in ONE
+        -- pcall meant a nil stamina widget threw and killed the health/shield update too (the
+        -- HP-stuck-full + stamina-blank bug). each sub-widget is guarded on its own now. re-check
+        -- hudMeters:IsValid() immediately before the field deref = smallest possible use-after-free
+        -- window if the HUD frees mid-callback during a transition.
+        local okHS, shieldP, healthP = pcall(function()
+            if not (hudMeters and hudMeters:IsValid()) then return nil, nil end
+            local hb = hudMeters.PlayerHealthBar
+            local sb = hudMeters.PlayerShieldBar
+            local h = (hb and hb:IsValid()) and hb.Percent or nil
+            local s = (sb and sb:IsValid()) and sb.Percent or nil
+            return s, h
+        end)
+        if okHS and healthP then
+            setPct(np, "PlayerHealthBar",     healthP) -- primary fill
+            setPct(np, "PlayerLastHealthBar", healthP) -- damage trail
+            showWidget(np, "PlayerHealthBar")
+            showWidget(np, "PlayerLastHealthBar")
+        end
+        if okHS and shieldP then
+            setPct(np, "PlayerHealthBar_Additive", shieldP) -- shield overlay
+            showWidget(np, "PlayerHealthBar_Additive")
+        end
+        local okS, staminaP = pcall(function()
+            if not (hudMeters and hudMeters:IsValid()) then return nil end
+            local sm = hudMeters.HUD_PlayerStaminaMeters
+            sm = sm and sm.PlayerStaminaMeter
+            return (sm and sm:IsValid()) and sm.Percent or nil
+        end)
+        if okS and staminaP then
+            setPct(np, "characterStaminaFill", staminaP) -- stamina fill
+            showWidget(np, "characterStaminaFill")
+        end
+        -- diag: log whenever the driven hp/stam CHANGES (>2%) so we can see if the value TRACKS
+        -- vs is stuck-full (the MP-host bug). change-throttled, not spammy.
+        if healthP and (math.abs(healthP - (lastDrivenHp or -1)) > 0.02
+                     or math.abs((staminaP or 0) - (lastDrivenStam or -1)) > 0.02) then
+            lastDrivenHp = healthP; lastDrivenStam = staminaP or 0
+            print(string.format("[ShowNameplates] drive: hp=%.2f shield=%.2f stam=%.2f\n", healthP or -1, shieldP or -1, staminaP or -1))
+        end
     end)
-    if okHS and healthP then
-        setPct(np, "PlayerHealthBar",     healthP) -- primary fill
-        setPct(np, "PlayerLastHealthBar", healthP) -- damage trail
-        showWidget(np, "PlayerHealthBar")
-        showWidget(np, "PlayerLastHealthBar")
-    end
-    if okHS and shieldP then
-        setPct(np, "PlayerHealthBar_Additive", shieldP) -- shield overlay
-        showWidget(np, "PlayerHealthBar_Additive")
-    end
-    local okS, staminaP = pcall(function()
-        local sm = hudMeters.HUD_PlayerStaminaMeters
-        sm = sm and sm.PlayerStaminaMeter
-        return (sm and sm:IsValid()) and sm.Percent or nil
-    end)
-    if okS and staminaP then
-        setPct(np, "characterStaminaFill", staminaP) -- stamina fill
-        showWidget(np, "characterStaminaFill")
-    end
-    -- diag: log whenever the driven hp/stam CHANGES (>2%) so we can see if the value TRACKS
-    -- vs is stuck-full (the MP-host bug). change-throttled, not spammy.
-    if healthP and (math.abs(healthP - (lastDrivenHp or -1)) > 0.02
-                 or math.abs((staminaP or 0) - (lastDrivenStam or -1)) > 0.02) then
-        lastDrivenHp = healthP; lastDrivenStam = staminaP or 0
-        print(string.format("[ShowNameplates] drive: hp=%.2f shield=%.2f stam=%.2f\n", healthP or -1, shieldP or -1, staminaP or -1))
-    end
+    driving = false
 end
 
 local function installHooks()
@@ -220,6 +240,12 @@ local function npTeardown()
 end
 RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenu", npTeardown)
 RegisterHook("/Script/Engine.PlayerController:ClientGameEnded", npTeardown)
+-- SEAMLESS-TRANSITION teardown (dungeon-leave / instance swap): these free the HUD meter widgets
+-- WITHOUT a ClientRestart, so catch the widget's own Destruct to arm the settle gate the moment the
+-- HUD tears down = driveSelf bails before the meter-change storm reads freed memory. best-effort:
+-- pcall'd in case a build doesn't override Destruct on the widget (RegisterHook would otherwise throw).
+pcall(function() RegisterHook("/Game/UI/UI_WF_Blueprints/UI_WF_HUD/HUD_PlayerMeters.HUD_PlayerMeters_C:Destruct", npTeardown) end)
+pcall(function() RegisterHook("/Game/UI/UI_WF_Blueprints/UI_WF_HUD/HUD_PlayerStaminaMeters.HUD_PlayerStaminaMeters_C:Destruct", npTeardown) end)
 
 -- mod restarted mid-map: install immediately if the widget class is already loaded
 do
