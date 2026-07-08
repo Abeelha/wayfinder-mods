@@ -246,11 +246,10 @@ RegisterHook("/Script/Engine.PlayerController:ClientGameEnded", npTeardown)
 -- pcall'd in case a build doesn't override Destruct on the widget (RegisterHook would otherwise throw).
 pcall(function() RegisterHook("/Game/UI/UI_WF_Blueprints/UI_WF_HUD/HUD_PlayerMeters.HUD_PlayerMeters_C:Destruct", npTeardown) end)
 pcall(function() RegisterHook("/Game/UI/UI_WF_Blueprints/UI_WF_HUD/HUD_PlayerStaminaMeters.HUD_PlayerStaminaMeters_C:Destruct", npTeardown) end)
--- SEAMLESS MENU EXIT: "exit to main menu" = UWFPlayerTravelComponent::RequestMainMenuTravel -> a
--- seamless FrontEnd travel that fires none of the ClientReturnToMainMenu* hooks (crash Atlas.log
--- confirmed), so the rail/driveSelf ran against the tearing-down HUD = AV. arm teardown at the travel
--- request + on any travel start (universal). best-effort pcall; the 300ms rail is the backstop.
-pcall(function() RegisterHook("/Script/Wayfinder.WFPlayerTravelComponent:CLIENT_OnTravelStarted", npTeardown) end)
+-- MENU-EXIT early-arm belt: exit-to-menu = UWFPlayerTravelComponent::RequestMainMenuTravel (a seamless
+-- FrontEnd travel that fires none of the ClientReturnToMainMenu* hooks). driveSelf ALREADY self-guards
+-- via the localPawn() possession check (nil the instant unpossessed on ANY transition); this is just an
+-- early-arm for the full menu teardown. best-effort pcall. (CLIENT_OnTravelStarted removed - never fires.)
 pcall(function() RegisterHook("/Script/Wayfinder.WFPlayerTravelComponent:RequestMainMenuTravel", npTeardown) end)
 
 -- mod restarted mid-map: install immediately if the widget class is already loaded
