@@ -41,6 +41,10 @@ end
 local CHAR = "/Game/Blueprints/Main/WFPlayerCharacter_Base.WFPlayerCharacter_Base_C"
 local CHAR_CLASS_ONLY = "WFPlayerCharacter_Base_C"
 local AIBASE = "/Game/Blueprints/Abilities/AIGeneric/GA_AI_Base.GA_AI_Base_C"
+-- C++ base ALL character (enemy) abilities derive from - its native UFunctions are override-proof
+-- (no BP subclass can replace them), so hooking here catches EVERY enemy attack universally, unlike
+-- the per-BP GA_AI_Base hook that many attacks (e.g. Teryssa melee) bypass with their own base+event.
+local WFCHAR_GA = "/Script/Wayfinder.WFCharacterGameplayAbility"
 local RELOAD_GA = "/Game/Blueprints/Player/GAS/GameplayAbilities/RangedWeapon/GA_Player_RangedWeapon_ActiveReload.GA_Player_RangedWeapon_ActiveReload_C"
 local RELOAD_OK_GA = "/Game/Blueprints/Player/GAS/GameplayAbilities/RangedWeapon/GA_Player_RangedWeapon_ActiveReloadSucceeded.GA_Player_RangedWeapon_ActiveReloadSucceeded_C"
 local WFLIB = "/Script/Wayfinder.Default__WFAbilitySystemBlueprintLibrary"
@@ -581,6 +585,39 @@ local function onEnemyAbility(self)
         end
     end)
     if not ok then logErrorOnce("parry-schedule", err) end
+end
+
+-- ---- UNIVERSAL ENEMY-ATTACK PROBE (diagnostic, additive - does NOT touch the working parry) ----
+-- Verified: many enemy attacks derive DIRECTLY from WFCharacterGameplayAbility with their OWN
+-- K2_ActivateAbility, so they bypass our GA_AI_Base_C hook = unparryable (the "seen:0 vs Archon"
+-- bug). WFCharacterGameplayAbility:OnWeaponHit is a C++-base UFunction no BP can override -> fires
+-- for EVERY character weapon attack universally. This probe logs ONE line per NEW enemy ability
+-- class it catches, so a single fight names every escaping enemy + proves the universal hook fires.
+-- Then the parry gets rewired onto the confirmed universal signal. Player abilities are filtered by
+-- avatar (skip our own). Remove once the universal parry is wired in.
+local probeSeen = {}
+local function onAttackProbe(self)
+    if not state.parry then return end
+    pcall(function()
+        local ab = self:get()
+        if not (ab and ab:IsValid()) then return end
+        local av; pcall(function() av = ab:GetAvatarActorFromActorInfo() end)
+        if not (av and av:IsValid()) then return end
+        -- skip OUR OWN abilities (player weapon hits) - address compare, safe
+        local aad, pad
+        pcall(function() aad = av:GetAddress() end)
+        pcall(function() if pawnRef and pawnRef:IsValid() then pad = pawnRef:GetAddress() end end)
+        if aad and pad and aad == pad then return end
+        local cls = ab:GetClass():GetFName():ToString()
+        if probeSeen[cls] then return end
+        probeSeen[cls] = true
+        local tagStr = ""
+        pcall(function()
+            local tags = ab.AbilityTags.GameplayTags
+            for i = 1, #tags do tagStr = tagStr .. tags[i].TagName:ToString() .. " " end
+        end)
+        log("PROBE OnWeaponHit: enemy ability %s [tags: %s]", cls, tagStr)
+    end)
 end
 
 -- ---------------------------------------------------------------- AutoSprint
@@ -1186,6 +1223,7 @@ local function registerAll()
         m2Held = false
     end)
     tryHook(AIBASE .. ":K2_ActivateAbility", onEnemyAbility)
+    tryHook(WFCHAR_GA .. ":OnWeaponHit", onAttackProbe) -- diagnostic: universal enemy-attack coverage
     tryHook(RELOAD_GA .. ":K2_ActivateAbility", onReloadActivated)
     tryHook(RELOAD_GA .. ":K2_OnEndAbility", onReloadEnded)
     tryHook(RELOAD_OK_GA .. ":K2_ActivateAbility", onReloadSucceeded)
