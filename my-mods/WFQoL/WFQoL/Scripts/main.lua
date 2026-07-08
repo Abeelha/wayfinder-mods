@@ -86,38 +86,42 @@ local function localPC()
     return pcCache
 end
 
+-- is this pawn our LIVE, locally-controlled player pawn? IsLocallyControlled() goes FALSE the instant
+-- the controller unpossesses at transition start (BEFORE the pawn frees), so it's the reliable "still
+-- safe to drive" signal in Wayfinder. NOTE: pc.Pawn / UEHelpers is nil in this game so it can't be
+-- used - but IsLocallyControlled is the exact call the FindAllOf resolver already trusts to find the
+-- pawn (that's why autoswing works), so it's proven-reliable here.
+local function isLocalPawn(p)
+    if not (p and p:IsValid() and isReal(p)) then return false end
+    local ok, lc = pcall(function() return p:IsLocallyControlled() end)
+    return ok and lc == true
+end
+
 local lastPawnScan = 0.0 -- throttle getPawn's FindAllOf fallback (game-thread scan during loads)
 local function getPawn()
-    if pawnRef and pawnRef:IsValid() then return pawnRef end
+    -- fast path: the cached pawn, but ONLY while it is STILL locally controlled. a cached pawn whose
+    -- IsValid() is still true during teardown but is already UNPOSSESSED is the crash trap - isLocalPawn
+    -- rejects it, so every loop that goes through getPawn bails on ANY transition (dungeon/menu/zone/death).
+    if isLocalPawn(pawnRef) then return pawnRef end
     pawnRef = nil
-    -- primary O(1) route: the local PlayerController's Pawn (no object scan, MP-correct)
+    -- PC route (usually nil in this game; kept in case it ever resolves)
     local pc = localPC()
     if pc then
         pcall(function()
             local p = pc.Pawn
-            if p and p:IsValid() and isReal(p) then pawnRef = p end
+            if isLocalPawn(p) then pawnRef = p end
         end)
     end
     if pawnRef then return pawnRef end
-    -- throttle the FALLBACK object scan: when the PC route fails (during a load/stream the pawn is
-    -- unfindable for a while), FindAllOf(135k) every 300ms tick on the game thread is a perma-load
-    -- amplifier. cap to ~1x/2s. (the O(1) PC route above is unthrottled, so a valid pawn is still
-    -- picked up the instant it appears.)
+    -- FALLBACK object scan (the ACTUAL resolver in this game). throttled: FindAllOf(135k) every tick
+    -- on the game thread would amplify a load into a freeze. accept ONLY a locally-controlled pawn -
+    -- never a remote (MP) or a tearing-down/unpossessed one (dropped the old unconditional `first`).
     if (os.clock() - lastPawnScan) < 2.0 then return nil end
     lastPawnScan = os.clock()
-    -- FALLBACK object scan (only if the PC route failed). MULTIPLAYER: FindAllOf returns
-    -- REMOTE players' characters too (null components client-side -> native crash if driven);
-    -- prefer the LOCALLY-controlled pawn, fall back to first real (single-player).
     pcall(function()
-        local first = nil
         for _, p in pairs(FindAllOf(CHAR_CLASS_ONLY) or {}) do
-            if isReal(p) then
-                first = first or p
-                local okl, loc = pcall(function() return p:IsLocallyControlled() end)
-                if okl and loc then pawnRef = p break end
-            end
+            if isLocalPawn(p) then pawnRef = p break end
         end
-        if not pawnRef then pawnRef = first end
     end)
     return pawnRef
 end
@@ -180,7 +184,7 @@ local lastChainLog = 0.0     -- throttle the diag log
 local function flushChainRelease()
     if not (sendRelease or sendRelease2) then chainDown = false; return end
     ExecuteInGameThread(function()
-        if pawnRef and pawnRef:IsValid() then
+        if isLocalPawn(pawnRef) then
             injecting = true
             pcall(function()
                 if sendRelease then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_37(LMB) end
@@ -199,7 +203,7 @@ LoopAsync(70, function()
         return false
     end
     ExecuteInGameThread(function()
-        if not pawnRef or not pawnRef:IsValid() then return end
+        if not isLocalPawn(pawnRef) then return end   -- unpossessed at teardown = false = clean bail
         injecting = true
         pcall(function()
             if chainDown then

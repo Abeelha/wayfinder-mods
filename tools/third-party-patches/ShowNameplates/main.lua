@@ -103,17 +103,19 @@ local driving = false  -- re-entrancy guard: teardown fires the meter hooks in a
                        -- NOT run against the half-freed HUD.
 local function driveSelf()
     if driving or settling() then return end
-    -- SYNCHRONOUS transition catch: dungeon-leave destroys the local pawn and fires the HUD
-    -- meter-change hooks (-> here) BEFORE the 300ms rail notices the pawn swap, so the cached HUD
-    -- widget is mid-free = native AV pcall can't catch (crash-on-leave-dungeon). if the local pawn
-    -- is gone we're tearing down: arm the settle gate, drop the stale caches, bail. mirrors the
-    -- rail but runs synchronously in the hook, so it beats the teardown storm.
-    if not localPawn() then
-        transitionAt = os.clock(); selfNameplate = nil; hudMeters = nil
-        return
-    end
     local np = selfNameplate
     if not (np and np:IsValid()) then return end
+    -- ROOT teardown gate: only drive while the local player still CONTROLS the owning pawn. on ANY
+    -- transition the pawn unpossesses (IsLocallyControlled -> false) BEFORE the HUD widget frees, so
+    -- driveSelf bails cleanly with no per-transition hook. NOTE: the old `if not localPawn()` bail
+    -- fired EVERY call (localPawn()/UEHelpers is nil in this game) = constant selfNameplate
+    -- null+recapture CHURN and it never actually drove HP/stamina. this replaces it.
+    local live = false
+    pcall(function()
+        local owner = np.AttachedOwnerActor
+        live = owner and owner:IsValid() and owner:IsLocallyControlled() == true
+    end)
+    if not live then return end
     driving = true
     pcall(function()
         if not resolveHUD() then return end
