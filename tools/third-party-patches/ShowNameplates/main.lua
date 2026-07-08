@@ -52,6 +52,8 @@ local svbLogged = false -- one-shot diag: player ShouldBeVisible fired
 local lastDrivenHp, lastDrivenStam = nil, nil -- diag: track driven values to see if they move
 local lastDriveLog = 0.0 -- min interval between drive diag lines
 local selfAddr = nil     -- address of the captured self nameplate (cheap identity compare)
+local coloredAddr = nil  -- addr whose missing-health backing has been tinted dark (set once/plate)
+local hudFailLog = 0.0   -- throttle the resolveHUD-failed diagnostic
 
 -- safe pointer read (address value only, no object-internal deref -> safe on any owner)
 local function addrOf(o)
@@ -72,17 +74,29 @@ local function resolveHUD()
     -- scans report "unresolved" so the caller just skips driving this frame.
     if (os.clock() - lastHudScan) < 0.5 then return false end
     lastHudScan = os.clock()
+    local scanned = 0
     for _, e in pairs(FindAllOf("HUD_PlayerMeters_C") or {}) do
+        scanned = scanned + 1
         local ok, valid = pcall(function()
             if e:GetFName():ToString():sub(1, 9) == "Default__" then return false end -- skip CDO
-            -- require BOTH bars valid (not just shield) so a stale/unpopulated HUD instance
-            -- (whose .Percent defaults to 1.0) can't get picked and peg self HP full.
-            return e.PlayerShieldBar and e.PlayerShieldBar:IsValid()
-                and e.PlayerHealthBar and e.PlayerHealthBar:IsValid()
+            -- GATE (relaxed): require the two widgets we actually DRIVE - HEALTH bar + STAMINA meter.
+            -- shield is OPTIONAL now. the old gate REQUIRED PlayerShieldBar valid; after a transition
+            -- where the shield sub-widget rebuilds late/absent, EVERY candidate got rejected ->
+            -- hudMeters never resolved -> health blank + stamina frozen forever (the recurring break).
+            -- health+stamina both-valid still rejects a half-built/unpopulated instance.
+            local hb = e.PlayerHealthBar
+            local sm = e.HUD_PlayerStaminaMeters
+            sm = sm and sm.PlayerStaminaMeter
+            return hb and hb:IsValid() and sm and sm:IsValid()
         end)
         if ok and valid then hudMeters = e break end
     end
-    return hudMeters ~= nil and hudMeters:IsValid()
+    local okres = hudMeters ~= nil and hudMeters:IsValid()
+    if not okres and (os.clock() - hudFailLog) > 3.0 then
+        hudFailLog = os.clock()
+        print(string.format("[ShowNameplates] resolveHUD FAIL: %d HUD_PlayerMeters found, none passed gate\n", scanned))
+    end
+    return okres
 end
 
 -- mirror the local player's LIVE HUD health/shield/stamina onto the cached self nameplate.
@@ -91,9 +105,11 @@ end
 local driving = false  -- re-entrancy guard: teardown fires the meter hooks in a nested cascade
                        -- (crash stack showed 3x re-entry on dungeon-leave); a nested driveSelf must
                        -- NOT run against the half-freed HUD.
-local function driveSelf()
+local function driveSelf(npOverride)
     if driving or settling() then return end
-    local np = selfNameplate
+    -- drive the LIVE widget ShouldBeVisible hands us when provided (never a stale cache); the
+    -- HUD-change event hooks call with no arg -> fall back to the cache (refreshed every frame).
+    local np = npOverride or selfNameplate
     if not (np and np:IsValid()) then return end
     -- teardown safety is settling(), armed SECONDS early by the travel-request hooks below (cause-side
     -- signal) + the HUD Destruct hooks. NO game-native liveness probes here: IsValid() (UE4SS-side
@@ -116,10 +132,20 @@ local function driveSelf()
             return s, h
         end)
         if okHS and healthP then
-            setPct(np, "PlayerHealthBar",     healthP) -- primary fill
-            setPct(np, "PlayerLastHealthBar", healthP) -- damage trail
+            setPct(np, "PlayerHealthBar",     healthP) -- primary green fill
+            setPct(np, "PlayerLastHealthBar", 1.0)     -- FULL width = dark "missing health" backing
             showWidget(np, "PlayerHealthBar")
             showWidget(np, "PlayerLastHealthBar")
+            -- MISSING-HEALTH = grey/black: PlayerLastHealthBar sits behind the green fill; driving it
+            -- full-width + near-black tint makes the unfilled region read dark. tint set ONCE/plate.
+            local a = addrOf(np)
+            if a and a ~= coloredAddr then
+                coloredAddr = a
+                pcall(function()
+                    local b = np.PlayerLastHealthBar
+                    if b and b:IsValid() then b:SetFillColorAndOpacity({ R = 0.03, G = 0.03, B = 0.03, A = 1.0 }) end
+                end)
+            end
         end
         if okHS and shieldP then
             setPct(np, "PlayerHealthBar_Additive", shieldP) -- shield overlay
@@ -166,9 +192,11 @@ local function installHooks()
 
     -- LOCAL player's values: driven only when the HUD meters actually change (cheap,
     -- event-driven). these fire for the local player only.
-    RegisterHook("/Game/UI/UI_WF_Blueprints/UI_WF_HUD/HUD_PlayerMeters.HUD_PlayerMeters_C:OnHealthChanged", driveSelf)
-    RegisterHook("/Game/UI/UI_WF_Blueprints/UI_WF_HUD/HUD_PlayerMeters.HUD_PlayerMeters_C:UpdateShieldBar", driveSelf)
-    RegisterHook("/Game/UI/UI_WF_Blueprints/UI_WF_HUD/HUD_PlayerStaminaMeters.HUD_PlayerStaminaMeters_C:OnStaminaChanged", driveSelf)
+    -- wrapped in no-arg thunks: RegisterHook passes the HUD widget as the 1st cb arg, which would
+    -- land in driveSelf's npOverride and mis-drive the HUD widget as if it were a nameplate.
+    RegisterHook("/Game/UI/UI_WF_Blueprints/UI_WF_HUD/HUD_PlayerMeters.HUD_PlayerMeters_C:OnHealthChanged", function() driveSelf() end)
+    RegisterHook("/Game/UI/UI_WF_Blueprints/UI_WF_HUD/HUD_PlayerMeters.HUD_PlayerMeters_C:UpdateShieldBar", function() driveSelf() end)
+    RegisterHook("/Game/UI/UI_WF_Blueprints/UI_WF_HUD/HUD_PlayerStaminaMeters.HUD_PlayerStaminaMeters_C:OnStaminaChanged", function() driveSelf() end)
 
     -- PLAYER nameplate visibility only (enemies are left to the game). the game calls
     -- ShouldBeVisible per nameplate; re-assert the meters visible here (counters the game's
@@ -196,34 +224,28 @@ local function installHooks()
             -- stale cache was still IsValid (valid != visible) -> bars gone until relog. also gone:
             -- the addr-compare against GetOwningPlayerPawn/localPawn (localPawn was ALWAYS nil in
             -- this game, and nil==nil could mis-capture an ally plate in MP).
-            local npAddr = addrOf(np)
-            -- ADDRESS-REUSE FIX: also recapture when the cached self is STALE (invalid), not only
-            -- when the address differs. a respawned/rebuilt nameplate can be pooled to the SAME
-            -- memory address as the destroyed one; guarding on npAddr~=selfAddr alone then SKIPS
-            -- recapture, leaving selfNameplate pointing at the dead userdata -> driveSelf bails on
-            -- IsValid()==false -> blank healthbar forever (addr keeps matching, never heals). the
-            -- per-frame retry here also covers the possession race (owner not yet locally-controlled).
-            local haveSelf = selfNameplate and selfNameplate:IsValid()
-            if (not haveSelf) or npAddr ~= selfAddr then
-                local owner = np.AttachedOwnerActor
-                local isMine = false
-                if owner and owner:IsValid() then
-                    pcall(function() isMine = owner:IsLocallyControlled() == true end)
-                end
-                if isMine then
-                    local reason = haveSelf and "new-addr" or "stale-revalidate"
-                    selfNameplate = np
-                    selfAddr = npAddr
-                    print("[ShowNameplates] self nameplate captured ("..reason..")\n")
-                    driveSelf() -- populate immediately on capture
-                end
+            -- IDENTIFY + DRIVE THE LIVE PLATE. check ownership on THIS live widget every fire
+            -- (owner alive by construction here; ally/remote plates return false = left alone).
+            -- driving the LIVE np directly (not the cached ref) is what permanently fixes the
+            -- recurring break: the cache went stale between fires, so driveSelf ran against a dead
+            -- widget = blank health + frozen stamina. now every fire drives the on-screen plate.
+            local owner = np.AttachedOwnerActor
+            local isMine = false
+            if owner and owner:IsValid() then
+                pcall(function() isMine = owner:IsLocallyControlled() == true end)
             end
-            -- STAMINA only on the LOCAL player's nameplate (allies get health only)
-            if npAddr and npAddr == selfAddr then
+            if isMine then
+                local npAddr = addrOf(np)
+                if npAddr ~= selfAddr then
+                    selfAddr = npAddr
+                    coloredAddr = nil -- new plate: re-tint the missing-health backing
+                    print("[ShowNameplates] self nameplate captured\n")
+                end
+                selfNameplate = np -- refresh cache to the LIVE widget every fire (kills stale churn)
                 showWidget(np, "characterStaminaFill")
-                -- ShouldBeVisible fires EVERY frame; throttle the refresh to ~10x/sec so an
-                -- unresolved HUD can't drive a per-frame resolveHUD scan (freeze guard).
-                if (os.clock() - lastVisDrive) > 0.1 then lastVisDrive = os.clock(); driveSelf() end
+                -- ShouldBeVisible fires ~every frame; throttle to ~12x/sec so an unresolved HUD
+                -- can't drive a per-frame resolveHUD scan (freeze guard). drive the LIVE np.
+                if (os.clock() - lastVisDrive) > 0.08 then lastVisDrive = os.clock(); driveSelf(np) end
             end
         end)
     end)
