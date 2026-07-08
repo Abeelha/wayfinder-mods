@@ -88,30 +88,26 @@ end
 
 local lastPawnScan = 0.0 -- throttle getPawn's FindAllOf fallback (game-thread scan during loads)
 local function getPawn()
-    -- POSSESSION IS TRUTH. only ever return the pawn the local controller CURRENTLY possesses.
-    -- the old fast-path trusted `pawnRef:IsValid()`, but during a world swap the OUTGOING pawn's
-    -- IsValid() stays TRUE while its components tear down (unpossessed, not yet GC'd) - driving it =
-    -- native AV pcall can't catch (this was every leave-dungeon / exit-to-menu crash). `pc.Pawn` is
-    -- a pointer read (safe) that goes nil the INSTANT the controller unpossesses at transition START,
-    -- so every loop that calls getPawn() bails on ANY transition (dungeon/menu/zone/death) with NO
-    -- per-event teardown hook. re-derived each call (cheap: one property read).
+    if pawnRef and pawnRef:IsValid() then return pawnRef end
+    pawnRef = nil
+    -- primary O(1) route: the local PlayerController's Pawn (no object scan, MP-correct)
     local pc = localPC()
     if pc then
-        local ok, p = pcall(function() return pc.Pawn end)
-        if ok and p and p:IsValid() and isReal(p) then
-            pawnRef = p
-            return p
-        end
-        -- have a controller but no valid possessed pawn = mid-transition / teardown / spectator:
-        -- return nil so every loop bails. do NOT FindAllOf here - it would grab the tearing-down pawn.
-        pawnRef = nil
-        return nil
+        pcall(function()
+            local p = pc.Pawn
+            if p and p:IsValid() and isReal(p) then pawnRef = p end
+        end)
     end
-    -- NO controller at all (rare single-player boot edge before the PC exists): throttled fallback
-    -- scan. FindAllOf(135k) every tick on the game thread would amplify a load into a freeze.
-    pawnRef = nil
+    if pawnRef then return pawnRef end
+    -- throttle the FALLBACK object scan: when the PC route fails (during a load/stream the pawn is
+    -- unfindable for a while), FindAllOf(135k) every 300ms tick on the game thread is a perma-load
+    -- amplifier. cap to ~1x/2s. (the O(1) PC route above is unthrottled, so a valid pawn is still
+    -- picked up the instant it appears.)
     if (os.clock() - lastPawnScan) < 2.0 then return nil end
     lastPawnScan = os.clock()
+    -- FALLBACK object scan (only if the PC route failed). MULTIPLAYER: FindAllOf returns
+    -- REMOTE players' characters too (null components client-side -> native crash if driven);
+    -- prefer the LOCALLY-controlled pawn, fall back to first real (single-player).
     pcall(function()
         local first = nil
         for _, p in pairs(FindAllOf(CHAR_CLASS_ONLY) or {}) do
@@ -184,12 +180,11 @@ local lastChainLog = 0.0     -- throttle the diag log
 local function flushChainRelease()
     if not (sendRelease or sendRelease2) then chainDown = false; return end
     ExecuteInGameThread(function()
-        local p = getPawn()   -- possessed pawn or nil; nil = transition -> just drop the state, inject nothing
-        if p then
+        if pawnRef and pawnRef:IsValid() then
             injecting = true
             pcall(function()
-                if sendRelease then p:InpActEvt_Attack1_K2Node_InputActionEvent_37(LMB) end
-                if sendRelease2 then p:InpActEvt_Attack2_K2Node_InputActionEvent_41(RMB) end
+                if sendRelease then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_37(LMB) end
+                if sendRelease2 then pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_41(RMB) end
             end)
             injecting = false
         end
@@ -204,19 +199,18 @@ LoopAsync(70, function()
         return false
     end
     ExecuteInGameThread(function()
-        local p = getPawn()   -- possession-truth: nil the instant the pawn is unpossessed on any transition
-        if not p then return end
+        if not pawnRef or not pawnRef:IsValid() then return end
         injecting = true
         pcall(function()
             if chainDown then
                 -- this tick RELEASES the press we sent last tick (completes one tap)
-                if m1Held then p:InpActEvt_Attack1_K2Node_InputActionEvent_37(LMB) end
-                if m2Held then p:InpActEvt_Attack2_K2Node_InputActionEvent_41(RMB) end
+                if m1Held then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_37(LMB) end
+                if m2Held then pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_41(RMB) end
                 chainDown = false; sendRelease = false; sendRelease2 = false
             else
                 -- this tick PRESSES the attack button; next tick releases it
-                if m1Held then p:InpActEvt_Attack1_K2Node_InputActionEvent_36(LMB); sendRelease = true end
-                if m2Held then p:InpActEvt_Attack2_K2Node_InputActionEvent_40(RMB); sendRelease2 = true end
+                if m1Held then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_36(LMB); sendRelease = true end
+                if m2Held then pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_40(RMB); sendRelease2 = true end
                 chainDown = true
                 if os.clock() - lastChainLog > 3.0 then lastChainLog = os.clock(); log("chain: spam m1=%s m2=%s", tostring(m1Held), tostring(m2Held)) end
             end
@@ -1201,12 +1195,13 @@ end
 RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenu", onTeardown)
 RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenuWithTextReason", onTeardown)
 RegisterHook("/Script/Engine.PlayerController:ClientGameEnded", onTeardown)
--- MENU-EXIT early-arm belt: "exit to main menu" = UWFPlayerTravelComponent::RequestMainMenuTravel (a
--- seamless FrontEnd travel that fires none of the ClientReturnToMainMenu* hooks). arms teardown a beat
--- early for the full menu teardown. NOTE: the REAL universal guard is getPawn() = possession-truth
--- (bails the instant the pawn is unpossessed on ANY transition); this hook is just belt-and-suspenders.
--- best-effort pcall. (CLIENT_OnTravelStarted was tried + REMOVED: crash log proved it never fires - the
---  game uses AWFPlayerController::PreClientTravel, which is a C++ virtual, not a hookable UFunction.)
+-- SEAMLESS MENU EXIT: "exit to main menu" goes through UWFPlayerTravelComponent::RequestMainMenuTravel
+-- -> a SEAMLESS travel to the FrontEnd map that fires NONE of the ClientReturnToMainMenu* hooks above
+-- (confirmed in the crash Atlas.log: RequestMainMenuTravel ~3s before the AV, no Client* teardown).
+-- our always-on loops then ran against the tearing-down world = native AV. arm teardown at the travel
+-- request AND on any travel start (CLIENT_OnTravelStarted = the universal signal, also reinforces the
+-- rail on dungeon/zone swaps). best-effort (pcall) in case a build renames them; the rail is the backstop.
+pcall(function() RegisterHook("/Script/Wayfinder.WFPlayerTravelComponent:CLIENT_OnTravelStarted", onTeardown) end)
 pcall(function() RegisterHook("/Script/Wayfinder.WFPlayerTravelComponent:RequestMainMenuTravel", onTeardown) end)
 
 -- ---------------------------------------------------------------- keybinds
