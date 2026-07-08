@@ -691,11 +691,19 @@ local function onNewInstance()
     incoming = { name = "", kind = "", ts = 0 }
 end
 
-LoopAsync(300, function()
-    -- LIFECYCLE RAIL - the SINGLE authority for `ready`. runs EVERY tick (NOT gated on ready)
-    -- so it can always detect the local pawn swapping. the game swaps the pawn on EVERY
-    -- instance change (dungeon / other instance / death / fall-out-of-map / hub) and MOST do
-    -- NOT fire ClientRestart - so identity, not events, drives readiness:
+local RAIL_MS = 400 -- steady cadence (was 300). the travel hooks arm settle SECONDS early now, so
+                    -- the rail is a backstop + `ready`-restore, not the primary transition catch -
+                    -- 400ms cuts steady game-thread hops ~25% (thread-contention trim).
+LoopAsync(RAIL_MS, function()
+    -- QUIET DURING TRANSITIONS: while settling() (armed seconds-early by the travel hooks), skip the
+    -- game-thread hop ENTIRELY. ready is already false, getPawn would bail anyway, and this is exactly
+    -- when the game's own teardown threads are churning locks - not hopping in avoids contending them
+    -- (a lock-ownership crash STATUS_RESOURCE_NOT_OWNED fired once in this window class). the next
+    -- post-settle tick resolves the new pawn and restores ready.
+    if settling() then return false end
+    -- LIFECYCLE RAIL - the SINGLE authority for `ready`. the game swaps the pawn on EVERY instance
+    -- change (dungeon / other instance / death / fall-out-of-map / hub) and MOST do NOT fire
+    -- ClientRestart - so identity, not events, drives readiness:
     --   pawn nil/invalid  -> ready=false (mid-transition; touch nothing)
     --   pawn addr changed -> new instance: wipe ALL per-pawn state, arm settle, ready=false
     --   pawn stable + past the settle window -> ready=true
