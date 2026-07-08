@@ -105,17 +105,11 @@ local function driveSelf()
     if driving or settling() then return end
     local np = selfNameplate
     if not (np and np:IsValid()) then return end
-    -- ROOT teardown gate: only drive while the local player still CONTROLS the owning pawn. on ANY
-    -- transition the pawn unpossesses (IsLocallyControlled -> false) BEFORE the HUD widget frees, so
-    -- driveSelf bails cleanly with no per-transition hook. NOTE: the old `if not localPawn()` bail
-    -- fired EVERY call (localPawn()/UEHelpers is nil in this game) = constant selfNameplate
-    -- null+recapture CHURN and it never actually drove HP/stamina. this replaces it.
-    local live = false
-    pcall(function()
-        local owner = np.AttachedOwnerActor
-        live = owner and owner:IsValid() and owner:IsLocallyControlled() == true
-    end)
-    if not live then return end
+    -- teardown safety is settling(), armed SECONDS early by the travel-request hooks below (cause-side
+    -- signal) + the HUD Destruct hooks + the rail. NO game-native liveness probes here: the previous
+    -- owner:IsLocallyControlled() check was itself a native call (derefs owner->Controller) that can AV
+    -- on a dying actor - the exact crash class it was meant to prevent. IsValid() (UE4SS-side flag
+    -- read) is the only probe used.
     driving = true
     pcall(function()
         if not resolveHUD() then return end
@@ -164,7 +158,19 @@ local function driveSelf()
     driving = false
 end
 
+local npTeardown -- forward-declared: defined below, referenced by installHooks (Destruct hooks)
+local destructHooked = false
 local function installHooks()
+    -- HUD Destruct = the moment the HUD widget actually dies (any transition kind). registered HERE
+    -- (ClientRestart, classes loaded) because a boot-time attempt silently failed in pcall (class not
+    -- loaded yet) - the guard never existed. retried until it lands, then flagged.
+    if not destructHooked then
+        destructHooked = pcall(function()
+            RegisterHook("/Game/UI/UI_WF_Blueprints/UI_WF_HUD/HUD_PlayerMeters.HUD_PlayerMeters_C:Destruct", npTeardown)
+            RegisterHook("/Game/UI/UI_WF_Blueprints/UI_WF_HUD/HUD_PlayerStaminaMeters.HUD_PlayerStaminaMeters_C:Destruct", npTeardown)
+        end)
+        if destructHooked then print("[ShowNameplates] HUD Destruct teardown hooks registered\n") end
+    end
     if hooksInstalled then return end
     hooksInstalled = true
 
@@ -235,24 +241,34 @@ end)
 -- so on close the HUD change-hooks (-> driveSelf) + ShouldBeVisible ran against tearing-down
 -- widgets. arm settling + drop the cached refs so every callback (all gate on settling()) bails.
 -- sets only Lua state = itself crash-safe.
-local function npTeardown()
-    transitionAt = os.clock()
+npTeardown = function()
+    -- EXTENDED hold: travel request fires seconds before CleanupWorld frees the HUD widgets; keep
+    -- settling() true ~6s from the arm (SETTLE_SECS 1.5 alone expired before the world actually died).
+    -- ClientRestart / the rail re-arm a normal window when the new world signals in.
+    transitionAt = os.clock() + 4.5
     selfNameplate = nil
     hudMeters = nil
 end
 RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenu", npTeardown)
 RegisterHook("/Script/Engine.PlayerController:ClientGameEnded", npTeardown)
--- SEAMLESS-TRANSITION teardown (dungeon-leave / instance swap): these free the HUD meter widgets
--- WITHOUT a ClientRestart, so catch the widget's own Destruct to arm the settle gate the moment the
--- HUD tears down = driveSelf bails before the meter-change storm reads freed memory. best-effort:
--- pcall'd in case a build doesn't override Destruct on the widget (RegisterHook would otherwise throw).
-pcall(function() RegisterHook("/Game/UI/UI_WF_Blueprints/UI_WF_HUD/HUD_PlayerMeters.HUD_PlayerMeters_C:Destruct", npTeardown) end)
-pcall(function() RegisterHook("/Game/UI/UI_WF_Blueprints/UI_WF_HUD/HUD_PlayerStaminaMeters.HUD_PlayerStaminaMeters_C:Destruct", npTeardown) end)
--- MENU-EXIT early-arm belt: exit-to-menu = UWFPlayerTravelComponent::RequestMainMenuTravel (a seamless
--- FrontEnd travel that fires none of the ClientReturnToMainMenu* hooks). driveSelf ALREADY self-guards
--- via the localPawn() possession check (nil the instant unpossessed on ANY transition); this is just an
--- early-arm for the full menu teardown. best-effort pcall. (CLIENT_OnTravelStarted removed - never fires.)
-pcall(function() RegisterHook("/Script/Wayfinder.WFPlayerTravelComponent:RequestMainMenuTravel", npTeardown) end)
+-- TRAVEL-REQUEST TEARDOWN ARM (cause-side, seconds before CleanupWorld). same verified UFunction
+-- family as WFQoL. NOTE the HUD Destruct hooks are registered in installHooks() (ClientRestart),
+-- NOT here: at boot the BP widget classes aren't loaded yet, so a boot-time RegisterHook silently
+-- failed inside pcall and the Destruct guard NEVER actually existed (found via boot-log audit).
+for _, fn in ipairs({
+    "/Script/Wayfinder.WFPlayerTravelComponent:RequestMainMenuTravel",
+    "/Script/Wayfinder.WFPlayerTravelComponent:ReturnFromExpedition",
+    "/Script/Wayfinder.WFPlayerTravelComponent:PerformGeneratedLevelTravel",
+    "/Script/Wayfinder.WFPlayerTravelComponent:RequestTravel",
+    "/Script/Wayfinder.WFPlayerTravelComponent:RequestTravelSimple",
+    "/Script/Wayfinder.WFPlayerTravelComponent:RequestTravelWithNextUnlock",
+    "/Script/Wayfinder.WFPlayerTravelComponent:SERVER_ConfirmTravel",
+    "/Script/Wayfinder.WFPlayerTravelComponent:CLIENT_InternalRequestTravel",
+    "/Script/Wayfinder.WFPlayerTravelComponent:PerformServerTravelDelayedHelper",
+    "/Script/Wayfinder.WFPlayerController:CLIENT_HandleInteractWithTravelRegion",
+}) do
+    pcall(function() RegisterHook(fn, npTeardown) end)
+end
 
 -- mod restarted mid-map: install immediately if the widget class is already loaded
 do

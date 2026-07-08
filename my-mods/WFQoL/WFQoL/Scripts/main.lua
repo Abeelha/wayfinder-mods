@@ -86,11 +86,10 @@ local function localPC()
     return pcCache
 end
 
--- is this pawn our LIVE, locally-controlled player pawn? IsLocallyControlled() goes FALSE the instant
--- the controller unpossesses at transition start (BEFORE the pawn frees), so it's the reliable "still
--- safe to drive" signal in Wayfinder. NOTE: pc.Pawn / UEHelpers is nil in this game so it can't be
--- used - but IsLocallyControlled is the exact call the FindAllOf resolver already trusts to find the
--- pawn (that's why autoswing works), so it's proven-reliable here.
+-- RESOLVER-ONLY check: is this a real, locally-controlled pawn? IsLocallyControlled() is a GAME-native
+-- call (derefs pawn->Controller) - it is NOT a safe liveness probe on a dying object (the deref itself
+-- AVs when the controller frees first; pcall can't catch it). so it is used ONLY inside the resolver,
+-- and the resolver NEVER runs during a transition (getPawn hard-bails on settling() first).
 local function isLocalPawn(p)
     if not (p and p:IsValid() and isReal(p)) then return false end
     local ok, lc = pcall(function() return p:IsLocallyControlled() end)
@@ -99,10 +98,12 @@ end
 
 local lastPawnScan = 0.0 -- throttle getPawn's FindAllOf fallback (game-thread scan during loads)
 local function getPawn()
-    -- fast path: the cached pawn, but ONLY while it is STILL locally controlled. a cached pawn whose
-    -- IsValid() is still true during teardown but is already UNPOSSESSED is the crash trap - isLocalPawn
-    -- rejects it, so every loop that goes through getPawn bails on ANY transition (dungeon/menu/zone/death).
-    if isLocalPawn(pawnRef) then return pawnRef end
+    -- TRANSITION = HANDS OFF. the travel-request hooks arm settling() seconds BEFORE the world starts
+    -- dying, so during the whole danger window this returns nil immediately: no cache probe, no PC
+    -- route, no FindAllOf, no native call of ANY kind on ANY pawn. every caller just bails.
+    if settling() then return nil end
+    -- fast path: cached pawn. IsValid() is a UE4SS-side object-flag read (no game code) = safe probe.
+    if pawnRef and pawnRef:IsValid() then return pawnRef end
     pawnRef = nil
     -- PC route (usually nil in this game; kept in case it ever resolves)
     local pc = localPC()
@@ -115,7 +116,7 @@ local function getPawn()
     if pawnRef then return pawnRef end
     -- FALLBACK object scan (the ACTUAL resolver in this game). throttled: FindAllOf(135k) every tick
     -- on the game thread would amplify a load into a freeze. accept ONLY a locally-controlled pawn -
-    -- never a remote (MP) or a tearing-down/unpossessed one (dropped the old unconditional `first`).
+    -- never a remote (MP) one.
     if (os.clock() - lastPawnScan) < 2.0 then return nil end
     lastPawnScan = os.clock()
     pcall(function()
@@ -184,7 +185,9 @@ local lastChainLog = 0.0     -- throttle the diag log
 local function flushChainRelease()
     if not (sendRelease or sendRelease2) then chainDown = false; return end
     ExecuteInGameThread(function()
-        if isLocalPawn(pawnRef) then
+        -- settling() = transition in progress: inject NOTHING (no native probe either - IsValid is the
+        -- only safe check, and even that only outside the travel window). just drop the Lua state.
+        if not settling() and pawnRef and pawnRef:IsValid() then
             injecting = true
             pcall(function()
                 if sendRelease then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_37(LMB) end
@@ -203,7 +206,9 @@ LoopAsync(70, function()
         return false
     end
     ExecuteInGameThread(function()
-        if not isLocalPawn(pawnRef) then return end   -- unpossessed at teardown = false = clean bail
+        -- re-check settling INSIDE the game-thread closure: the travel hooks arm it on the game thread,
+        -- so this is race-free vs the async gate at the top of the loop.
+        if settling() or not (pawnRef and pawnRef:IsValid()) then return end
         injecting = true
         pcall(function()
             if chainDown then
@@ -1190,23 +1195,45 @@ end)
 -- the START of teardown; flip ready=false + arm the settle gate so every native-touching loop
 -- bails (sprint/chain gate on `ready`, parry work on `settling()`). the callback ONLY sets Lua
 -- flags - zero object access = itself crash-safe. ready re-arms on the next ClientRestart.
+local lastTeardownLog = 0.0
 local function onTeardown()
     ready = false
-    transitionAt = os.clock()
+    -- EXTENDED hold: a travel request fires SECONDS before CleanupWorld (menu exit measured ~3s,
+    -- dungeon exit longer). future-date transitionAt so settling() stays true ~6s from the arm -
+    -- long enough to cover request -> confirm -> world teardown. the new world's ClientRestart /
+    -- the rail's pawn-addr change re-arms transitionAt to a normal 1.5s settle, so readiness
+    -- returns on the game's own signal, not this timer.
+    transitionAt = os.clock() + 4.5
     lastPawnAddr = nil   -- force the rail to treat the next pawn as a fresh instance
     onNewInstance()
+    if os.clock() - lastTeardownLog > 2.0 then
+        lastTeardownLog = os.clock()
+        log("teardown armed (travel/menu) - all loops quiet")
+    end
 end
 RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenu", onTeardown)
 RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenuWithTextReason", onTeardown)
 RegisterHook("/Script/Engine.PlayerController:ClientGameEnded", onTeardown)
--- SEAMLESS MENU EXIT: "exit to main menu" goes through UWFPlayerTravelComponent::RequestMainMenuTravel
--- -> a SEAMLESS travel to the FrontEnd map that fires NONE of the ClientReturnToMainMenu* hooks above
--- (confirmed in the crash Atlas.log: RequestMainMenuTravel ~3s before the AV, no Client* teardown).
--- our always-on loops then ran against the tearing-down world = native AV. arm teardown at the travel
--- request AND on any travel start (CLIENT_OnTravelStarted = the universal signal, also reinforces the
--- rail on dungeon/zone swaps). best-effort (pcall) in case a build renames them; the rail is the backstop.
-pcall(function() RegisterHook("/Script/Wayfinder.WFPlayerTravelComponent:CLIENT_OnTravelStarted", onTeardown) end)
-pcall(function() RegisterHook("/Script/Wayfinder.WFPlayerTravelComponent:RequestMainMenuTravel", onTeardown) end)
+-- TRAVEL-REQUEST TEARDOWN ARM - the cause-side signal. every world swap starts as a call into
+-- WFPlayerTravelComponent SECONDS before CleanupWorld frees the old world's actors, and these are
+-- reflected UFunctions (UHT dump verified) unlike PreClientTravel (C++ virtual, unhookable) or
+-- CLIENT_OnTravelStarted (registered fine but NEVER fires in the logs - dropped). solo = listen
+-- host, so SERVER_* ones execute locally and their hooks DO fire. all best-effort pcall'd; the
+-- lifecycle rail stays as the backstop for anything that slips past.
+for _, fn in ipairs({
+    "/Script/Wayfinder.WFPlayerTravelComponent:RequestMainMenuTravel",            -- exit to main menu
+    "/Script/Wayfinder.WFPlayerTravelComponent:ReturnFromExpedition",             -- leave dungeon
+    "/Script/Wayfinder.WFPlayerTravelComponent:PerformGeneratedLevelTravel",      -- enter dungeon
+    "/Script/Wayfinder.WFPlayerTravelComponent:RequestTravel",                    -- generic travel
+    "/Script/Wayfinder.WFPlayerTravelComponent:RequestTravelSimple",
+    "/Script/Wayfinder.WFPlayerTravelComponent:RequestTravelWithNextUnlock",
+    "/Script/Wayfinder.WFPlayerTravelComponent:SERVER_ConfirmTravel",             -- travel confirmed (host-local)
+    "/Script/Wayfinder.WFPlayerTravelComponent:CLIENT_InternalRequestTravel",
+    "/Script/Wayfinder.WFPlayerTravelComponent:PerformServerTravelDelayedHelper", -- the actual travel executor
+    "/Script/Wayfinder.WFPlayerController:CLIENT_HandleInteractWithTravelRegion", -- exit-portal interact
+}) do
+    pcall(function() RegisterHook(fn, onTeardown) end)
+end
 
 -- ---------------------------------------------------------------- keybinds
 -- debounced: key auto-repeat fires RegisterKeyBind multiple times per press
