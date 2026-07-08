@@ -271,17 +271,12 @@ end
 -- goes through the overlay SORT button (sortOwnedItems below), which is dupe-aware: it only
 -- junks DUPLICATE extras (keeping the best) and never touches a unique. hook not registered.
 
+-- NEUTERED (WFQoL): the console path called FlagItems -> handleApplyItemFlag SYNCHRONOUSLY for
+-- every item = hundreds of back-to-back SERVER_TryApplyItemFlags RPCs on the game thread - the
+-- exact hard-freeze SmartSort was once disabled for. The batched overlay SORT path is the only
+-- sanctioned entry point (queue-drained, teardown-gated, dupe-aware).
 RegisterConsoleCommandHandler("RunSmartSort", function(FullCommand, Parameters, OutputDevice)
-    local PlayerInventoryComponent = FindFirstOf("PlayerInventoryComponent");
-
-    if PlayerInventoryComponent:IsValid() then
-        Log(Text.flaggingItems, OutputDevice)
-        FlagItems(PlayerInventoryComponent);
-        Log(Text.flaggedItems, OutputDevice);
-    else
-        Log(Text.noInventory, OutputDevice)
-    end
-
+    Log("RunSmartSort is disabled (sync path froze the game) - use the overlay SORT button\n", OutputDevice)
     return true
 end)
 
@@ -293,9 +288,28 @@ end)
 -- teardown guard: on close / return-to-menu, stop touching the freeing inventory. the poll,
 -- the queue drain, and sortOwnedItems all check this. hook sets only a Lua flag = crash-safe.
 local tearing = false
-RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenu", function() tearing = true end)
-RegisterHook("/Script/Engine.PlayerController:ClientGameEnded", function() tearing = true end)
+local function ssTeardown() tearing = true end
+RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenu", ssTeardown)
+RegisterHook("/Script/Engine.PlayerController:ClientGameEnded", ssTeardown)
 RegisterHook("/Script/Engine.PlayerController:ClientRestart", function() tearing = false end)
+-- TRAVEL-REQUEST TEARDOWN ARM: dungeon-leave / zone swaps are SEAMLESS travels that fire NONE of
+-- the Client* hooks above - a sort queue draining (or a SORT click) mid-travel would RPC into the
+-- freeing PlayerInventoryComponent = native AV pcall can't catch. same verified UFunction family
+-- as WFQoL/ShowNameplates; ClientRestart on arrival resets tearing=false.
+for _, fn in ipairs({
+    "/Script/Wayfinder.WFPlayerTravelComponent:RequestMainMenuTravel",
+    "/Script/Wayfinder.WFPlayerTravelComponent:ReturnFromExpedition",
+    "/Script/Wayfinder.WFPlayerTravelComponent:PerformGeneratedLevelTravel",
+    "/Script/Wayfinder.WFPlayerTravelComponent:RequestTravel",
+    "/Script/Wayfinder.WFPlayerTravelComponent:RequestTravelSimple",
+    "/Script/Wayfinder.WFPlayerTravelComponent:RequestTravelWithNextUnlock",
+    "/Script/Wayfinder.WFPlayerTravelComponent:SERVER_ConfirmTravel",
+    "/Script/Wayfinder.WFPlayerTravelComponent:CLIENT_InternalRequestTravel",
+    "/Script/Wayfinder.WFPlayerTravelComponent:PerformServerTravelDelayedHelper",
+    "/Script/Wayfinder.WFPlayerController:CLIENT_HandleInteractWithTravelRegion",
+}) do
+    pcall(function() RegisterHook(fn, ssTeardown) end)
+end
 
 local flagQueue = {}
 local flagRunning = false

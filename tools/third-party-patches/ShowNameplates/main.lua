@@ -49,24 +49,14 @@ local function showWidget(np, name)
 end
 
 local svbLogged = false -- one-shot diag: player ShouldBeVisible fired
-local drove = false     -- one-shot diag: driveSelf succeeded (capture + HUD resolve OK)
 local lastDrivenHp, lastDrivenStam = nil, nil -- diag: track driven values to see if they move
-local captureMissLogged = false -- one-shot diag: self-capture ran but addr didn't match
+local lastDriveLog = 0.0 -- min interval between drive diag lines
+local selfAddr = nil     -- address of the captured self nameplate (cheap identity compare)
 
 -- safe pointer read (address value only, no object-internal deref -> safe on any owner)
 local function addrOf(o)
     local ok, a = pcall(function() return o:GetAddress() end)
     return ok and a or nil
-end
-
--- the LOCAL player's pawn, directly (never iterates remote pawns)
-local function localPawn()
-    local ok, p = pcall(function()
-        local UEHelpers = require("UEHelpers")
-        return UEHelpers:GetPlayerController().Pawn
-    end)
-    if ok and p and p:IsValid() then return p end
-    return nil
 end
 
 -- (re)find the LOCAL HUD meters widget; cached until it goes invalid (level change). the
@@ -106,10 +96,8 @@ local function driveSelf()
     local np = selfNameplate
     if not (np and np:IsValid()) then return end
     -- teardown safety is settling(), armed SECONDS early by the travel-request hooks below (cause-side
-    -- signal) + the HUD Destruct hooks + the rail. NO game-native liveness probes here: the previous
-    -- owner:IsLocallyControlled() check was itself a native call (derefs owner->Controller) that can AV
-    -- on a dying actor - the exact crash class it was meant to prevent. IsValid() (UE4SS-side flag
-    -- read) is the only probe used.
+    -- signal) + the HUD Destruct hooks. NO game-native liveness probes here: IsValid() (UE4SS-side
+    -- flag read) is the only probe used; native calls on a dying object AV through pcall.
     driving = true
     pcall(function()
         if not resolveHUD() then return end
@@ -147,11 +135,13 @@ local function driveSelf()
             setPct(np, "characterStaminaFill", staminaP) -- stamina fill
             showWidget(np, "characterStaminaFill")
         end
-        -- diag: log whenever the driven hp/stam CHANGES (>2%) so we can see if the value TRACKS
-        -- vs is stuck-full (the MP-host bug). change-throttled, not spammy.
-        if healthP and (math.abs(healthP - (lastDrivenHp or -1)) > 0.02
-                     or math.abs((staminaP or 0) - (lastDrivenStam or -1)) > 0.02) then
-            lastDrivenHp = healthP; lastDrivenStam = staminaP or 0
+        -- diag: >5% change AND >=1s apart. the old >2%-only version printed on every stamina tick
+        -- = hundreds of print() I/O lines per minute ON THE GAME THREAD (perf smell, log noise).
+        local now = os.clock()
+        if healthP and (now - lastDriveLog) >= 1.0
+           and (math.abs(healthP - (lastDrivenHp or -1)) > 0.05
+             or math.abs((staminaP or 0) - (lastDrivenStam or -1)) > 0.05) then
+            lastDrivenHp = healthP; lastDrivenStam = staminaP or 0; lastDriveLog = now
             print(string.format("[ShowNameplates] drive: hp=%.2f shield=%.2f stam=%.2f\n", healthP or -1, shieldP or -1, staminaP or -1))
         end
     end)
@@ -197,28 +187,31 @@ local function installHooks()
             showWidget(np, "PlayerHealthBar")
             showWidget(np, "PlayerLastHealthBar")
             showWidget(np, "PlayerHealthBar_Additive")
-            -- capture the LOCAL nameplate once
-            if not (selfNameplate and selfNameplate:IsValid()) then
+            -- SELF-HEALING CAPTURE: identity = "is this widget's owner the pawn *I* control?"
+            -- owner:IsLocallyControlled() is safe HERE because the game is actively evaluating this
+            -- LIVE widget this frame (owner alive by construction); remote teammates return false.
+            -- capture REPLACES the cache whenever a *different* local nameplate shows up - death
+            -- respawn / instance change / MP rejoin all spawn a NEW widget, whose ShouldBeVisible
+            -- fires, and we re-capture instantly. the old code captured ONCE and skipped while the
+            -- stale cache was still IsValid (valid != visible) -> bars gone until relog. also gone:
+            -- the addr-compare against GetOwningPlayerPawn/localPawn (localPawn was ALWAYS nil in
+            -- this game, and nil==nil could mis-capture an ally plate in MP).
+            local npAddr = addrOf(np)
+            if npAddr ~= selfAddr then
                 local owner = np.AttachedOwnerActor
-                -- LOCAL player's pawn via UMG's own GetOwningPlayerPawn (the UI is owned by the
-                -- local player) - NO require("UEHelpers") dependency, which was FAILING here so
-                -- the address never matched and self was never captured -> stuck-full HP / no
-                -- stamina. fall back to localPawn() if the getter returns nil.
-                local lp = nil
-                pcall(function() lp = np:GetOwningPlayerPawn() end)
-                if not (lp and lp:IsValid()) then lp = localPawn() end
-                if owner and owner:IsValid() and lp and lp:IsValid() and addrOf(owner) == addrOf(lp) then
+                local isMine = false
+                if owner and owner:IsValid() then
+                    pcall(function() isMine = owner:IsLocallyControlled() == true end)
+                end
+                if isMine then
                     selfNameplate = np
+                    selfAddr = npAddr
                     print("[ShowNameplates] self nameplate captured\n")
                     driveSelf() -- populate immediately on capture
-                elseif not captureMissLogged then
-                    captureMissLogged = true
-                    print(string.format("[ShowNameplates] capture miss: owner=%s lp=%s\n",
-                        tostring(owner and addrOf(owner)), tostring(lp and addrOf(lp))))
                 end
             end
             -- STAMINA only on the LOCAL player's nameplate (allies get health only)
-            if selfNameplate and selfNameplate:IsValid() and addrOf(np) == addrOf(selfNameplate) then
+            if npAddr and npAddr == selfAddr then
                 showWidget(np, "characterStaminaFill")
                 -- ShouldBeVisible fires EVERY frame; throttle the refresh to ~10x/sec so an
                 -- unresolved HUD can't drive a per-frame resolveHUD scan (freeze guard).
@@ -233,6 +226,7 @@ end
 RegisterHook("/Script/Engine.PlayerController:ClientRestart", function()
     transitionAt = os.clock()
     selfNameplate = nil
+    selfAddr = nil
     hudMeters = nil
     pcall(installHooks)
 end)
@@ -247,6 +241,7 @@ npTeardown = function()
     -- ClientRestart / the rail re-arm a normal window when the new world signals in.
     transitionAt = os.clock() + 4.5
     selfNameplate = nil
+    selfAddr = nil
     hudMeters = nil
 end
 RegisterHook("/Script/Engine.PlayerController:ClientReturnToMainMenu", npTeardown)
@@ -276,36 +271,11 @@ do
     if wp and wp:IsValid() then pcall(installHooks) end
 end
 
--- LIFECYCLE RAIL: the game swaps the local pawn on EVERY instance change (dungeon / other
--- instance / death / fall-out-of-map / hub) and MOST do NOT fire ClientRestart - so the cached
--- self-nameplate + HUD-meter refs would keep pointing at the OLD instance (the "HP stuck full /
--- stamina blank after a zone change" bug). cheap 300ms poll of the local pawn ADDRESS (a pointer
--- read, NOT the per-frame object scan that was the old fps killer): any change - or a cached ref
--- going invalid - arms the settle gate + drops the caches so ShouldBeVisible/driveSelf re-capture
--- cleanly for the new pawn. degrades safely: if localPawn() can't resolve, the stale-ref check
--- still drops caches the moment they go invalid.
-local npLastPawnAddr = nil
-LoopAsync(300, function()
-    -- GAME-THREAD WRAP: reading pawn/widget UObjects off the async loop thread can race the
-    -- game thread mid-transition (torn read -> AV). all native reads go through
-    -- ExecuteInGameThread, same as the WFQoL loops. the poll itself only sets Lua state.
-    ExecuteInGameThread(function()
-        pcall(function()
-            local p = localPawn()
-            local pa = p and addrOf(p) or nil
-            local staleRef = (selfNameplate and not selfNameplate:IsValid())
-                          or (hudMeters and not hudMeters:IsValid())
-            if pa ~= npLastPawnAddr or staleRef then
-                npLastPawnAddr = pa
-                transitionAt = os.clock()
-                selfNameplate = nil
-                hudMeters = nil
-                captureMissLogged = false
-                svbLogged = false
-            end
-        end)
-    end)
-    return false
-end)
+-- NO lifecycle rail anymore (deleted, deliberately): its pawn-address branch was 100% dead
+-- (localPawn()/UEHelpers is ALWAYS nil in this game -> the address never changed), and its only
+-- live effect was arming a 1.5s settle pause every time the self widget got recycled = the
+-- "self nameplate captured" churn + frozen bars every 1-2 min. capture is now SELF-HEALING at
+-- ShouldBeVisible time (fires per-frame on live widgets - the correct lifecycle signal), and
+-- driveSelf/resolveHUD re-validate their caches on every call.
 
-print("[ShowNameplates] loaded - players only, event-driven + 300ms lifecycle poll, MP + perf safe\n")
+print("[ShowNameplates] loaded - players only, event-driven, self-healing capture, MP + perf safe\n")

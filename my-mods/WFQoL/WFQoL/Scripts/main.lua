@@ -71,20 +71,10 @@ local function settling() return (os.clock() - transitionAt) < SETTLE_SECS end
 -- for -> arm the settle gate the same way.
 local lastPawnAddr = nil
 
--- O(1) local pawn: the local PlayerController's Pawn - authoritative, avoids the 135k-object
--- FindAllOf scan in the hot path (the rail calls getPawn every tick), and can't accidentally
--- grab a REMOTE player's pawn in MP. the PlayerController persists across pawn swaps (it
--- repossesses the new pawn); IsValid re-fetches it after a teardown.
-local pcCache = nil
-local function localPC()
-    if pcCache and pcCache:IsValid() then return pcCache end
-    pcCache = nil
-    pcall(function()
-        local pc = require("UEHelpers"):GetPlayerController()
-        if pc and pc:IsValid() then pcCache = pc end
-    end)
-    return pcCache
-end
+-- NOTE: there is deliberately NO UEHelpers/GetPlayerController route here - in Wayfinder
+-- `GetPlayerController().Pawn` is ALWAYS nil (verified repeatedly in logs), and building logic on
+-- it broke autoswing/autosprint once already. the pawn resolver = attack-hook cache + the
+-- throttled FindAllOf scan below. do not re-add the PC route.
 
 -- RESOLVER-ONLY check: is this a real, locally-controlled pawn? IsLocallyControlled() is a GAME-native
 -- call (derefs pawn->Controller) - it is NOT a safe liveness probe on a dying object (the deref itself
@@ -105,15 +95,6 @@ local function getPawn()
     -- fast path: cached pawn. IsValid() is a UE4SS-side object-flag read (no game code) = safe probe.
     if pawnRef and pawnRef:IsValid() then return pawnRef end
     pawnRef = nil
-    -- PC route (usually nil in this game; kept in case it ever resolves)
-    local pc = localPC()
-    if pc then
-        pcall(function()
-            local p = pc.Pawn
-            if isLocalPawn(p) then pawnRef = p end
-        end)
-    end
-    if pawnRef then return pawnRef end
     -- FALLBACK object scan (the ACTUAL resolver in this game). throttled: FindAllOf(135k) every tick
     -- on the game thread would amplify a load into a freeze. accept ONLY a locally-controlled pawn -
     -- never a remote (MP) one.
@@ -162,6 +143,8 @@ local m2Held = false
 local injecting = false
 local sendRelease = false
 local sendRelease2 = false
+local lastRealPressAt = 0.0 -- os.clock() of the last REAL (player) press event; the `injecting`
+                            -- guard keeps our synthetic presses out. drives the stuck-hold failsafe.
 
 -- reload minigame state lives up here: AutoChain must stop injecting M1 while
 -- the minigame runs (Attack1 AND Reload both count as minigame inputs - a
@@ -200,6 +183,14 @@ local function flushChainRelease()
 end
 
 LoopAsync(70, function()
+    -- STUCK-HOLD FAILSAFE: if a UI (inventory/menu) swallows the physical release, the game's
+    -- release event (_37/_41) never fires and m1Held/m2Held stay true forever -> the chain keeps
+    -- attacking after the UI closes. nobody holds attack for 45s straight without re-pressing;
+    -- if the last REAL press is that old, clear the held state and stop.
+    if (m1Held or m2Held) and (os.clock() - lastRealPressAt) > 45.0 then
+        m1Held = false; m2Held = false
+        log("chain: hold timed out after 45s without a real press (UI swallowed the release?)")
+    end
     -- can't continue the chain? flush any outstanding press so nothing is left held.
     if not (state.chain and ready) or settling() or reloadInProgress() or not (m1Held or m2Held) then
         flushChainRelease()
@@ -212,9 +203,13 @@ LoopAsync(70, function()
         injecting = true
         pcall(function()
             if chainDown then
-                -- this tick RELEASES the press we sent last tick (completes one tap)
-                if m1Held then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_37(LMB) end
-                if m2Held then pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_41(RMB) end
+                -- this tick RELEASES the press we sent last tick (completes one tap). keyed off
+                -- sendRelease/sendRelease2 = what we ACTUALLY pressed, NOT the current m1Held/m2Held:
+                -- keying off the held state orphaned an injected press when one button was released
+                -- while the other stayed held (its release tick saw held=false and skipped) =
+                -- character stuck mid-attack with a phantom held button.
+                if sendRelease  then pawnRef:InpActEvt_Attack1_K2Node_InputActionEvent_37(LMB) end
+                if sendRelease2 then pawnRef:InpActEvt_Attack2_K2Node_InputActionEvent_41(RMB) end
                 chainDown = false; sendRelease = false; sendRelease2 = false
             else
                 -- this tick PRESSES the attack button; next tick releases it
@@ -252,6 +247,8 @@ local lastScheduled = 0.0
 local lastParryInfo = "" -- for the external overlay
 local lastStaminaSkipLog = 0.0
 local lastConnectLog = 0.0
+local lastParryLog = 0.0     -- throttle the parry-landed log
+local lastParryFailLog = 0.0 -- throttle the parry-failed log
 
 local function isMeleeAttack(ability)
     local hasAttack, hasMelee = false, false
@@ -345,10 +342,15 @@ end
 
 -- stamina read via the HUD stamina meter widget (same trick ShowNameplates uses)
 local metersCache = nil
+local lastMetersScan = 0.0 -- THROTTLE the 135k-object FindAllOf re-scan: staminaPct runs on the
+                           -- game thread per parry attempt; with a cold cache in a swarm that was
+                           -- an unthrottled repeated full-object scan = hitch/freeze vector.
 local function staminaPct()
     local ok, pct = pcall(function()
         if not metersCache or not metersCache:IsValid() then
             metersCache = nil
+            if (os.clock() - lastMetersScan) < 0.5 then return nil end -- nil = "unknown, allow parry"
+            lastMetersScan = os.clock()
             for _, m in pairs(FindAllOf("HUD_PlayerMeters_C") or {}) do
                 if isReal(m) and m.PlayerShieldBar and m.PlayerShieldBar:IsValid() then
                     metersCache = m
@@ -459,7 +461,10 @@ local function doParry(className, delayMs, enemy, attempt)
             if reloadInProgress() then return end -- parry/montage-stop would kill the minigame
             local now = os.clock()
             if now - lastParry < PARRY_COOLDOWN then return end
-            local pawn = getPawn()
+            -- cached pawn ONLY: getPawn()'s FindAllOf fallback is a 135k-object scan and this runs
+            -- on the game thread mid-combat (a cold cache in a swarm = second scan per parry =
+            -- hitch vector). no cached pawn -> just skip this parry; the rail re-resolves it.
+            local pawn = (pawnRef and pawnRef:IsValid()) and pawnRef or nil
             if not pawn then return end
 
             -- only spend the parry if this attack is actually about to land on us
@@ -491,7 +496,10 @@ local function doParry(className, delayMs, enemy, attempt)
                 lastParry = now
                 stat.parry = stat.parry + 1
                 lastParryInfo = string.format("%s @%dms", className:gsub("^GA_", ""):gsub("_C$", ""), delayMs)
-                log("parry vs %s (delay %dms)", className, delayMs)
+                if now - lastParryLog >= 2.0 then -- throttled: was ~200 lines/min in sustained combat
+                    lastParryLog = now
+                    log("parry vs %s (delay %dms)", className, delayMs)
+                end
                 return
             end
 
@@ -503,7 +511,10 @@ local function doParry(className, delayMs, enemy, attempt)
                 ExecuteWithDelay(80, function() doParry(className, delayMs, enemy, attempt + 1) end)
             else
                 stat.parryFail = stat.parryFail + 1
-                log("parry FAILED vs %s after %d attempts", className, attempt)
+                if now - lastParryFailLog >= 2.0 then -- throttled (log spam diet)
+                    lastParryFailLog = now
+                    log("parry FAILED vs %s after %d attempts", className, attempt)
+                end
             end
         end)
         if not ok then logErrorOnce("parry", err) end
@@ -1013,13 +1024,14 @@ end
 -- ---------------------------------------------------------------- overlay state file
 -- consumed by the external overlay app (tools/overlay/WFQoL-Overlay.ps1).
 -- pure Lua io: safe to run any time, no engine access.
-local STATE_FILE = "Mods/WFQoL/overlay-state.json"
+-- ABS path ONLY: the old relative-path-first fallback could write a stray file against an
+-- unexpected CWD while the overlay reads the absolute one = silent overlay staleness.
 local STATE_FILE_ABS = "D:/SteamLibrary/steamapps/common/Wayfinder/Atlas/Binaries/Win64/Mods/WFQoL/overlay-state.json"
 
 local function writeState()
     local ok, err = pcall(function()
-        local f = io.open(STATE_FILE, "w") or io.open(STATE_FILE_ABS, "w")
-        if not f then error("cannot open " .. STATE_FILE) end
+        local f = io.open(STATE_FILE_ABS, "w")
+        if not f then error("cannot open " .. STATE_FILE_ABS) end
         f:write(string.format(
             '{"chain":%s,"parry":%s,"sprint":%s,"reload":%s,"overlay":%s,"sprintMode":"%s","combat":%s,"lastParry":"%s","incoming":"%s","incomingKind":"%s","incomingTs":%d,"statParry":%d,"statParryFail":%d,"statSeen":%d,"ts":%d}',
             tostring(state.chain), tostring(state.parry), tostring(state.sprint),
@@ -1044,6 +1056,12 @@ local perfLastLog = 0.0
 -- frozen. log it once so the NEXT perma-load leaves a fingerprint (base-game stream
 -- hang vs a mod hang). re-arms after a normal (finite) zone load recovers.
 local gtBeat, gtAck, gtFrozenLogged = 0, 0, false
+local gtAckAt = 0.0 -- os.clock() stamped ON the game thread at each answered ping
+-- HEARTBEAT FILE (freeze fingerprint): after a dumpless freeze, this file tells which layer died.
+-- `async` fresh + `game` stale = game-thread hang (engine/native). BOTH stale = the whole process
+-- froze (GPU/driver-side). written every ~5s; pure Lua io = zero crash risk.
+local HEARTBEAT_ABS = "D:/SteamLibrary/steamapps/common/Wayfinder/Atlas/Binaries/Win64/Mods/WFQoL/heartbeat.txt"
+local hbTick = 0
 LoopAsync(1000, function()
     writeState()
     local now = os.clock()
@@ -1055,7 +1073,7 @@ LoopAsync(1000, function()
     end
     gtBeat = gtBeat + 1
     local myBeat = gtBeat
-    ExecuteInGameThread(function() gtAck = myBeat end)
+    ExecuteInGameThread(function() gtAck = myBeat; gtAckAt = os.clock() end)
     local behind = gtBeat - gtAck
     if behind >= 6 and not gtFrozenLogged then
         gtFrozenLogged = true
@@ -1063,18 +1081,27 @@ LoopAsync(1000, function()
     elseif behind < 3 then
         gtFrozenLogged = false -- recovered (normal zone load), re-arm
     end
+    hbTick = hbTick + 1
+    if hbTick % 5 == 0 then
+        pcall(function()
+            local f = io.open(HEARTBEAT_ABS, "w")
+            if f then
+                f:write(string.format("async=%.1f game=%.1f behind=%d ts=%d\n", now, gtAckAt, behind, os.time()))
+                f:close()
+            end
+        end)
+    end
     return false
 end)
 
 -- overlay -> mod command channel: clicking a mod row in the overlay writes
 -- overlay-cmd.json {seq, feature}; we toggle that mod's state on a new seq.
 -- the pre-existing seq at load is recorded but not applied (stale click guard).
-local CMD_REL = "Mods/WFQoL/overlay-cmd.json"
 local CMD_ABS = "D:/SteamLibrary/steamapps/common/Wayfinder/Atlas/Binaries/Win64/Mods/WFQoL/overlay-cmd.json"
 local lastCmdSeq = nil
 LoopAsync(200, function()
     pcall(function()
-        local f = io.open(CMD_REL, "r") or io.open(CMD_ABS, "r")
+        local f = io.open(CMD_ABS, "r")
         if not f then return end
         local raw = f:read("*a")
         f:close()
@@ -1124,6 +1151,7 @@ local function registerAll()
     tryHook(CHAR .. ":InpActEvt_Attack1_K2Node_InputActionEvent_36", function(self)
         if injecting then return end
         m1Held = true
+        lastRealPressAt = os.clock() -- real player press (stuck-hold failsafe anchor)
         pcall(function()
             local p = self:get()
             if p and p:IsValid() then pawnRef = p end -- guard: never cache an invalid pawn
@@ -1137,6 +1165,7 @@ local function registerAll()
     tryHook(CHAR .. ":InpActEvt_Attack2_K2Node_InputActionEvent_40", function(self)
         if injecting then return end
         m2Held = true
+        lastRealPressAt = os.clock() -- real player press (stuck-hold failsafe anchor)
         pcall(function()
             local p = self:get()
             if p and p:IsValid() then pawnRef = p end
@@ -1244,6 +1273,12 @@ local function bindToggle(key, name, label)
         if lastToggle[name] and now - lastToggle[name] < 0.3 then return end
         lastToggle[name] = now
         state[name] = not state[name]
+        -- chain OFF must also drop the held state + release any in-flight injected press -
+        -- otherwise a stuck m1Held keeps the loop primed for the next toggle-on.
+        if name == "chain" and not state.chain then
+            m1Held = false; m2Held = false
+            flushChainRelease()
+        end
         log("%s %s", label, state[name] and "ON" or "OFF")
         writeState()
     end)
