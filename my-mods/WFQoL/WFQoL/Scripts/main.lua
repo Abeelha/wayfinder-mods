@@ -1073,7 +1073,22 @@ end
 -- unexpected CWD while the overlay reads the absolute one = silent overlay staleness.
 local STATE_FILE_ABS = "D:/SteamLibrary/steamapps/common/Wayfinder/Atlas/Binaries/Win64/Mods/WFQoL/overlay-state.json"
 
+-- FOOTPRINT TRIM: the 1s perf loop calls writeState every tick. file I/O inside a LoopAsync body
+-- holds the shared Lua VM mutex, so a game-thread ExecuteInGameThread callback STALLS behind it =
+-- periodic micro-stutter. So actually WRITE only when the overlay-visible state CHANGED, plus a slow
+-- 10s keepalive so the overlay's liveness timestamp still advances. Idle: 1 write / 10s (was 1 / s).
+local lastStateKey = nil
+local lastStateWrite = 0.0
 local function writeState()
+    local key = table.concat({
+        tostring(state.chain), tostring(state.parry), tostring(state.sprint), tostring(state.reload),
+        tostring(state.overlay), sprintMode, tostring(lastCombat == true), lastParryInfo,
+        incoming.name, incoming.kind, tostring(incoming.ts),
+        tostring(stat.parry), tostring(stat.parryFail), tostring(stat.seen) }, "|")
+    local now = os.clock()
+    if key == lastStateKey and (now - lastStateWrite) < 10.0 then return end -- unchanged + keepalive fresh
+    lastStateKey = key
+    lastStateWrite = now
     local ok, err = pcall(function()
         local f = io.open(STATE_FILE_ABS, "w")
         if not f then error("cannot open " .. STATE_FILE_ABS) end
