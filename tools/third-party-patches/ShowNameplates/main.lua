@@ -197,16 +197,24 @@ local function installHooks()
             -- the addr-compare against GetOwningPlayerPawn/localPawn (localPawn was ALWAYS nil in
             -- this game, and nil==nil could mis-capture an ally plate in MP).
             local npAddr = addrOf(np)
-            if npAddr ~= selfAddr then
+            -- ADDRESS-REUSE FIX: also recapture when the cached self is STALE (invalid), not only
+            -- when the address differs. a respawned/rebuilt nameplate can be pooled to the SAME
+            -- memory address as the destroyed one; guarding on npAddr~=selfAddr alone then SKIPS
+            -- recapture, leaving selfNameplate pointing at the dead userdata -> driveSelf bails on
+            -- IsValid()==false -> blank healthbar forever (addr keeps matching, never heals). the
+            -- per-frame retry here also covers the possession race (owner not yet locally-controlled).
+            local haveSelf = selfNameplate and selfNameplate:IsValid()
+            if (not haveSelf) or npAddr ~= selfAddr then
                 local owner = np.AttachedOwnerActor
                 local isMine = false
                 if owner and owner:IsValid() then
                     pcall(function() isMine = owner:IsLocallyControlled() == true end)
                 end
                 if isMine then
+                    local reason = haveSelf and "new-addr" or "stale-revalidate"
                     selfNameplate = np
                     selfAddr = npAddr
-                    print("[ShowNameplates] self nameplate captured\n")
+                    print("[ShowNameplates] self nameplate captured ("..reason..")\n")
                     driveSelf() -- populate immediately on capture
                 end
             end
