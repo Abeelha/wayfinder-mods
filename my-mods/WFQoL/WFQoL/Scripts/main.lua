@@ -1089,16 +1089,18 @@ LoopAsync(1000, function()
     elseif behind < 3 then
         gtFrozenLogged = false -- recovered (normal zone load), re-arm
     end
+    -- every tick (~1s): tight freeze resolution. after a dumpless freeze, this file pins the last
+    -- healthy moment to ~1s and shows the failure MODE: `behind` climbing (1,2,3..) = game-thread hang
+    -- (engine/native); file frozen while `behind` was low = whole-process stop (GPU/driver/kill).
     hbTick = hbTick + 1
-    if hbTick % 5 == 0 then
-        pcall(function()
-            local f = io.open(HEARTBEAT_ABS, "w")
-            if f then
-                f:write(string.format("async=%.1f game=%.1f behind=%d ts=%d\n", now, gtAckAt, behind, os.time()))
-                f:close()
-            end
-        end)
-    end
+    pcall(function()
+        local f = io.open(HEARTBEAT_ABS, "w")
+        if f then
+            f:write(string.format("async=%.1f game=%.1f behind=%d combat=%s ts=%d\n",
+                now, gtAckAt, behind, tostring(lastCombat == true), os.time()))
+            f:close()
+        end
+    end)
     return false
 end)
 
