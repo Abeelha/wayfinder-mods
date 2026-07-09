@@ -186,20 +186,10 @@ local function driveSelf(npOverride)
             end
         end
         if healthP then
-            setPct(np, "PlayerHealthBar",     healthP) -- primary green fill
-            setPct(np, "PlayerLastHealthBar", 1.0)     -- FULL width = dark "missing health" backing
-            showWidget(np, "PlayerHealthBar")
-            showWidget(np, "PlayerLastHealthBar")
-            -- MISSING-HEALTH = grey/black: PlayerLastHealthBar sits behind the green fill; driving it
-            -- full-width + near-black tint makes the unfilled region read dark. tint set ONCE/plate.
-            local a = addrOf(np)
-            if a and a ~= coloredAddr then
-                coloredAddr = a
-                pcall(function()
-                    local b = np.PlayerLastHealthBar
-                    if b and b:IsValid() then b:SetFillColorAndOpacity({ R = 0.03, G = 0.03, B = 0.03, A = 1.0 }) end
-                end)
-            end
+            setPct(np, "PlayerHealthBar",     healthP) -- primary fill = real health
+            setPct(np, "PlayerLastHealthBar", healthP) -- damage trail matches current (NOT full - a
+            showWidget(np, "PlayerHealthBar")          -- full LastHealthBar renders IN FRONT on this
+            showWidget(np, "PlayerLastHealthBar")      -- nameplate = covered the fill = "always max")
         end
         if shieldP then
             setPct(np, "PlayerHealthBar_Additive", shieldP) -- shield overlay
