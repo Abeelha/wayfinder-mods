@@ -197,11 +197,27 @@ local function driveSelf(npOverride)
             end
         end
         if healthP then
-            setPct(np, "PlayerHealthBar", healthP) -- real health -> the green/health-colored fill
+            -- PROVEN by the log: PlayerHealthBar IGNORES SetPercent (we sent hp=0.00, bar stayed
+            -- FULL). PlayerLastHealthBar is the FRONT bar that actually TRACKS SetPercent. So:
+            --   PlayerLastHealthBar = live current-health FILL (tinted green)
+            --   PlayerHealthBar     = the always-full BACKING behind it (tinted dark = missing health)
+            setPct(np, "PlayerLastHealthBar", healthP) -- live health fill (tracks)
+            showWidget(np, "PlayerLastHealthBar")
+            setPct(np, "PlayerHealthBar", 1.0)          -- full backing = the "missing health" region
             showWidget(np, "PlayerHealthBar")
-            -- do NOT drive/show PlayerLastHealthBar: it's the WHITE trail bar, IN FRONT on this
-            -- nameplate; any % on it covered the green fill (the white/max bug). collapse it.
-            hideWidget(np, "PlayerLastHealthBar")
+            -- colors set ONCE per plate: green fill + dark-grey missing backing (the requested look)
+            local a = addrOf(np)
+            if a and a ~= coloredAddr then
+                coloredAddr = a
+                pcall(function()
+                    local f = np.PlayerLastHealthBar
+                    if f and f:IsValid() then f:SetFillColorAndOpacity({ R = 0.20, G = 0.85, B = 0.30, A = 1.0 }) end
+                end)
+                pcall(function()
+                    local b = np.PlayerHealthBar
+                    if b and b:IsValid() then b:SetFillColorAndOpacity({ R = 0.05, G = 0.05, B = 0.05, A = 1.0 }) end
+                end)
+            end
         end
         if shieldP then
             setPct(np, "PlayerHealthBar_Additive", shieldP) -- shield overlay
@@ -262,8 +278,8 @@ local function installHooks()
             -- (verified: 0 in the object dump) - calling them THREW and aborted this whole
             -- callback before the capture ran (why self was never captured -> stuck-full HP).
             -- raw showWidget (SetVisibility 0) is the real reveal.
-            showWidget(np, "PlayerHealthBar")
-            hideWidget(np, "PlayerLastHealthBar") -- white front-trail: collapse so green fill shows
+            showWidget(np, "PlayerHealthBar")      -- full backing (missing-health region)
+            showWidget(np, "PlayerLastHealthBar")  -- live health fill (the bar that actually tracks)
             showWidget(np, "PlayerHealthBar_Additive")
             -- SELF-HEALING CAPTURE: identity = "is this widget's owner the pawn *I* control?"
             -- owner:IsLocallyControlled() is safe HERE because the game is actively evaluating this
