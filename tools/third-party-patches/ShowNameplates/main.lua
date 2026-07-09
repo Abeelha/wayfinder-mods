@@ -59,6 +59,14 @@ local function hideWidget(np, name)
     end)
 end
 
+-- health FILL color BY VALUE so low health reads at a glance + stays distinct from the dark missing
+-- backing: red when low, amber mid, vivid green high. fully opaque (A=1) so it can't wash out.
+local function healthColor(p)
+    if p <= 0.25 then return { R = 0.92, G = 0.12, B = 0.12, A = 1.0 }     -- red (danger)
+    elseif p <= 0.50 then return { R = 0.98, G = 0.72, B = 0.10, A = 1.0 } -- amber (caution)
+    else return { R = 0.16, G = 0.92, B = 0.28, A = 1.0 } end             -- green (healthy)
+end
+
 local svbLogged = false -- one-shot diag: player ShouldBeVisible fired
 local lastDrivenHp, lastDrivenStam = nil, nil -- diag: track driven values to see if they move
 local lastDriveLog = 0.0 -- min interval between drive diag lines
@@ -205,17 +213,18 @@ local function driveSelf(npOverride)
             showWidget(np, "PlayerLastHealthBar")
             setPct(np, "PlayerHealthBar", 1.0)          -- full backing = the "missing health" region
             showWidget(np, "PlayerHealthBar")
-            -- colors set ONCE per plate: green fill + dark-grey missing backing (the requested look)
+            -- FILL recolored EVERY drive by current health (green/amber/red) so low HP is obvious.
+            pcall(function()
+                local f = np.PlayerLastHealthBar
+                if f and f:IsValid() then f:SetFillColorAndOpacity(healthColor(healthP)) end
+            end)
+            -- BACKING = near-black, once per plate: high contrast vs the fill = clear missing region.
             local a = addrOf(np)
             if a and a ~= coloredAddr then
                 coloredAddr = a
                 pcall(function()
-                    local f = np.PlayerLastHealthBar
-                    if f and f:IsValid() then f:SetFillColorAndOpacity({ R = 0.20, G = 0.85, B = 0.30, A = 1.0 }) end
-                end)
-                pcall(function()
                     local b = np.PlayerHealthBar
-                    if b and b:IsValid() then b:SetFillColorAndOpacity({ R = 0.05, G = 0.05, B = 0.05, A = 1.0 }) end
+                    if b and b:IsValid() then b:SetFillColorAndOpacity({ R = 0.02, G = 0.02, B = 0.02, A = 1.0 }) end
                 end)
             end
         end
