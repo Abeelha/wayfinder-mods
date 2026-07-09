@@ -99,9 +99,48 @@ local function resolveHUD()
     return okres
 end
 
--- mirror the local player's LIVE HUD health/shield/stamina onto the cached self nameplate.
--- these are the real, responsive values the HUD itself shows. driven by the HUD meter-change
--- events (fires on change) - no polling.
+-- ASC-DIRECT value source: read health%/stamina% straight off the owner pawn's ability-system
+-- attribute sets. survives the MP DOWNED window + transitions where the HUD meter is unpopulated
+-- (the recurring "blank on death" root - the HUD had no value to mirror). WFCharacterAttributeSet
+-- has Health/MaxHealth; WFPlayerCharacterAttributeSet has Stamina/MaxStamina (FGameplayAttributeData
+-- -> .CurrentValue). FULLY GUARDED: any failure returns nil and driveSelf falls back to the proven
+-- HUD-meter mirror = zero regression even if UE4SS can't read the attribute struct on this build.
+local WFASC_LIB = "/Script/Wayfinder.Default__WFAbilitySystemBlueprintLibrary"
+local ascLibCache = nil
+local function ascLib()
+    if ascLibCache and ascLibCache:IsValid() then return ascLibCache end
+    local l = StaticFindObject(WFASC_LIB)
+    ascLibCache = (l and l:IsValid()) and l or nil
+    return ascLibCache
+end
+local function ascValues(owner)
+    local hp, sp
+    pcall(function()
+        if not (owner and owner:IsValid()) then return end
+        local lib = ascLib(); if not lib then return end
+        local asc = lib:GetWFAbilitySystemComponent(owner)
+        if not (asc and asc:IsValid()) then return end
+        local sets = asc.SpawnedAttributes
+        if not sets then return end
+        for i = 1, #sets do
+            local s = sets[i]
+            if s and s:IsValid() then
+                pcall(function()  -- Health lives on WFCharacterAttributeSet (missing elsewhere -> throws -> caught)
+                    local cur, mx = s.Health.CurrentValue, s.MaxHealth.CurrentValue
+                    if cur and mx and mx > 0 then hp = cur / mx end
+                end)
+                pcall(function()  -- Stamina lives on WFPlayerCharacterAttributeSet
+                    local cur, mx = s.Stamina.CurrentValue, s.MaxStamina.CurrentValue
+                    if cur and mx and mx > 0 then sp = cur / mx end
+                end)
+            end
+        end
+    end)
+    return hp, sp
+end
+
+-- drive the local player's health/shield/stamina onto the LIVE self nameplate. ASC-direct primary,
+-- HUD-meter mirror fallback (see ascValues). driven by ShouldBeVisible (live np) + HUD change events.
 local driving = false  -- re-entrancy guard: teardown fires the meter hooks in a nested cascade
                        -- (crash stack showed 3x re-entry on dungeon-leave); a nested driveSelf must
                        -- NOT run against the half-freed HUD.
@@ -116,22 +155,37 @@ local function driveSelf(npOverride)
     -- flag read) is the only probe used; native calls on a dying object AV through pcall.
     driving = true
     pcall(function()
-        if not resolveHUD() then return end
-        -- read HEALTH+SHIELD independently from STAMINA. stamina lives on a SEPARATE widget
-        -- (HUD_PlayerStaminaMeters.PlayerStaminaMeter) that can be nil - reading all three in ONE
-        -- pcall meant a nil stamina widget threw and killed the health/shield update too (the
-        -- HP-stuck-full + stamina-blank bug). each sub-widget is guarded on its own now. re-check
-        -- hudMeters:IsValid() immediately before the field deref = smallest possible use-after-free
-        -- window if the HUD frees mid-callback during a transition.
-        local okHS, shieldP, healthP = pcall(function()
-            if not (hudMeters and hudMeters:IsValid()) then return nil, nil end
-            local hb = hudMeters.PlayerHealthBar
-            local sb = hudMeters.PlayerShieldBar
-            local h = (hb and hb:IsValid()) and hb.Percent or nil
-            local s = (sb and sb:IsValid()) and sb.Percent or nil
-            return s, h
-        end)
-        if okHS and healthP then
+        -- PRIMARY read: ASC-direct off the owner pawn (survives downed/transitions). FALLBACK: the
+        -- HUD-meter mirror (proven; used when ASC gives nothing OR for shield, which the ASC path
+        -- doesn't expose as a percent). resolveHUD only runs when we still need a value = cheap.
+        local owner = np.AttachedOwnerActor
+        local healthP, staminaP = ascValues(owner)
+        local shieldP, src = nil, "ASC"
+        if not (healthP and staminaP) then
+            if resolveHUD() then
+                local okHS, s, h = pcall(function()
+                    if not (hudMeters and hudMeters:IsValid()) then return nil, nil end
+                    local hb = hudMeters.PlayerHealthBar
+                    local sb = hudMeters.PlayerShieldBar
+                    return (sb and sb:IsValid()) and sb.Percent or nil,
+                           (hb and hb:IsValid()) and hb.Percent or nil
+                end)
+                if okHS then
+                    shieldP = s
+                    if not healthP then healthP = h; src = "HUD" end
+                end
+                if not staminaP then
+                    local okS, st = pcall(function()
+                        if not (hudMeters and hudMeters:IsValid()) then return nil end
+                        local sm = hudMeters.HUD_PlayerStaminaMeters
+                        sm = sm and sm.PlayerStaminaMeter
+                        return (sm and sm:IsValid()) and sm.Percent or nil
+                    end)
+                    if okS and st then staminaP = st; if src == "ASC" then src = "ASC+HUD" end end
+                end
+            end
+        end
+        if healthP then
             setPct(np, "PlayerHealthBar",     healthP) -- primary green fill
             setPct(np, "PlayerLastHealthBar", 1.0)     -- FULL width = dark "missing health" backing
             showWidget(np, "PlayerHealthBar")
@@ -147,17 +201,11 @@ local function driveSelf(npOverride)
                 end)
             end
         end
-        if okHS and shieldP then
+        if shieldP then
             setPct(np, "PlayerHealthBar_Additive", shieldP) -- shield overlay
             showWidget(np, "PlayerHealthBar_Additive")
         end
-        local okS, staminaP = pcall(function()
-            if not (hudMeters and hudMeters:IsValid()) then return nil end
-            local sm = hudMeters.HUD_PlayerStaminaMeters
-            sm = sm and sm.PlayerStaminaMeter
-            return (sm and sm:IsValid()) and sm.Percent or nil
-        end)
-        if okS and staminaP then
+        if staminaP then
             setPct(np, "characterStaminaFill", staminaP) -- stamina fill
             showWidget(np, "characterStaminaFill")
         end
@@ -168,7 +216,7 @@ local function driveSelf(npOverride)
            and (math.abs(healthP - (lastDrivenHp or -1)) > 0.05
              or math.abs((staminaP or 0) - (lastDrivenStam or -1)) > 0.05) then
             lastDrivenHp = healthP; lastDrivenStam = staminaP or 0; lastDriveLog = now
-            print(string.format("[ShowNameplates] drive: hp=%.2f shield=%.2f stam=%.2f\n", healthP or -1, shieldP or -1, staminaP or -1))
+            print(string.format("[ShowNameplates] drive[%s]: hp=%.2f shield=%.2f stam=%.2f\n", src, healthP or -1, shieldP or -1, staminaP or -1))
         end
     end)
     driving = false
