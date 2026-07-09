@@ -48,6 +48,17 @@ local function showWidget(np, name)
     end)
 end
 
+-- collapse a sub-widget (ESlateVisibility 1 = Collapsed). used to hide PlayerLastHealthBar - on
+-- this nameplate it's a WHITE damage-trail bar that renders IN FRONT of the green health fill, so
+-- showing it (at any %) covered the real bar = the "white / always-max health" look. hidden = the
+-- true PlayerHealthBar fill shows through.
+local function hideWidget(np, name)
+    pcall(function()
+        local w = np[name]
+        if w and w:IsValid() then w:SetVisibility(1) end
+    end)
+end
+
 local svbLogged = false -- one-shot diag: player ShouldBeVisible fired
 local lastDrivenHp, lastDrivenStam = nil, nil -- diag: track driven values to see if they move
 local lastDriveLog = 0.0 -- min interval between drive diag lines
@@ -186,10 +197,11 @@ local function driveSelf(npOverride)
             end
         end
         if healthP then
-            setPct(np, "PlayerHealthBar",     healthP) -- primary fill = real health
-            setPct(np, "PlayerLastHealthBar", healthP) -- damage trail matches current (NOT full - a
-            showWidget(np, "PlayerHealthBar")          -- full LastHealthBar renders IN FRONT on this
-            showWidget(np, "PlayerLastHealthBar")      -- nameplate = covered the fill = "always max")
+            setPct(np, "PlayerHealthBar", healthP) -- real health -> the green/health-colored fill
+            showWidget(np, "PlayerHealthBar")
+            -- do NOT drive/show PlayerLastHealthBar: it's the WHITE trail bar, IN FRONT on this
+            -- nameplate; any % on it covered the green fill (the white/max bug). collapse it.
+            hideWidget(np, "PlayerLastHealthBar")
         end
         if shieldP then
             setPct(np, "PlayerHealthBar_Additive", shieldP) -- shield overlay
@@ -251,7 +263,7 @@ local function installHooks()
             -- callback before the capture ran (why self was never captured -> stuck-full HP).
             -- raw showWidget (SetVisibility 0) is the real reveal.
             showWidget(np, "PlayerHealthBar")
-            showWidget(np, "PlayerLastHealthBar")
+            hideWidget(np, "PlayerLastHealthBar") -- white front-trail: collapse so green fill shows
             showWidget(np, "PlayerHealthBar_Additive")
             -- SELF-HEALING CAPTURE: identity = "is this widget's owner the pawn *I* control?"
             -- owner:IsLocallyControlled() is safe HERE because the game is actively evaluating this
