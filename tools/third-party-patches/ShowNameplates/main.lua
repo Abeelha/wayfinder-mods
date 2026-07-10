@@ -62,9 +62,9 @@ end
 -- health FILL color BY VALUE so low health reads at a glance + stays distinct from the dark missing
 -- backing: red when low, amber mid, vivid green high. fully opaque (A=1) so it can't wash out.
 local function healthColor(p)
-    if p <= 0.25 then return { R = 0.92, G = 0.12, B = 0.12, A = 1.0 }     -- red (danger)
-    elseif p <= 0.50 then return { R = 0.98, G = 0.72, B = 0.10, A = 1.0 } -- amber (caution)
-    else return { R = 0.16, G = 0.92, B = 0.28, A = 1.0 } end             -- green (healthy)
+    if p <= 0.25 then return { R = 1.0, G = 0.10, B = 0.10, A = 1.0 }     -- bright red (danger)
+    elseif p <= 0.50 then return { R = 1.0, G = 0.78, B = 0.0, A = 1.0 }  -- bright amber (caution)
+    else return { R = 0.12, G = 1.0, B = 0.30, A = 1.0 } end             -- bright green (healthy)
 end
 
 local svbLogged = false -- one-shot diag: player ShouldBeVisible fired
@@ -209,24 +209,17 @@ local function driveSelf(npOverride)
             -- FULL). PlayerLastHealthBar is the FRONT bar that actually TRACKS SetPercent. So:
             --   PlayerLastHealthBar = live current-health FILL (tinted green)
             --   PlayerHealthBar     = the always-full BACKING behind it (tinted dark = missing health)
-            setPct(np, "PlayerLastHealthBar", healthP) -- live health fill (tracks)
+            setPct(np, "PlayerLastHealthBar", healthP)  -- colored fill = current health (tracks)
             showWidget(np, "PlayerLastHealthBar")
-            setPct(np, "PlayerHealthBar", 1.0)          -- full backing = the "missing health" region
-            showWidget(np, "PlayerHealthBar")
-            -- FILL recolored EVERY drive by current health (green/amber/red) so low HP is obvious.
+            -- PlayerHealthBar is INERT (won't take SetPercent OR our tint -> it kept showing a full,
+            -- health-LOOKING bar = the "missing looks like health" complaint). HIDE it so only the
+            -- bright colored fill shows; the missing region reads as the dark nameplate track.
+            hideWidget(np, "PlayerHealthBar")
+            -- recolor the fill EVERY drive by current health (bright green/amber/red) so low HP pops.
             pcall(function()
                 local f = np.PlayerLastHealthBar
                 if f and f:IsValid() then f:SetFillColorAndOpacity(healthColor(healthP)) end
             end)
-            -- BACKING = near-black, once per plate: high contrast vs the fill = clear missing region.
-            local a = addrOf(np)
-            if a and a ~= coloredAddr then
-                coloredAddr = a
-                pcall(function()
-                    local b = np.PlayerHealthBar
-                    if b and b:IsValid() then b:SetFillColorAndOpacity({ R = 0.02, G = 0.02, B = 0.02, A = 1.0 }) end
-                end)
-            end
         end
         if shieldP then
             setPct(np, "PlayerHealthBar_Additive", shieldP) -- shield overlay
@@ -287,8 +280,8 @@ local function installHooks()
             -- (verified: 0 in the object dump) - calling them THREW and aborted this whole
             -- callback before the capture ran (why self was never captured -> stuck-full HP).
             -- raw showWidget (SetVisibility 0) is the real reveal.
-            showWidget(np, "PlayerHealthBar")      -- full backing (missing-health region)
-            showWidget(np, "PlayerLastHealthBar")  -- live health fill (the bar that actually tracks)
+            hideWidget(np, "PlayerHealthBar")      -- inert full bar (looks like health) - keep hidden
+            showWidget(np, "PlayerLastHealthBar")  -- the colored, tracking health fill
             showWidget(np, "PlayerHealthBar_Additive")
             -- SELF-HEALING CAPTURE: identity = "is this widget's owner the pawn *I* control?"
             -- owner:IsLocallyControlled() is safe HERE because the game is actively evaluating this
